@@ -6,6 +6,7 @@ import { startVpsWorkers } from "./workers.js";
 const logger = console;
 const runtime = await createVpsProductionRuntime({ logger });
 const origin = runtime.config.publicBaseUrl || `http://${runtime.config.host}:${runtime.config.port}`;
+let workers;
 const { app } = buildVpsApp({
   env: runtime.env,
   context: runtime.context,
@@ -22,10 +23,11 @@ const { app } = buildVpsApp({
   healthChecks: {
     storage: () => runtime.health(),
     cache: async () => ({ ok: (await runtime.redis.ping()) === "PONG" }),
-    queues: async () => ({ ok: true })
+    queues: async () => ({ ok: true }),
+    telegramPolling: () => workers?.pollingStatus?.() || { ok: false, state: "starting" }
   }
 });
-const workers = startVpsWorkers({ runtime, origin, logger });
+workers = startVpsWorkers({ runtime, origin, logger });
 
 await app.listen({ host: runtime.config.host, port: runtime.config.port });
 logger.info?.(`OneUI VPS production server listening on ${runtime.config.host}:${runtime.config.port}`);

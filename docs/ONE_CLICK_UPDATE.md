@@ -7,10 +7,12 @@ sudo /opt/oneui-bot/deploy/update-vps.sh
 ```
 
 The script is intentionally limited to the OneUI application. It verifies the
-checkout is on `main` and clean, fast-forwards from `origin/main`, installs the
-locked Node dependencies without lifecycle scripts, runs tests, runs the
-repository security scan, runs the production dependency audit, restarts only
-`oneui-bot.service`, and waits for `/health`.
+checkout is on `main` and clean, fast-forwards from `origin/main`, then always
+installs the locked Node dependencies without lifecycle scripts, runs tests,
+runs the repository security scan, runs the production dependency audit,
+restarts only `oneui-bot.service`, and waits for `/health`. Re-running after a
+failed update therefore revalidates the same checkout instead of skipping
+tests.
 
 It does not restart PostgreSQL or Redis, change Telegram Webhook state, touch
 Cloudflare, modify Nginx/firewall/SSH, or run a database migration.
@@ -24,7 +26,8 @@ sudo journalctl -u oneui-bot.service -n 80 --no-pager
 ```
 
 The health endpoint must report `ok: true`. It checks PostgreSQL and Redis
-connectivity and exposes queue counts without exposing credentials.
+connectivity, long-polling liveness, and queue counts without exposing
+credentials.
 
 ## If an update fails
 

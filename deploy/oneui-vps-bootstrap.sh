@@ -12,6 +12,8 @@ APP_SERVICE="oneui-bot.service"
 PG_PORT="55432"
 REDIS_PORT="56379"
 APP_PORT="8787"
+NODE_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/node"
+NPM_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/npm"
 PG_DATA_DIR="/var/lib/oneui-postgresql/data"
 REDIS_DATA_DIR="/var/lib/oneui-redis"
 SYSTEM_DIR="/etc/oneui-bot"
@@ -35,6 +37,7 @@ trap restore_policy_rc EXIT
 [[ "${EUID}" -eq 0 ]] || die "请使用 sudo 运行此脚本。"
 [[ -d "${PROJECT_DIR}" && -f "${PROJECT_DIR}/package.json" ]] || die "项目目录不存在：${PROJECT_DIR}"
 id "${APP_USER}" >/dev/null 2>&1 || die "系统用户不存在：${APP_USER}"
+[[ -x "${NODE_BIN}" && -x "${NPM_BIN}" ]] || die "未找到 OneUI Node.js/npm：${NODE_BIN}"
 
 if [[ -e "/etc/systemd/system/${APP_SERVICE}" ]]; then
   die "检测到已有 ${APP_SERVICE}，为避免覆盖现有服务，脚本停止。"
@@ -80,7 +83,7 @@ trap - EXIT
 command -v systemctl >/dev/null || die "systemd 不可用。"
 if [[ ! -d "${PROJECT_DIR}/node_modules" ]]; then
   log "项目依赖目录不存在，执行 npm ci --ignore-scripts。"
-  runuser -u oneui -- env HOME=/home/oneui npm ci --ignore-scripts --prefix "${PROJECT_DIR}"
+  runuser -u oneui -- env HOME=/home/oneui "${NPM_BIN}" ci --ignore-scripts --prefix "${PROJECT_DIR}"
 fi
 PG_BIN_DIR="$(pg_config --bindir)"
 [[ -x "${PG_BIN_DIR}/initdb" && -x "${PG_BIN_DIR}/postgres" ]] || die "未找到 PostgreSQL 初始化程序。"
@@ -240,11 +243,11 @@ set -a
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
-runuser -u oneui -- env DATABASE_URL="${DATABASE_URL}" node "${PROJECT_DIR}/scripts/migrate-vps.mjs"
+runuser -u oneui -- env DATABASE_URL="${DATABASE_URL}" "${NODE_BIN}" "${PROJECT_DIR}/scripts/migrate-vps.mjs"
 
 if [[ -f "${SNAPSHOT}" ]]; then
   log "导入 Cloudflare 导出的 OneUI 用户配置；不输出快照内容。"
-  runuser -u oneui -- env DATABASE_URL="${DATABASE_URL}" node "${PROJECT_DIR}/scripts/import-cloudflare-state.mjs" "${SNAPSHOT}"
+  runuser -u oneui -- env DATABASE_URL="${DATABASE_URL}" "${NODE_BIN}" "${PROJECT_DIR}/scripts/import-cloudflare-state.mjs" "${SNAPSHOT}"
 else
   die "缺少 Cloudflare 导出快照：${SNAPSHOT}"
 fi

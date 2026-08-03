@@ -108,6 +108,9 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
 
   return {
     workers,
+    pollingStatus() {
+      return telegramPolling?.status?.() || { ok: true, state: "disabled" };
+    },
     async close() {
       clearInterval(timer);
       await telegramPolling?.close();

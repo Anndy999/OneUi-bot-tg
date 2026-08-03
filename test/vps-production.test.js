@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createPersistentQueueBinding, validateVpsProductionEnv } from "../src/vps/production.js";
 import { OFFSET_KEY, startTelegramPolling } from "../src/vps/telegram-polling.js";
+import { randomId } from "../src/runtime/random-id.js";
 
 const webhookSecret = ["webhook", "test", "secret"].join("-");
 const webhookKey = ["WEBHOOK", "SECRET"].join("_");
@@ -46,6 +47,11 @@ test("VPS queue binding adds retry and retention policy without exposing payload
   assert.equal(received.options.backoff.type, "exponential");
 });
 
+test("portable random IDs work when the runtime has no Web Crypto global", () => {
+  const id = randomId(null);
+  assert.match(id, /^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/i);
+});
+
 test("VPS Telegram polling queues updates and persists the next offset", async () => {
   const storage = new Map();
   const queued = [];
@@ -72,8 +78,30 @@ test("VPS Telegram polling queues updates and persists the next offset", async (
     })
   });
   const data = await queuedPromise;
+  assert.equal(poller.status().ok, true);
+  assert.equal(poller.status().state, "healthy");
   await poller.close();
+  assert.equal(poller.status().state, "stopped");
   assert.equal(queued.length, 1);
   assert.equal(data.id, "telegram-update:41");
   assert.equal(storage.get(OFFSET_KEY), "42");
+});
+
+test("VPS Telegram polling marks invalid-token and webhook-conflict responses unhealthy", async () => {
+  let observedStatus;
+  const poller = startTelegramPolling({
+    token: "poll-token",
+    storage: { async get() { return null; }, async put() {} },
+    queue: { async send() {} },
+    logger: { error() {}, warn() {} },
+    fetchImpl: async () => ({ ok: false, status: 409, async json() { return { ok: false, error_code: 409 }; } })
+  });
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    observedStatus = poller.status();
+    if (observedStatus.fatalFailure) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await poller.close();
+  assert.equal(observedStatus.fatalFailure, true);
+  assert.equal(observedStatus.ok, false);
 });

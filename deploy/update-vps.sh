@@ -27,17 +27,17 @@ git_cmd fetch --prune origin main
 git_cmd pull --ff-only origin main
 
 if [[ "$(git_cmd rev-parse HEAD)" == "${previous_commit}" ]]; then
-  log "没有新的代码提交，仍然执行健康检查。"
-else
-  log "安装锁定依赖。"
-  "${NPM_BIN}" ci --ignore-scripts
-  log "运行测试。"
-  "${NPM_BIN}" test
-  log "运行安全扫描。"
-  "${NPM_BIN}" run security-check
-  log "运行生产依赖审计。"
-  "${NPM_BIN}" audit --omit=dev --audit-level=high
+  log "没有新的代码提交，重新验证当前部署。"
 fi
+
+log "安装锁定依赖。"
+"${NPM_BIN}" ci --ignore-scripts
+log "运行测试。"
+"${NPM_BIN}" test
+log "运行安全扫描。"
+"${NPM_BIN}" run security-check
+log "运行生产依赖审计。"
+"${NPM_BIN}" audit --omit=dev --audit-level=high
 
 systemctl daemon-reload
 log "仅重启 ${SERVICE}。PostgreSQL 和 Redis 不重启。"

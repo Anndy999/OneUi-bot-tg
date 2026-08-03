@@ -1,9 +1,5 @@
 const OFFSET_KEY = "vps:telegram:polling:offset";
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function safeError(error) {
   const message = String(error?.message || error || "unknown error");
   return message.replace(/bot\d+:[A-Za-z0-9_-]+/gi, "bot<redacted>").slice(0, 240);
@@ -35,6 +31,23 @@ export function startTelegramPolling({
   let stopped = false;
   let controller = null;
   let offset = null;
+  const startedAt = Date.now();
+  let lastSuccessAt = 0;
+  let lastFailureAt = 0;
+  let lastError = "";
+  let fatalFailure = false;
+  let retryTimer = null;
+  let retryResolve = null;
+  const staleAfterMs = Math.max(90_000, (longPollSeconds + 10) * 3 * 1000);
+
+  const waitForRetry = (ms) => new Promise((resolve) => {
+    retryResolve = resolve;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      retryResolve = null;
+      resolve();
+    }, ms);
+  });
 
   const fetchUpdates = async () => {
     controller = new AbortController();
@@ -55,6 +68,9 @@ export function startTelegramPolling({
         const code = data?.error_code || response.status || "unknown";
         throw new Error(`Telegram getUpdates rejected (${code})`);
       }
+      lastSuccessAt = Date.now();
+      lastError = "";
+      fatalFailure = false;
       return Array.isArray(data.result) ? data.result : [];
     } finally {
       clearTimeout(timeout);
@@ -91,8 +107,11 @@ export function startTelegramPolling({
         }
       } catch (error) {
         if (stopped || error?.name === "AbortError") return;
-        logger.error?.(`Telegram polling failed: ${safeError(error)}`);
-        await delay(retryMs);
+        lastFailureAt = Date.now();
+        lastError = safeError(error);
+        fatalFailure = /Telegram getUpdates rejected \((?:401|409)\)/.test(lastError);
+        logger.error?.(`Telegram polling failed: ${lastError}`);
+        await waitForRetry(retryMs);
         retryMs = Math.min(retryMs * 2, 30_000);
       }
     }
@@ -103,9 +122,27 @@ export function startTelegramPolling({
   });
 
   return {
+    status() {
+      const now = Date.now();
+      const lastActivityAt = Math.max(startedAt, lastSuccessAt);
+      const ok = !stopped && !fatalFailure && now - lastActivityAt <= staleAfterMs;
+      return {
+        ok,
+        state: stopped ? "stopped" : lastSuccessAt ? (lastError ? "retrying" : "healthy") : (lastError ? "retrying" : "starting"),
+        startedAt,
+        lastSuccessAt,
+        lastFailureAt,
+        fatalFailure,
+        lastError: lastError || undefined
+      };
+    },
     async close() {
       stopped = true;
       controller?.abort();
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      retryResolve?.();
+      retryResolve = null;
       await running;
     }
   };

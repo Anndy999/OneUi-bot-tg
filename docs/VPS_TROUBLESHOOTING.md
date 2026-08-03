@@ -42,6 +42,11 @@ curl -sS http://127.0.0.1:8787/health
   that the database migration was approved and completed.
 - `redis` failure: verify `oneui-redis.service`, its local port and password
   configuration, and its journal.
+- `telegramPolling` failure: the long-poll loop has not completed a successful
+  `getUpdates` request within its grace period. Check the OneUI service log for
+  the sanitized Telegram error category; do not print the environment file or
+  Token. HTTP 401 or 409 is immediately unhealthy because it indicates an
+  invalid Token or a polling/Webhook conflict.
 - queue failure: inspect BullMQ/Redis errors in the application journal; do not
   delete Redis data while jobs are being investigated.
 
