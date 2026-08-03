@@ -1,0 +1,468 @@
+import { validateModelCsc } from "./targets.js";
+import { beijingParts, normalizeClockTime, timeToMinutes } from "./utils.js";
+import { randomId } from "./runtime/random-id.js";
+import {
+  cancelMonitorItemSnooze,
+  getRolloutChainsState,
+  getRolloutProposal,
+  putRolloutProposal,
+  recordMonitorEvent,
+  setRolloutChainsState,
+  snoozeMonitorItem,
+  upsertMonitorItem
+} from "./state.js";
+
+const STAGES = [
+  { id: "kr", name: "韩版" },
+  { id: "eu", name: "欧版" },
+  { id: "hk", name: "港版" },
+  { id: "cn", name: "国行" }
+];
+
+const DEFAULT_CHAINS = [
+  { id: "s26", name: "26 系列", startChainOnFirstStage: "s25" },
+  { id: "s25", name: "25 系列", startChainOnFirstStage: "" }
+];
+let cachedChains = null;
+let cachedChainsExpiresAt = 0;
+let cachedEnv = null;
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function cleanText(value, max = 64) {
+  return String(value || "").trim().slice(0, max);
+}
+
+function normalizeTarget(value = {}) {
+  const target = validateModelCsc(value.model, value.csc);
+  return {
+    model: target.model,
+    csc: target.csc,
+    name: cleanText(value.name || `${target.model} ${target.csc}`, 64) || `${target.model} ${target.csc}`
+  };
+}
+
+function normalizeStage(raw = {}, fallback) {
+  const seen = new Set();
+  const targets = (Array.isArray(raw.targets) ? raw.targets : [])
+    .map((target) => {
+      try { return normalizeTarget(target); } catch { return null; }
+    })
+    .filter((target) => {
+      if (!target) return false;
+      const key = `${target.model}:${target.csc}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  return {
+    id: fallback.id,
+    name: cleanText(raw.name || fallback.name, 24) || fallback.name,
+    targets
+  };
+}
+
+function normalizeChain(raw = {}, fallback) {
+  const stagesById = new Map((Array.isArray(raw.stages) ? raw.stages : []).map((stage) => [String(stage?.id || "").trim(), stage]));
+  const stages = STAGES.map((stage) => normalizeStage(stagesById.get(stage.id) || {}, stage));
+  const activeStageId = stages.some((stage) => stage.id === raw.activeStageId)
+    ? raw.activeStageId
+    : stages[0].id;
+  const intervalMinutes = Number(raw.intervalMinutes || 15);
+  return {
+    id: fallback.id,
+    name: cleanText(raw.name || fallback.name, 32) || fallback.name,
+    enabled: raw.enabled === true,
+    status: ["active", "awaiting_confirmation", "completed", "needs_configuration"].includes(raw.status)
+      ? raw.status
+      : "needs_configuration",
+    activeStageId,
+    intervalMinutes: Number.isFinite(intervalMinutes) && intervalMinutes >= 5 && intervalMinutes <= 1440
+      ? Math.floor(intervalMinutes)
+      : 15,
+    startTime: normalizeClockTime(raw.startTime || "08:00") || "08:00",
+    endTime: normalizeClockTime(raw.endTime || "23:00") || "23:00",
+    startChainOnFirstStage: fallback.startChainOnFirstStage,
+    pendingProposalId: cleanText(raw.pendingProposalId, 64),
+    updatedAt: cleanText(raw.updatedAt, 40),
+    stages
+  };
+}
+
+export function defaultRolloutChains() {
+  return {
+    schemaVersion: 1,
+    chains: DEFAULT_CHAINS.map((chain) => normalizeChain({}, chain)),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+export function normalizeRolloutChains(value) {
+  const rawChains = Array.isArray(value?.chains) ? value.chains : [];
+  const byId = new Map(rawChains.map((chain) => [String(chain?.id || "").trim(), chain]));
+  return {
+    schemaVersion: 1,
+    chains: DEFAULT_CHAINS.map((fallback) => normalizeChain(byId.get(fallback.id) || {}, fallback)),
+    updatedAt: cleanText(value?.updatedAt, 40) || new Date().toISOString()
+  };
+}
+
+export async function getRolloutChains(env) {
+  if (cachedEnv === env && cachedChains && cachedChainsExpiresAt > Date.now()) return clone(cachedChains);
+  const stored = await getRolloutChainsState(env);
+  const value = normalizeRolloutChains(stored || defaultRolloutChains());
+  if (!stored) await setRolloutChainsState(env, value);
+  cachedChains = value;
+  cachedEnv = env;
+  cachedChainsExpiresAt = Date.now() + 15_000;
+  return clone(value);
+}
+
+async function saveChains(env, value) {
+  const normalized = normalizeRolloutChains({ ...value, updatedAt: new Date().toISOString() });
+  await setRolloutChainsState(env, normalized);
+  cachedChains = normalized;
+  cachedEnv = env;
+  cachedChainsExpiresAt = Date.now() + 15_000;
+  return clone(normalized);
+}
+
+function findChain(chains, chainId) {
+  const id = String(chainId || "").trim().toLowerCase();
+  return chains.chains.find((chain) => chain.id === id) || null;
+}
+
+function findStage(chain, stageId) {
+  const id = String(stageId || "").trim().toLowerCase();
+  return chain?.stages.find((stage) => stage.id === id) || null;
+}
+
+function nextStage(chain, stageId) {
+  const index = chain.stages.findIndex((stage) => stage.id === stageId);
+  return index >= 0 ? chain.stages[index + 1] || null : null;
+}
+
+export async function addRolloutTarget(env, chainId, stageId, target) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  const stage = findStage(chain, stageId);
+  if (!chain || !stage) throw new Error("发布链或地区不存在");
+  const normalized = normalizeTarget(target);
+  const key = `${normalized.model}:${normalized.csc}`;
+  const existsInAnotherStage = chain.stages.some((candidate) => candidate.id !== stage.id && candidate.targets.some((item) => `${item.model}:${item.csc}` === key));
+  if (existsInAnotherStage) throw new Error("同一 Model / CSC 不能同时属于两个地区阶段");
+  const existing = stage.targets.find((item) => `${item.model}:${item.csc}` === key);
+  if (existing) existing.name = normalized.name || existing.name;
+  else stage.targets.push(normalized);
+  chain.status = chain.enabled ? "active" : "needs_configuration";
+  const active = chain.activeStageId === stage.id && chain.enabled;
+  await upsertMonitorItem(env, {
+    ...normalized,
+    enabled: active,
+    paused: !active,
+    pauseReason: active ? "" : "rollout_waiting",
+    priority: "high",
+    intervalMinutes: chain.intervalMinutes,
+    rolloutChainId: chain.id,
+    rolloutStageId: stage.id,
+    notifyAllowedUsers: true
+  });
+  return saveChains(env, chains);
+}
+
+export async function setRolloutChainSettings(env, chainId, patch = {}) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain) throw new Error("发布链不存在");
+  if (patch.intervalMinutes !== undefined) {
+    const interval = Number(patch.intervalMinutes);
+    if (!Number.isFinite(interval) || interval < 5 || interval > 1440) throw new Error("检查间隔需在 5 到 1440 分钟之间");
+    chain.intervalMinutes = Math.floor(interval);
+  }
+  if (patch.startTime !== undefined) {
+    const time = normalizeClockTime(patch.startTime);
+    if (!time) throw new Error("开始时间无效");
+    chain.startTime = time;
+  }
+  if (patch.endTime !== undefined) {
+    const time = normalizeClockTime(patch.endTime);
+    if (!time) throw new Error("结束时间无效");
+    chain.endTime = time;
+  }
+  if (patch.enabled !== undefined) {
+    const activeStage = findStage(chain, chain.activeStageId);
+    if (patch.enabled && !activeStage?.targets.length) throw new Error("请先为当前地区添加至少一个精确 Model / CSC");
+    chain.enabled = patch.enabled === true;
+    chain.status = chain.enabled ? "active" : "needs_configuration";
+    for (const stage of chain.stages) {
+      for (const target of stage.targets) {
+        const active = chain.enabled && stage.id === chain.activeStageId;
+        await upsertMonitorItem(env, {
+          ...target,
+          enabled: active,
+          paused: !active,
+          pauseReason: active ? "" : "rollout_waiting",
+          priority: "high",
+          intervalMinutes: chain.intervalMinutes,
+          rolloutChainId: chain.id,
+          rolloutStageId: stage.id
+        });
+      }
+    }
+  }
+  for (const stage of chain.stages) {
+    for (const target of stage.targets) {
+      await upsertMonitorItem(env, { ...target, intervalMinutes: chain.intervalMinutes, rolloutChainId: chain.id, rolloutStageId: stage.id });
+    }
+  }
+  return saveChains(env, chains);
+}
+
+export async function setRolloutChainStage(env, chainId, stageId) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  const stage = findStage(chain, stageId);
+  if (!chain || !stage) throw new Error("发布链或地区不存在");
+  if (!stage.targets.length) throw new Error("请先为该地区添加至少一个精确 Model / CSC");
+  for (const candidate of chain.stages) {
+    for (const target of candidate.targets) {
+      const active = candidate.id === stage.id && chain.enabled;
+      if (active) await cancelMonitorItemSnooze(env, target.model, target.csc);
+      await upsertMonitorItem(env, {
+        ...target,
+        enabled: active,
+        paused: !active,
+        pauseReason: active ? "" : "rollout_waiting",
+        priority: "high",
+        intervalMinutes: chain.intervalMinutes,
+        rolloutChainId: chain.id,
+        rolloutStageId: candidate.id
+      });
+    }
+  }
+  chain.activeStageId = stage.id;
+  chain.status = chain.enabled ? "active" : "needs_configuration";
+  chain.pendingProposalId = "";
+  return saveChains(env, chains);
+}
+
+function nextBeijingMonthStart(now = new Date()) {
+  const parts = beijingParts(now);
+  return new Date(Date.UTC(Number(parts.year), Number(parts.month), 1, -8, 0, 0));
+}
+
+export async function createRolloutProposalForUpdate(env, item, parsed, now = new Date()) {
+  const chainId = cleanText(item.rolloutChainId, 48);
+  const stageId = cleanText(item.rolloutStageId, 48);
+  if (!chainId || !stageId) return null;
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain || !chain.enabled || chain.status === "completed" || chain.activeStageId !== stageId || chain.pendingProposalId) return null;
+  const stage = findStage(chain, stageId);
+  const configured = stage?.targets.some((target) => target.model === item.model && target.csc === item.csc);
+  if (!configured) return null;
+  const next = nextStage(chain, stageId);
+  const startChain = stageId === chain.stages[0].id ? findChain(chains, chain.startChainOnFirstStage) : null;
+  if (next && !next.targets.length) return { blocked: true, reason: "next_stage_unconfigured", chain, stage, next };
+  if (startChain && !findStage(startChain, startChain.activeStageId)?.targets.length) {
+    return { blocked: true, reason: "starter_chain_unconfigured", chain, stage, startChain };
+  }
+  const id = randomId().replace(/-/g, "").slice(0, 16);
+  const proposal = {
+    id,
+    type: "rollout_advance",
+    status: "pending",
+    chainId: chain.id,
+    chainName: chain.name,
+    stageId: stage.id,
+    stageName: stage.name,
+    nextStageId: next?.id || "",
+    nextStageName: next?.name || "",
+    startChainId: startChain?.id || "",
+    startChainName: startChain?.name || "",
+    source: { model: item.model, csc: item.csc, name: item.name || `${item.model} ${item.csc}`, version: String(parsed.latest || "") },
+    createdAt: now.toISOString(),
+    decidedAt: "",
+    decidedBy: "",
+    decision: ""
+  };
+  chain.pendingProposalId = id;
+  chain.status = "awaiting_confirmation";
+  await putRolloutProposal(env, proposal);
+  await saveChains(env, chains);
+  return { proposal, chain, stage, next, startChain };
+}
+
+export async function isRolloutItemWithinSchedule(env, item, now = new Date()) {
+  const chainId = cleanText(item?.rolloutChainId, 48);
+  const stageId = cleanText(item?.rolloutStageId, 48);
+  if (!chainId || !stageId) return true;
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain || !chain.enabled) return false;
+  // A finished region may resume at the next month boundary. It then returns
+  // to ordinary monitoring without moving the rollout chain backward.
+  if (chain.activeStageId !== stageId || chain.status !== "active") return item.enabled !== false;
+  const parts = beijingParts(now);
+  const current = Number(parts.hour) * 60 + Number(parts.minute);
+  const start = timeToMinutes(chain.startTime);
+  const end = timeToMinutes(chain.endTime);
+  if (start === null || end === null) return false;
+  return start <= end ? current >= start && current <= end : current >= start || current <= end;
+}
+
+export function rolloutProposalText(proposal, lang = "zh") {
+  const next = proposal.nextStageName || (lang === "en" ? "complete this chain" : "完成本系列本轮监控");
+  const extra = proposal.startChainName
+    ? (lang === "en" ? `Also start: ${proposal.startChainName} Korea` : `同时启动：${proposal.startChainName} 韩版`)
+    : "";
+  if (lang === "en") {
+    return [
+      "📣 Rollout update detected",
+      "",
+      `${proposal.chainName} · ${proposal.stageName}`,
+      `${proposal.source.model} · ${proposal.source.csc}`,
+      `Version: ${proposal.source.version}`,
+      "",
+      `Next: ${next}`,
+      extra,
+      "",
+      "Confirm to pause this region until next month and advance the rollout."
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "📣 发布链发现新固件",
+    "",
+    `${proposal.chainName} · ${proposal.stageName}`,
+    `${proposal.source.model} · ${proposal.source.csc}`,
+    `版本：${proposal.source.version}`,
+    "",
+    `下一步：${next}`,
+    extra,
+    "",
+    "确认后将暂停当前地区至下月初，并推进发布链。"
+  ].filter(Boolean).join("\n");
+}
+
+export function rolloutProposalKeyboard(proposal, lang = "zh") {
+  return {
+    inline_keyboard: [
+      [
+        { text: lang === "en" ? "Confirm advance" : "确认切换", callback_data: `rollout:approve:${proposal.id}` },
+        { text: lang === "en" ? "Not now" : "暂不处理", callback_data: `rollout:skip:${proposal.id}` }
+      ],
+      [{ text: lang === "en" ? "View rollout" : "查看发布链", callback_data: `admin:rollout:${proposal.chainId}` }]
+    ]
+  };
+}
+
+async function activateStage(env, chain, stage) {
+  for (const target of stage.targets) {
+    await cancelMonitorItemSnooze(env, target.model, target.csc);
+    await upsertMonitorItem(env, {
+      ...target,
+      enabled: true,
+      paused: false,
+      pauseReason: "",
+      priority: "high",
+      intervalMinutes: chain.intervalMinutes,
+      rolloutChainId: chain.id,
+      rolloutStageId: stage.id
+    });
+  }
+}
+
+export async function applyRolloutProposalDecision(env, proposalId, decision, decidedBy = "") {
+  const proposal = await getRolloutProposal(env, proposalId);
+  if (!proposal) return { ok: false, reason: "missing" };
+  if (proposal.status !== "pending") return { ok: false, reason: "already_decided", proposal };
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, proposal.chainId);
+  const stage = findStage(chain, proposal.stageId);
+  if (!chain || !stage || chain.pendingProposalId !== proposal.id) return { ok: false, reason: "stale", proposal };
+  if (decision === "skip") {
+    proposal.status = "decided";
+    proposal.decision = "skip";
+    proposal.decidedAt = new Date().toISOString();
+    proposal.decidedBy = String(decidedBy || "");
+    chain.pendingProposalId = "";
+    chain.status = "active";
+    await putRolloutProposal(env, proposal);
+    await saveChains(env, chains);
+    return { ok: true, decision: "skip", proposal, chain };
+  }
+  if (decision !== "approve") return { ok: false, reason: "invalid_decision", proposal };
+  const next = proposal.nextStageId ? findStage(chain, proposal.nextStageId) : null;
+  const starter = proposal.startChainId ? findChain(chains, proposal.startChainId) : null;
+  if (next && !next.targets.length) return { ok: false, reason: "next_stage_unconfigured", proposal };
+  if (starter && !findStage(starter, starter.activeStageId)?.targets.length) return { ok: false, reason: "starter_chain_unconfigured", proposal };
+  const resumeAt = nextBeijingMonthStart(new Date());
+  for (const target of stage.targets) {
+    const paused = await snoozeMonitorItem(env, target.model, target.csc, resumeAt, {
+      requestedBy: String(decidedBy || ""),
+      updateVersion: proposal.source.version,
+      reason: "rollout_release_pause"
+    });
+    if (!paused?.ok) return { ok: false, reason: "pause_failed", proposal };
+  }
+  if (next) {
+    await activateStage(env, chain, next);
+    chain.activeStageId = next.id;
+    chain.status = "active";
+  } else {
+    chain.status = "completed";
+  }
+  if (starter && !starter.enabled) {
+    starter.enabled = true;
+    starter.status = "active";
+    await activateStage(env, starter, findStage(starter, starter.activeStageId));
+  }
+  chain.pendingProposalId = "";
+  proposal.status = "decided";
+  proposal.decision = "approve";
+  proposal.decidedAt = new Date().toISOString();
+  proposal.decidedBy = String(decidedBy || "");
+  await putRolloutProposal(env, proposal);
+  await saveChains(env, chains);
+  await recordMonitorEvent(env, {
+    type: "rollout_advanced",
+    model: proposal.source.model,
+    csc: proposal.source.csc,
+    name: proposal.chainName,
+    detail: `${proposal.stageName} -> ${proposal.nextStageName || "completed"}`,
+    at: proposal.decidedAt
+  });
+  return { ok: true, decision: "approve", proposal, chain, next, starter, resumeAt };
+}
+
+export function rolloutChainPanelText(chain, lang = "zh") {
+  const current = findStage(chain, chain.activeStageId);
+  const stageLines = chain.stages.map((stage) => {
+    const marker = stage.id === chain.activeStageId ? "▶️" : "•";
+    return `${marker} ${stage.name}：${stage.targets.length ? `${stage.targets.length} 台` : "未配置"}`;
+  });
+  if (lang === "en") {
+    return [
+      `📣 ${chain.name} rollout`,
+      "",
+      `Status: ${chain.status}`,
+      `Current region: ${current?.name || "Not configured"}`,
+      `Schedule: ${chain.startTime}–${chain.endTime} Beijing Time`,
+      `Interval: ${chain.intervalMinutes} min`,
+      "",
+      ...stageLines
+    ].join("\n");
+  }
+  return [
+    `📣 ${chain.name} 发布链`,
+    "",
+    `状态：${chain.status === "active" ? "监控中" : chain.status === "awaiting_confirmation" ? "等待确认" : chain.status === "completed" ? "本轮完成" : "待配置"}`,
+    `当前地区：${current?.name || "未配置"}`,
+    `时间：${chain.startTime}–${chain.endTime}（北京时间）`,
+    `间隔：${chain.intervalMinutes} 分钟`,
+    "",
+    ...stageLines
+  ].join("\n");
+}

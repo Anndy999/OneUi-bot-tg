@@ -39,6 +39,7 @@ import {
 import { validateModelCsc } from "./targets.js";
 
 const ALLOWED_USERS_KEY = "allowed:users";
+const ADMIN_USERS_KEY = "admin:users";
 const ACCESS_REQUESTS_KEY = "access:requests";
 const ACCESS_SETTINGS_KEY = "access:settings";
 const MONITOR_ITEMS_KEY = "monitor:items";
@@ -49,6 +50,8 @@ const MONITOR_EVENTS_KEY = "monitor:events";
 const USER_DEVICES_KEY_PREFIX = "user:devices:";
 const USER_ONBOARDING_KEY_PREFIX = "user:onboarding:";
 const USER_DEVICE_LIMIT = 20;
+const ROLLOUT_CHAINS_KEY = "rollout:chains";
+const ROLLOUT_PROPOSAL_PREFIX = "rollout:proposal:";
 
 
 const stateMemoryCache = new Map();
@@ -106,6 +109,12 @@ function flagshipProposalKey(proposalId) {
   const id = String(proposalId || "").trim();
   if (!/^[a-zA-Z0-9_-]{6,64}$/.test(id)) throw new Error("Invalid flagship proposal id");
   return `flagship:proposal:${id}`;
+}
+
+function rolloutProposalKey(proposalId) {
+  const id = String(proposalId || "").trim();
+  if (!/^[a-zA-Z0-9_-]{6,64}$/.test(id)) throw new Error("Invalid rollout proposal id");
+  return `${ROLLOUT_PROPOSAL_PREFIX}${id}`;
 }
 
 function userLanguageKey(chatId) {
@@ -300,6 +309,77 @@ export async function getAllowedUsers(env) {
   return normalized.map((user) => ({ ...user }));
 }
 
+function normalizeAdminUser(user = {}) {
+  const chatId = String(user.chatId || "").trim();
+  if (!/^-?\d{1,24}$/.test(chatId)) return null;
+  return {
+    chatId,
+    name: String(user.name || "").trim().slice(0, 64),
+    addedAt: String(user.addedAt || ""),
+    addedBy: String(user.addedBy || "")
+  };
+}
+
+export function isOwnerChatId(env, chatId) {
+  return isAdminChatId(env, String(chatId || "").trim());
+}
+
+export async function getAdditionalAdmins(env) {
+  const cached = memoryGet(ADMIN_USERS_KEY);
+  if (cached) return cached.map((user) => ({ ...user }));
+  const users = await getControlStateWithLegacyMigration(env, ADMIN_USERS_KEY, []);
+  const ownerId = adminChatId(env);
+  const normalized = (Array.isArray(users) ? users : [])
+    .map(normalizeAdminUser)
+    .filter(Boolean)
+    .filter((user, index, list) => user.chatId !== ownerId && list.findIndex((item) => item.chatId === user.chatId) === index);
+  memoryPut(ADMIN_USERS_KEY, normalized, 30000);
+  return normalized.map((user) => ({ ...user }));
+}
+
+async function setAdditionalAdmins(env, users) {
+  const normalized = (Array.isArray(users) ? users : [])
+    .map(normalizeAdminUser)
+    .filter(Boolean)
+    .filter((user, index, list) => !isOwnerChatId(env, user.chatId) && list.findIndex((item) => item.chatId === user.chatId) === index);
+  await putControlStateOrLegacy(env, ADMIN_USERS_KEY, normalized);
+  memoryPut(ADMIN_USERS_KEY, normalized, 30000);
+  return normalized.map((user) => ({ ...user }));
+}
+
+export async function addAdditionalAdmin(env, chatId, name = "", addedBy = "") {
+  const user = normalizeAdminUser({ chatId, name, addedAt: new Date().toISOString(), addedBy });
+  if (!user) throw new Error("管理员 Chat ID 无效");
+  if (isOwnerChatId(env, user.chatId)) return { ...user, owner: true, existing: true };
+  const users = await getAdditionalAdmins(env);
+  const existing = users.find((item) => item.chatId === user.chatId);
+  if (existing) {
+    existing.name = user.name || existing.name;
+    existing.addedBy = user.addedBy || existing.addedBy;
+    await setAdditionalAdmins(env, users);
+    return { ...existing, existing: true };
+  }
+  users.push(user);
+  await setAdditionalAdmins(env, users);
+  return { ...user, existing: false };
+}
+
+export async function removeAdditionalAdmin(env, chatId) {
+  const id = String(chatId || "").trim();
+  if (isOwnerChatId(env, id)) return { removed: false, owner: true };
+  const users = await getAdditionalAdmins(env);
+  const next = users.filter((user) => user.chatId !== id);
+  if (next.length === users.length) return { removed: false, owner: false };
+  await setAdditionalAdmins(env, next);
+  return { removed: true, owner: false };
+}
+
+export async function getAdminChatIds(env) {
+  const ownerId = adminChatId(env);
+  const admins = await getAdditionalAdmins(env);
+  return [ownerId, ...admins.map((user) => user.chatId)].filter((id, index, values) => id && values.indexOf(id) === index);
+}
+
 export async function setAllowedUsers(env, users) {
   await putControlStateOrLegacy(env, ALLOWED_USERS_KEY, users);
   memoryDelete(ALLOWED_USERS_KEY);
@@ -424,7 +504,9 @@ export async function setUserLanguage(env, chatId, lang) {
 
 export async function getIdentity(env, chatId) {
   const id = String(chatId || "").trim();
-  if (isAdminChatId(env, id)) return "admin";
+  if (isOwnerChatId(env, id)) return "admin";
+  const admins = await getAdditionalAdmins(env);
+  if (admins.some((user) => user.chatId === id)) return "admin";
   const users = await getAllowedUsers(env);
   return users.some((user) => user.chatId === id) ? "allowed" : "unauthorized";
 }
@@ -499,6 +581,8 @@ export async function upsertMonitorItem(env, item) {
     if (item.linkedRuleId !== undefined) target.linkedRuleId = String(item.linkedRuleId || "");
     if (item.linkedAt !== undefined) target.linkedAt = String(item.linkedAt || "");
     if (item.adminDecision !== undefined) target.adminDecision = String(item.adminDecision || "");
+    if (item.rolloutChainId !== undefined) target.rolloutChainId = String(item.rolloutChainId || "").slice(0, 48);
+    if (item.rolloutStageId !== undefined) target.rolloutStageId = String(item.rolloutStageId || "").slice(0, 48);
     if (item.resumeAt !== undefined) target.resumeAt = String(item.resumeAt || "");
     if (item.pausedAt !== undefined) target.pausedAt = String(item.pausedAt || "");
     if (item.pauseSource !== undefined) target.pauseSource = String(item.pauseSource || "");
@@ -523,6 +607,8 @@ export async function upsertMonitorItem(env, item) {
       linkedRuleId: String(item.linkedRuleId || ""),
       linkedAt: String(item.linkedAt || ""),
       adminDecision: String(item.adminDecision || ""),
+      rolloutChainId: String(item.rolloutChainId || "").slice(0, 48),
+      rolloutStageId: String(item.rolloutStageId || "").slice(0, 48),
       resumeAt: String(item.resumeAt || ""),
       pausedAt: String(item.pausedAt || ""),
       pauseSource: String(item.pauseSource || ""),
@@ -646,6 +732,27 @@ export async function putFlagshipProposal(env, proposal) {
 
 export async function getFlagshipProposal(env, proposalId) {
   return getControlStateWithLegacyMigration(env, flagshipProposalKey(proposalId), null);
+}
+
+export async function getRolloutChainsState(env) {
+  const stored = await getControlStateWithLegacyMigration(env, ROLLOUT_CHAINS_KEY, null);
+  return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : null;
+}
+
+export async function setRolloutChainsState(env, value) {
+  await putControlStateOrLegacy(env, ROLLOUT_CHAINS_KEY, value);
+  return value;
+}
+
+export async function putRolloutProposal(env, proposal) {
+  const id = String(proposal?.id || "").trim();
+  const value = { ...proposal, id };
+  await putControlStateOrLegacy(env, rolloutProposalKey(id), value);
+  return value;
+}
+
+export async function getRolloutProposal(env, proposalId) {
+  return getControlStateWithLegacyMigration(env, rolloutProposalKey(proposalId), null);
 }
 
 export async function getMonitorLastCheck(env, model, csc) {

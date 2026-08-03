@@ -39,6 +39,9 @@ import {
   getFirmwareQueryCache,
   getFlagshipProposal,
   getAccessSettings,
+  addAdditionalAdmin,
+  getAdditionalAdmins,
+  getIdentity,
   getMonitorItems,
   getMonitorEvents,
   getMonitorRuntime,
@@ -66,6 +69,13 @@ import {
   removeUserDevice,
   hasCompletedOnboarding,
 } from "../src/state.js";
+import {
+  addRolloutTarget,
+  applyRolloutProposalDecision,
+  createRolloutProposalForUpdate,
+  getRolloutChains,
+  setRolloutChainSettings
+} from "../src/rollout-chain.js";
 import { normalizeReleaseWindowGroups, releaseWindowPeers, validateModelCsc } from "../src/targets.js";
 import {
   applyFlagshipProposalDecision,
@@ -2911,11 +2921,58 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   assert.deepEqual(callbacks, [
     "admin:monitor-menu",
     "admin:access-menu",
+    "admin:rollout-menu",
+    "admin:admins",
     "admin:system-menu",
-    "menu:language",
     "menu:help"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
+});
+
+test("owner can add persistent administrators without changing the owner identity", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await addAdditionalAdmin(env, "992", "Co-admin", "991");
+  assert.equal(await getIdentity(env, "991"), "admin");
+  assert.equal(await getIdentity(env, "992"), "admin");
+  assert.deepEqual((await getAdditionalAdmins(env)).map((entry) => entry.chatId), ["992"]);
+});
+
+test("rollout chains require exact configured targets and create one approval proposal", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await addRolloutTarget(env, "s26", "kr", { model: "SM-S9480", csc: "KOO", name: "S26 KR" });
+  await addRolloutTarget(env, "s26", "eu", { model: "SM-S948B", csc: "EUX", name: "S26 EU" });
+  await addRolloutTarget(env, "s25", "kr", { model: "SM-S9380", csc: "KOO", name: "S25 KR" });
+  await setRolloutChainSettings(env, "s26", { enabled: true, intervalMinutes: 15 });
+  const proposal = await createRolloutProposalForUpdate(env, {
+    model: "SM-S9480", csc: "KOO", name: "S26 KR", rolloutChainId: "s26", rolloutStageId: "kr"
+  }, { latest: "S9480XXU1A" });
+  assert.ok(proposal?.proposal);
+  assert.equal(proposal.proposal.nextStageId, "eu");
+  assert.equal(proposal.proposal.startChainId, "s25");
+  assert.equal((await getRolloutChains(env)).chains.find((chain) => chain.id === "s26").status, "awaiting_confirmation");
+});
+
+test("a confirmed rollout pauses the finished region and activates the next regions", async () => {
+  const scheduler = new MonitorScheduler({ storage: memoryDoStorage() }, {});
+  const env = {
+    FIRMWARE_KV: memoryKv(),
+    TELEGRAM_CHAT_ID: "991",
+    MONITOR_SCHEDULER: schedulerNamespace(scheduler),
+    MONITOR_SCHEDULER_ENABLED: "true"
+  };
+  await addRolloutTarget(env, "s26", "kr", { model: "SM-S9480", csc: "KOO", name: "S26 KR" });
+  await addRolloutTarget(env, "s26", "eu", { model: "SM-S948B", csc: "EUX", name: "S26 EU" });
+  await addRolloutTarget(env, "s25", "kr", { model: "SM-S9380", csc: "KOO", name: "S25 KR" });
+  await setRolloutChainSettings(env, "s26", { enabled: true });
+  const created = await createRolloutProposalForUpdate(env, {
+    model: "SM-S9480", csc: "KOO", name: "S26 KR", rolloutChainId: "s26", rolloutStageId: "kr"
+  }, { latest: "S9480XXU1A" });
+  const applied = await applyRolloutProposalDecision(env, created.proposal.id, "approve", "991");
+  assert.equal(applied.ok, true);
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "KOO").enabled, false);
+  assert.equal(items.find((item) => item.model === "SM-S948B" && item.csc === "EUX").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S9380" && item.csc === "KOO").enabled, true);
 });
 
 test("Telegram command sync clears inherited scopes and publishes the compact command list", async () => {
@@ -3058,10 +3115,10 @@ test("monitor target UI toggles allowed-user update delivery and exposes monitor
   assert.equal((await getMonitorItems(env))[0].notifyAllowedUsers, false);
 
   await callback(700008, "monitor-health", "admin:monitor-health");
-  const health = payloads.find((entry) => String(entry.body.text || "").includes("\u76d1\u63a7\u5065\u5eb7\u5ea6")
+  const health = payloads.find((entry) => String(entry.body.text || "").includes("\u76d1\u63a7\u5065\u5eb7")
     && entry.body.reply_markup?.inline_keyboard?.flat().some((button) => button.callback_data === "admin:monitor-health"));
   assert.ok(health);
-  assert.match(health.body.text, /\u8fde\u7eed\u5931\u8d25: 1/);
+  assert.match(health.body.text, /\u8fde\u7eed\u5931\u8d25\uff1a1/);
 
   await recordMonitorEvent(env, {
     type: "monitor_failed",

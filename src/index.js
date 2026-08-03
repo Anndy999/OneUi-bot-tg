@@ -16,6 +16,14 @@ import { adminHelpParts, guideText } from "./guides.js";
 import { formatSchedule, processMonitorQueueMessage, runMonitor, runScheduledTasks } from "./monitor.js";
 import { coordinatedFirmwareQuery } from "./firmware-query-coordinator.js";
 import { applyFlagshipProposalDecision } from "./flagship-priority.js";
+import {
+  addRolloutTarget,
+  applyRolloutProposalDecision,
+  getRolloutChains,
+  rolloutChainPanelText,
+  setRolloutChainSettings,
+  setRolloutChainStage
+} from "./rollout-chain.js";
 import { querySmartHistory } from "./fus.js";
 import { logQueryMetric } from "./metrics.js";
 import {
@@ -57,6 +65,7 @@ import {
 } from "./telegram.js";
 import {
   addAllowedUser,
+  addAdditionalAdmin,
   beginDeleteAllMonitorConfirmation,
   clearDeleteAllMonitorConfirmation,
   deleteAllPendingUpdates,
@@ -69,6 +78,7 @@ import {
   getAccessRequests,
   getAccessSettings,
   getAllowedUsers,
+  getAdditionalAdmins,
   getCacheSettings,
   getDeleteAllMonitorConfirmation,
   getFirmwareQueryCache,
@@ -83,9 +93,11 @@ import {
   getUserLanguage,
   hasCompletedOnboarding,
   identityLabel,
+  isOwnerChatId,
   isAuthorizedForQuery,
   listPendingUpdates,
   removeAllowedUser,
+  removeAdditionalAdmin,
   removeAccessRequest,
   removeMonitorItem,
   removeUserDevice,
@@ -622,6 +634,15 @@ function languageModeKeyboard(identity = "unauthorized", lang = "zh") {
 
 function mainMenuText(identity, lang = "zh") {
   if (lang === "en") {
+    if (identity === "admin") return "Admin panel\n\nManage monitoring, users, rollout chains, and system settings.";
+    if (identity === "allowed") return "Samsung Firmware\n\nSend Model + CSC, for example: SM-S948B EUX.";
+    return "Samsung Firmware\n\nRequest access to query firmware.";
+  }
+  if (identity === "admin") return "\u7ba1\u7406\u5458\u9762\u677f\n\n\u7ba1\u7406\u76d1\u63a7\u3001\u7528\u6237\u3001\u53d1\u5e03\u94fe\u548c\u7cfb\u7edf\u8bbe\u7f6e\u3002";
+  if (identity === "allowed") return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u53d1\u9001\u201c\u578b\u53f7 CSC\u201d\u5373\u53ef\u67e5\u8be2\u3002\n\u4f8b\u5982\uff1aSM-S948B EUX";
+  return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u7533\u8bf7\u6743\u9650\u540e\u5373\u53ef\u67e5\u8be2\u56fa\u4ef6\u3002";
+  /* legacy copy retained below for historical deployments */
+  if (lang === "en") {
     if (identity === "admin") return "Admin panel\n\nChoose a management area below. Firmware queries still accept Model / CSC text directly.";
     if (identity === "allowed") return "Samsung Firmware Center\n\nSend a Model / CSC directly, for example: 9480 CHC.\nUse My Devices to save shortcuts and choose update notifications.";
     return "Samsung Firmware Center\n\nRequest access first, then send a Model / CSC to query firmware.";
@@ -633,6 +654,24 @@ function mainMenuText(identity, lang = "zh") {
 
 function mainMenuKeyboard(identity, lang = "zh") {
   const en = lang === "en";
+  if (identity === "admin") {
+    return { inline_keyboard: [
+      [{ text: en ? "Monitoring" : "\ud83d\udce1 \u76d1\u63a7", callback_data: "admin:monitor-menu" }, { text: en ? "Users" : "\ud83d\udc65 \u7528\u6237", callback_data: "admin:access-menu" }],
+      [{ text: en ? "Rollout" : "\ud83d\udce3 \u53d1\u5e03\u94fe", callback_data: "admin:rollout-menu" }, { text: en ? "Admins" : "\ud83d\udc51 \u7ba1\u7406\u5458", callback_data: "admin:admins" }],
+      [{ text: en ? "System" : "\u2699\ufe0f \u7cfb\u7edf", callback_data: "admin:system-menu" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+    ] };
+  }
+  if (identity === "allowed") {
+    return { inline_keyboard: [
+      [{ text: en ? "Query firmware" : "\ud83d\udd0d \u67e5\u8be2\u56fa\u4ef6", callback_data: "menu:query-help" }, { text: en ? "My Devices" : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907", callback_data: "device:list" }],
+      [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+    ] };
+  }
+  return { inline_keyboard: [
+    [{ text: en ? "Request access" : "\ud83d\udd10 \u7533\u8bf7\u6743\u9650", callback_data: "user:apply" }],
+    [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+  ] };
+  /* legacy keyboard retained below for callback compatibility */
   if (identity === "admin") {
     return {
       inline_keyboard: [
@@ -683,6 +722,19 @@ async function showMainMenu(env, chatId, identity, messageId = null) {
   return sendTelegramMessage(env, chatId, text, keyboard);
 }
 
+function userSettingsKeyboard(identity, lang = "zh") {
+  const en = lang === "en";
+  return { inline_keyboard: [
+    [{ text: en ? "My info" : "\u6211\u7684\u4fe1\u606f", callback_data: "user:whoami" }, { text: en ? "Status" : "\u670d\u52a1\u72b6\u6001", callback_data: "user:status" }],
+    [{ text: en ? "Language" : "\u8bed\u8a00", callback_data: "menu:language" }],
+    [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
+  ] };
+}
+
+function userSettingsText(lang = "zh") {
+  return lang === "en" ? "Settings\n\nManage language and view account or service status." : "\u8bbe\u7f6e\n\n\u8bbe\u7f6e\u8bed\u8a00\uff0c\u6216\u67e5\u770b\u8d26\u53f7\u4e0e\u670d\u52a1\u72b6\u6001\u3002";
+}
+
 function onboardingText(identity, lang = "zh") {
   if (lang === "en") {
     return [
@@ -712,6 +764,15 @@ function onboardingText(identity, lang = "zh") {
 
 function userDevicesKeyboard(devices, lang = "zh") {
   const en = lang === "en";
+  return { inline_keyboard: [
+    ...devices.flatMap((device) => [[
+      { text: en ? "Query" : "\u67e5\u8be2", callback_data: `device:query:${device.model}:${device.csc}` },
+      { text: device.notifyEnabled !== false ? (en ? "Notifications on" : "\u901a\u77e5\u5f00") : (en ? "Notifications off" : "\u901a\u77e5\u5173"), callback_data: `device:toggle:${device.model}:${device.csc}` },
+      { text: en ? "Remove" : "\u79fb\u9664", callback_data: `device:remove:${device.model}:${device.csc}` }
+    ]]),
+    [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
+  ] };
+  /* legacy keyboard retained below */
   const rows = [];
   for (const device of devices) {
     rows.push([
@@ -725,6 +786,18 @@ function userDevicesKeyboard(devices, lang = "zh") {
 }
 
 async function renderUserDevices(env, chatId, messageId = null) {
+  {
+    const lang = await getUserLanguage(env, chatId);
+    const devices = await getUserDevices(env, chatId);
+    const en = lang === "en";
+    const text = devices.length
+      ? [en ? "📱 My Devices" : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} · ${device.csc}\n   ${en ? "Notifications" : "\u65b0\u7248\u672c\u901a\u77e5"}：${device.notifyEnabled !== false ? (en ? "ON" : "\u5f00") : (en ? "OFF" : "\u5173")}`)].join("\n")
+      : (en ? "📱 My Devices\n\nSave a device from a firmware result." : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907\n\n\u67e5\u8be2\u56fa\u4ef6\u540e\u53ef\u70b9\u201c\u4fdd\u5b58\u8bbe\u5907\u201d\u6dfb\u52a0\u3002");
+    const markup = userDevicesKeyboard(devices, lang);
+    if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
+    return sendTelegramMessage(env, chatId, text, markup);
+  }
+  /* legacy rendering retained below */
   const lang = await getUserLanguage(env, chatId);
   const devices = await getUserDevices(env, chatId);
   const text = devices.length
@@ -740,6 +813,9 @@ async function renderUserDevices(env, chatId, messageId = null) {
 }
 
 function queryHelpText(lang = "zh") {
+  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
+  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
+  /* legacy copy retained below */
   if (lang === "en") {
     return [
       "Firmware query",
@@ -766,6 +842,21 @@ function queryHelpText(lang = "zh") {
 function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed") {
   const normalizedModel = String(model || "").toUpperCase();
   const normalizedCsc = String(csc || "").toUpperCase();
+  {
+  const en = lang === "en";
+  const rows = [[
+    { text: en ? "Refresh" : "\u5237\u65b0", callback_data: `query:refresh:${normalizedModel}:${normalizedCsc}` },
+    { text: en ? "Samsung official" : "\u4e09\u661f\u5b98\u65b9", url: `https://doc.samsungmobile.com/${normalizedModel}/${normalizedCsc}/doc.html` }
+  ]];
+  if (identity === "admin" || identity === "allowed") rows.push([{ text: en ? "Save device" : "\u4fdd\u5b58\u8bbe\u5907", callback_data: `device:add:${normalizedModel}:${normalizedCsc}` }]);
+  if (identity === "admin") rows.push([
+    { text: en ? "Monitor" : "\u52a0\u5165\u76d1\u63a7", callback_data: `monitor-item:add:${normalizedModel}:${normalizedCsc}` },
+    { text: en ? "Clear cache" : "\u6e05\u7f13\u5b58", callback_data: `admin:cache-target:${normalizedModel}:${normalizedCsc}` }
+  ]);
+  rows.push([{ text: en ? "Home" : "\u9996\u9875", callback_data: "menu:home" }]);
+  return { inline_keyboard: rows };
+  }
+  /* legacy keyboard retained below */
   const rows = [[
     {
       text: lang === "en" ? "🔄 Realtime refresh" : "🔄 实时刷新",
@@ -1096,6 +1187,28 @@ function formatRuntimeTime(value, lang) {
 }
 
 async function formatMonitorHealthPanel(env, lang = "zh") {
+  {
+    const en = lang === "en";
+    const items = await getMonitorItems(env);
+    const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
+    const failing = runtimes.filter((runtime) => Number(runtime.failureCount || 0) > 0).length;
+    const lines = [
+      en ? "Monitor health" : "\u76d1\u63a7\u5065\u5eb7",
+      "",
+      `${en ? "Targets" : "\u76ee\u6807"}：${items.length}`,
+      `${en ? "Healthy" : "\u6b63\u5e38"}：${Math.max(0, items.filter((item) => item.enabled !== false).length - failing)}`,
+      `${en ? "Failing" : "\u5931\u8d25"}：${failing}`
+    ];
+    for (const [index, item] of items.slice(0, 20).entries()) {
+      const runtime = runtimes[index] || {};
+      lines.push("", `${Number(runtime.failureCount || 0) ? "⚠️" : "✅"} ${item.model} · ${item.csc}`, `${en ? "Last success" : "\u4e0a\u6b21\u6210\u529f"}：${formatRuntimeTime(runtime.lastSuccessAt, lang)}`, `${en ? "Next check" : "\u4e0b\u6b21\u68c0\u67e5"}：${formatRuntimeTime(runtime.nextCheckAt || runtime.nextAttemptAt, lang)}`, `${en ? "Failures" : "\u8fde\u7eed\u5931\u8d25"}：${runtime.failureCount || 0}`);
+    }
+    return { text: lines.join("\n"), replyMarkup: { inline_keyboard: [
+      [{ text: en ? "Refresh" : "\u5237\u65b0", callback_data: "admin:monitor-health" }],
+      [{ text: en ? "Events" : "\u4e8b\u4ef6", callback_data: "admin:monitor-events" }, { text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:monitor-menu" }]
+    ] } };
+  }
+  /* legacy source-score panel retained below */
   const en = lang === "en";
   const items = await getMonitorItems(env);
   const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
@@ -1408,6 +1521,13 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     return;
   }
 
+  if (data === "menu:settings") {
+    const identity = await getIdentity(env, chatId);
+    const lang = await getUserLanguage(env, chatId);
+    await safeEditOrSend(env, chatId, messageId, userSettingsText(lang), userSettingsKeyboard(identity, lang));
+    return;
+  }
+
   if (data === "menu:help") {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
@@ -1434,7 +1554,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const text = data === "user:whoami"
       ? formatWhoami(chatId, identity, lang)
       : await formatStatus(env, chatId, identity, lang);
-    await safeEditOrSend(env, chatId, messageId, text, mainMenuKeyboard(identity, lang));
+    await safeEditOrSend(env, chatId, messageId, text, userSettingsKeyboard(identity, lang));
     return;
   }
 
@@ -1451,7 +1571,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     return;
   }
 
-  if (data.startsWith("device:add:") || data.startsWith("device:toggle:") || data.startsWith("device:remove:") || data.startsWith("device:query:")) {
+  if (data.startsWith("device:add:") || data.startsWith("device:toggle:") || data.startsWith("device:remove:") || data.startsWith("device:remove-confirm:") || data.startsWith("device:query:")) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity !== "admin" && identity !== "allowed") {
@@ -1477,6 +1597,19 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       return;
     }
     if (action === "remove") {
+      const device = (await getUserDevices(env, chatId)).find((item) => item.model === model && item.csc === csc);
+      await safeEditOrSend(env, chatId, messageId,
+        lang === "en"
+          ? `Remove this device?\n\n${device?.name || `${model} ${csc}`}\n${model} · ${csc}`
+          : `\u786e\u5b9a\u79fb\u9664\u8fd9\u4e2a\u8bbe\u5907\u5417\uff1f\n\n${device?.name || `${model} ${csc}`}\n${model} · ${csc}`,
+        { inline_keyboard: [[
+          { text: lang === "en" ? "Confirm remove" : "\u786e\u8ba4\u79fb\u9664", callback_data: `device:remove-confirm:${model}:${csc}` },
+          { text: lang === "en" ? "Cancel" : "\u53d6\u6d88", callback_data: "device:list" }
+        ]] }
+      );
+      return;
+    }
+    if (action === "remove-confirm") {
       await removeUserDevice(env, chatId, model, csc);
       await renderUserDevices(env, chatId, messageId);
       return;
@@ -1651,6 +1784,30 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     return;
   }
 
+  if (data.startsWith("rollout:")) {
+    const identity = await getIdentity(env, chatId);
+    if (identity !== "admin") {
+      await sendTelegramMessage(env, chatId, "\u4f60\u6ca1\u6709\u6743\u9650\u6267\u884c\u6b64\u64cd\u4f5c\u3002");
+      return;
+    }
+    const [, decision, proposalId] = data.split(":");
+    const lang = await getUserLanguage(env, chatId);
+    const result = await applyRolloutProposalDecision(env, proposalId, decision, chatId);
+    if (!result.ok) {
+      await safeEditOrSend(env, chatId, messageId, lang === "en" ? "This rollout action has already been handled or needs configuration." : "\u8be5\u53d1\u5e03\u94fe\u64cd\u4f5c\u5df2\u5904\u7406\uff0c\u6216\u8fd8\u672a\u5b8c\u6210\u914d\u7f6e\u3002", adminMenuKeyboard(lang));
+      return;
+    }
+    if (result.decision === "skip") {
+      await safeEditOrSend(env, chatId, messageId, lang === "en" ? "No rollout changes were made." : "\u672a\u4fee\u6539\u53d1\u5e03\u94fe\u3002", adminMenuKeyboard(lang));
+      return;
+    }
+    const text = lang === "en"
+      ? `Rollout advanced.\n\nNext: ${result.next?.name || "chain complete"}${result.starter ? `\nAlso started: ${result.starter.name}` : ""}`
+      : `\u53d1\u5e03\u94fe\u5df2\u63a8\u8fdb\u3002\n\n\u4e0b\u4e00\u9636\u6bb5\uff1a${result.next?.name || "\u672c\u8f6e\u5b8c\u6210"}${result.starter ? `\n\u540c\u65f6\u542f\u52a8\uff1a${result.starter.name}` : ""}`;
+    await safeEditOrSend(env, chatId, messageId, text, adminMenuKeyboard(lang));
+    return;
+  }
+
   if (data.startsWith("admin:")) {
     const identity = await getIdentity(env, chatId);
     if (identity !== "admin") {
@@ -1663,6 +1820,51 @@ async function handleCallback(callbackQuery, env, ctx = null) {
 
 async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   const lang = await getUserLanguage(env, chatId);
+  if (data === "admin:rollout-menu") {
+    await renderRolloutMenu(env, chatId, messageId);
+    return;
+  }
+  if (data.startsWith("admin:rollout-interval:")) {
+    const [, , chainId, minutes] = data.split(":");
+    await setRolloutChainSettings(env, chainId, { intervalMinutes: Number(minutes) });
+    await renderRolloutChain(env, chatId, messageId, chainId);
+    return;
+  }
+  if (data.startsWith("admin:rollout-time:")) {
+    const [, , chainId, startTime, endTime] = data.split(":");
+    await setRolloutChainSettings(env, chainId, { startTime, endTime });
+    await renderRolloutChain(env, chatId, messageId, chainId);
+    return;
+  }
+  if (data.startsWith("admin:rollout-enable:")) {
+    const [, , chainId, value] = data.split(":");
+    try {
+      await setRolloutChainSettings(env, chainId, { enabled: value === "on" });
+      await renderRolloutChain(env, chatId, messageId, chainId);
+    } catch (error) {
+      await safeEditOrSend(env, chatId, messageId, String(error.message || error), { inline_keyboard: [[{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: `admin:rollout:${chainId}` }]] });
+    }
+    return;
+  }
+  if (data.startsWith("admin:rollout:")) {
+    const chainId = data.slice("admin:rollout:".length);
+    await renderRolloutChain(env, chatId, messageId, chainId);
+    return;
+  }
+  if (data === "admin:admins") {
+    await renderAdminsPanel(env, chatId, messageId);
+    return;
+  }
+  if (data.startsWith("admin:admin-remove:")) {
+    if (!await requireOwner(env, chatId)) return;
+    const targetId = data.slice("admin:admin-remove:".length);
+    const result = await removeAdditionalAdmin(env, targetId);
+    const text = result.removed
+      ? (lang === "en" ? "Administrator removed." : "\u5df2\u79fb\u9664\u7ba1\u7406\u5458\u3002")
+      : (lang === "en" ? "This administrator cannot be removed." : "\u65e0\u6cd5\u79fb\u9664\u8be5\u7ba1\u7406\u5458\u3002");
+    await safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: [[{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: "admin:admins" }]] });
+    return;
+  }
   if (data.startsWith("admin:cache-target:")) {
     const [, , model, csc] = data.split(":");
     if (!model || !csc) return;
@@ -2543,7 +2745,7 @@ async function formatMonitorPanel(env, lang = "zh") {
   const lines = items.map((item, index) => {
     const runtime = runtimes[index];
     const state = item.enabled === false ? (en ? "PAUSED" : "暂停") : (en ? "ACTIVE" : "监控中");
-    return `${index + 1}. ${item.model} / ${item.csc} · ${state} · ${item.priority || "normal"} · ${runtime.priorityScore || 0}`;
+    return `${index + 1}. ${item.model} / ${item.csc} · ${state} · ${item.priority || "normal"}`;
   });
   const rows = items.slice(0, 20).map((item) => [{
     text: `${item.enabled === false ? "⏸" : "▶"} ${item.model} / ${item.csc}`,
@@ -2563,6 +2765,35 @@ async function formatMonitorItemPanel(env, model, csc, lang = "zh") {
   const items = await getMonitorItems(env);
   const item = items.find((entry) => entry.model === model && entry.csc === csc);
   if (!item) return null;
+  {
+    const [runtime, intervalSettings] = await Promise.all([
+      getMonitorRuntime(env, model, csc),
+      getMonitorIntervalSettings(env)
+    ]);
+    const en = lang === "en";
+    const active = item.enabled !== false;
+    const intervalMinutes = Number(item.intervalMinutes) > 0 ? Number(item.intervalMinutes) : priorityIntervalMinutes(runtime.priorityScore, intervalSettings);
+    const text = [
+      item.name || `${model} / ${csc}`,
+      `${model} · ${csc}`,
+      `${en ? "Status" : "\u72b6\u6001"}：${active ? (en ? "Active" : "\u76d1\u63a7\u4e2d") : (en ? "Paused" : "\u5df2\u6682\u505c")}`,
+      `${en ? "Priority" : "\u4f18\u5148\u7ea7"}：${item.priority || "normal"}`,
+      `${en ? "Interval" : "\u95f4\u9694"}：${active ? `${intervalMinutes} min` : (en ? "Paused" : "\u5df2\u6682\u505c")}`,
+      `${en ? "Failures" : "\u8fde\u7eed\u5931\u8d25"}：${runtime.failureCount || 0}`,
+      !active && item.resumeAt ? `${en ? "Resume" : "\u81ea\u52a8\u6062\u590d"}：${formatBeijingTime(new Date(item.resumeAt), lang)}` : ""
+    ].filter(Boolean).join("\n");
+    return {
+      text,
+      replyMarkup: { inline_keyboard: [
+        [{ text: en ? "High" : "\u9ad8", callback_data: `monitor-item:high:${model}:${csc}` }, { text: en ? "Normal" : "\u666e\u901a", callback_data: `monitor-item:normal:${model}:${csc}` }, { text: en ? "Low" : "\u4f4e", callback_data: `monitor-item:low:${model}:${csc}` }],
+        [{ text: active ? (en ? "Pause" : "\u6682\u505c") : (en ? "Resume" : "\u6062\u590d"), callback_data: `monitor-item:${active ? "pause" : "resume"}:${model}:${csc}` }, { text: en ? "Query" : "\u67e5\u8be2", callback_data: `query:refresh:${model}:${csc}` }],
+        [{ text: item.notifyAllowedUsers !== false ? (en ? "Notifications on" : "\u901a\u77e5\u5f00") : (en ? "Notifications off" : "\u901a\u77e5\u5173"), callback_data: `monitor-item:notify-users:${model}:${csc}` }],
+        [{ text: en ? "Interval" : "\u95f4\u9694", callback_data: "admin:intervals" }, { text: en ? "Remove" : "\u5220\u9664", callback_data: `monitor-item:delete-request:${model}:${csc}` }],
+        [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:monitor-menu" }]
+      ] }
+    };
+  }
+  /* legacy detailed panel retained below */
   const [runtime, intervalSettings] = await Promise.all([
     getMonitorRuntime(env, model, csc),
     getMonitorIntervalSettings(env)
@@ -2679,6 +2910,76 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     if (!(await requireAdmin(env, chatId, identity))) return;
     const lang = await getUserLanguage(env, chatId);
     await sendTelegramMessage(env, chatId, adminMenuText(lang), adminMenuKeyboard(lang));
+    return;
+  }
+
+  if (command === "/admins") {
+    if (!await requireOwner(env, chatId)) return;
+    await renderAdminsPanel(env, chatId);
+    return;
+  }
+
+  if (command === "/adminadd") {
+    if (!await requireOwner(env, chatId)) return;
+    const targetId = String(args[0] || "").trim();
+    if (!targetId) {
+      await sendTelegramMessage(env, chatId, "\u7528\u6cd5\uff1a/adminadd <Chat ID> <\u5907\u6ce8>");
+      return;
+    }
+    const added = await addAdditionalAdmin(env, targetId, args.slice(1).join(" "), chatId);
+    await sendTelegramMessage(env, chatId, added.owner ? "\u8be5 Chat ID \u5df2\u662f\u6240\u6709\u8005\u3002" : (added.existing ? "\u7ba1\u7406\u5458\u4fe1\u606f\u5df2\u66f4\u65b0\u3002" : "\u7ba1\u7406\u5458\u5df2\u6dfb\u52a0\u3002"));
+    return;
+  }
+
+  if (command === "/admindel") {
+    if (!await requireOwner(env, chatId)) return;
+    const result = await removeAdditionalAdmin(env, args[0]);
+    await sendTelegramMessage(env, chatId, result.removed ? "\u7ba1\u7406\u5458\u5df2\u79fb\u9664\u3002" : "\u672a\u627e\u5230\u53ef\u79fb\u9664\u7684\u7ba1\u7406\u5458\u3002");
+    return;
+  }
+
+  if (command === "/chain" || command === "/rollout") {
+    if (!(await requireAdmin(env, chatId, identity))) return;
+    await renderRolloutMenu(env, chatId);
+    return;
+  }
+
+  if (command === "/chainadd") {
+    if (!(await requireAdmin(env, chatId, identity))) return;
+    if (args.length < 4) {
+      await sendTelegramMessage(env, chatId, "\u7528\u6cd5\uff1a/chainadd <s26|s25> <kr|eu|hk|cn> <\u578b\u53f7> <CSC> [\u540d\u79f0]");
+      return;
+    }
+    try {
+      await addRolloutTarget(env, args[0], args[1], { model: args[2], csc: args[3], name: args.slice(4).join(" ") });
+      await sendTelegramMessage(env, chatId, "\u5df2\u6dfb\u52a0\u53d1\u5e03\u94fe\u8bbe\u5907\u3002");
+    } catch (error) {
+      await sendTelegramMessage(env, chatId, `\u6dfb\u52a0\u5931\u8d25\uff1a${error.message}`);
+    }
+    return;
+  }
+
+  if (command === "/chaininterval" || command === "/chaintime" || command === "/chainenable") {
+    if (!(await requireAdmin(env, chatId, identity))) return;
+    try {
+      if (command === "/chaininterval") await setRolloutChainSettings(env, args[0], { intervalMinutes: Number(args[1]) });
+      if (command === "/chaintime") await setRolloutChainSettings(env, args[0], { startTime: args[1], endTime: args[2] });
+      if (command === "/chainenable") await setRolloutChainSettings(env, args[0], { enabled: ["on", "true", "1", "\u5f00\u542f"].includes(String(args[1] || "").toLowerCase()) });
+      await sendTelegramMessage(env, chatId, "\u53d1\u5e03\u94fe\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002");
+    } catch (error) {
+      await sendTelegramMessage(env, chatId, `\u8bbe\u7f6e\u5931\u8d25\uff1a${error.message}`);
+    }
+    return;
+  }
+
+  if (command === "/chainstage") {
+    if (!await requireOwner(env, chatId)) return;
+    try {
+      await setRolloutChainStage(env, args[0], args[1]);
+      await sendTelegramMessage(env, chatId, "\u53d1\u5e03\u94fe\u5f53\u524d\u5730\u533a\u5df2\u66f4\u65b0\u3002");
+    } catch (error) {
+      await sendTelegramMessage(env, chatId, `\u8bbe\u7f6e\u5931\u8d25\uff1a${error.message}`);
+    }
     return;
   }
 
@@ -3431,6 +3732,64 @@ async function requireAdmin(env, chatId, identity) {
   return false;
 }
 
+async function requireOwner(env, chatId) {
+  if (isOwnerChatId(env, chatId)) return true;
+  await sendTelegramMessage(env, chatId, "\u53ea\u6709\u6240\u6709\u8005\u53ef\u6267\u884c\u6b64\u64cd\u4f5c\u3002");
+  return false;
+}
+
+async function renderAdminsPanel(env, chatId, messageId = null) {
+  const lang = await getUserLanguage(env, chatId);
+  if (!isOwnerChatId(env, chatId)) {
+    const text = lang === "en" ? "Only the owner can manage administrators." : "\u53ea\u6709\u6240\u6709\u8005\u53ef\u7ba1\u7406\u7ba1\u7406\u5458\u3002";
+    if (messageId) return safeEditOrSend(env, chatId, messageId, text, adminMenuKeyboard(lang));
+    return sendTelegramMessage(env, chatId, text, adminMenuKeyboard(lang));
+  }
+  const admins = await getAdditionalAdmins(env);
+  const text = lang === "en"
+    ? ["👑 Administrators", "", "Owner: configured Telegram Chat ID", ...admins.map((admin, index) => `${index + 1}. ${admin.name || admin.chatId}\n   ${admin.chatId}`), "", "Add: /adminadd <Chat ID> <name>"].join("\n")
+    : ["\ud83d\udc51 \u7ba1\u7406\u5458", "", "\u6240\u6709\u8005\uff1a\u5f53\u524d\u914d\u7f6e\u7684 Telegram Chat ID", ...admins.map((admin, index) => `${index + 1}. ${admin.name || admin.chatId}\n   ${admin.chatId}`), "", "\u6dfb\u52a0\uff1a/adminadd <Chat ID> <\u5907\u6ce8>"] .join("\n");
+  const rows = admins.map((admin) => [{ text: `${lang === "en" ? "Remove" : "\u79fb\u9664"} ${(admin.name || admin.chatId).slice(0, 24)}`, callback_data: `admin:admin-remove:${admin.chatId}` }]);
+  rows.push([{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]);
+  if (messageId) return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: rows });
+  return sendTelegramMessage(env, chatId, text, { inline_keyboard: rows });
+}
+
+function rolloutMenuKeyboard(chains, lang = "zh") {
+  const en = lang === "en";
+  return {
+    inline_keyboard: [
+      chains.map((chain) => ({ text: `${chain.name} · ${chain.stages.find((stage) => stage.id === chain.activeStageId)?.name || "-"}`, callback_data: `admin:rollout:${chain.id}` })),
+      [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
+    ]
+  };
+}
+
+async function renderRolloutMenu(env, chatId, messageId = null) {
+  const [chains, lang] = await Promise.all([getRolloutChains(env), getUserLanguage(env, chatId)]);
+  const text = lang === "en"
+    ? ["📣 Rollout chains", "", ...chains.chains.map((chain) => `${chain.name} · ${chain.status}`), "", "Configure exact Model / CSC targets before enabling a chain."].join("\n")
+    : ["\ud83d\udce3 \u53d1\u5e03\u94fe", "", ...chains.chains.map((chain) => `${chain.name} · ${chain.status === "active" ? "\u76d1\u63a7\u4e2d" : chain.status === "awaiting_confirmation" ? "\u7b49\u5f85\u786e\u8ba4" : "\u5f85\u914d\u7f6e"}`), "", "\u542f\u7528\u524d\u8bf7\u4e3a\u6bcf\u4e2a\u5730\u533a\u914d\u7f6e\u7cbe\u786e Model / CSC\u3002"].join("\n");
+  const markup = rolloutMenuKeyboard(chains.chains, lang);
+  if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
+  return sendTelegramMessage(env, chatId, text, markup);
+}
+
+async function renderRolloutChain(env, chatId, messageId, chainId) {
+  const [chains, lang] = await Promise.all([getRolloutChains(env), getUserLanguage(env, chatId)]);
+  const chain = chains.chains.find((item) => item.id === chainId);
+  if (!chain) return renderRolloutMenu(env, chatId, messageId);
+  const en = lang === "en";
+  const text = `${rolloutChainPanelText(chain, lang)}\n\n${en ? `Add target: /chainadd ${chain.id} <kr|eu|hk|cn> <MODEL> <CSC> [name]` : `\u6dfb\u52a0\u8bbe\u5907\uff1a/chainadd ${chain.id} <kr|eu|hk|cn> <\u578b\u53f7> <CSC> [\u540d\u79f0]`}`;
+  const rows = [
+    [10, 15, 30, 60].map((minutes) => ({ text: `${minutes}m`, callback_data: `admin:rollout-interval:${chain.id}:${minutes}` })),
+    [{ text: en ? "Daytime" : "\u767d\u5929", callback_data: `admin:rollout-time:${chain.id}:08:00:23:00` }, { text: en ? "All day" : "\u5168\u5929", callback_data: `admin:rollout-time:${chain.id}:00:00:23:59` }],
+    [{ text: chain.enabled ? (en ? "Pause chain" : "\u6682\u505c\u53d1\u5e03\u94fe") : (en ? "Enable chain" : "\u542f\u7528\u53d1\u5e03\u94fe"), callback_data: `admin:rollout-enable:${chain.id}:${chain.enabled ? "off" : "on"}` }],
+    [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:rollout-menu" }]
+  ];
+  return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: rows });
+}
+
 async function handleAutoApprove(env, chatId, args) {
   const mode = String(args[0] || "status").toLowerCase();
 
@@ -4076,6 +4435,16 @@ async function handleMonitorIntervalCommand(env, chatId, args) {
 
 async function formatMonitorList(env) {
   const items = await getMonitorItems(env);
+  {
+  if (!items.length) return "\u5f53\u524d\u6ca1\u6709\u76d1\u63a7\u8bbe\u5907\u3002";
+  const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
+  return ["\ud83d\udce1 \u76d1\u63a7\u5217\u8868", "", ...items.map((item, index) => {
+    const runtime = runtimes[index] || {};
+    const interval = Number(item.intervalMinutes) > 0 ? Number(item.intervalMinutes) : "\u9ed8\u8ba4";
+    return [`${index + 1}. ${item.name || `${item.model} / ${item.csc}`}`, `   ${item.model} · ${item.csc}`, `   \u72b6\u6001\uff1a${item.enabled === false ? "\u5df2\u6682\u505c" : "\u76d1\u63a7\u4e2d"}`, `   \u4f18\u5148\u7ea7\uff1a${item.priority || "normal"}`, `   \u95f4\u9694\uff1a${interval}${typeof interval === "number" ? " \u5206\u949f" : ""}`, `   \u8fde\u7eed\u5931\u8d25\uff1a${runtime.failureCount || 0}`].join("\n");
+  })].join("\n");
+  }
+  /* legacy scored list retained below */
   if (!items.length) return `当前没有监控设备。
 
 可以使用：/add 9380 CHC S25 Ultra 国行`;

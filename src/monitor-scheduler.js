@@ -54,6 +54,7 @@ function normalizeControlStateKey(key) {
     "monitor:items",
     "monitor:intervals",
     "allowed:users",
+    "admin:users",
     "access:requests",
     "access:settings",
     "cache:settings",
@@ -62,7 +63,8 @@ function normalizeControlStateKey(key) {
   ]);
   if (exact.has(value)) return value;
   if (/^user:lang:-?\d{1,24}$/.test(value)) return value;
-  if (/^flagship:proposal:[a-zA-Z0-9_-]{6,64}$/.test(value)) return value;
+  if (/^(?:flagship|rollout):proposal:[a-zA-Z0-9_-]{6,64}$/.test(value)) return value;
+  if (value === "rollout:chains") return value;
   if (/^monitor:boost:SM-[A-Z0-9-]{2,20}:[A-Z0-9]{3}$/.test(value)) return value;
   if (/^acked:update:SM-[A-Z0-9-]{2,20}:[A-Z0-9]{3}$/.test(value)) return value;
   throw new Error("Unsupported control state key");
@@ -1398,8 +1400,8 @@ export class MonitorScheduler {
     const target = validateModelCsc(body.model, body.csc);
     const now = Date.now();
     const resumeAt = Number(body.resumeAt || 0);
-    if (!Number.isFinite(resumeAt) || resumeAt < now + 60_000 || resumeAt > now + 30 * 24 * 60 * 60 * 1000) {
-      throw new Error("Resume time must be between 1 minute and 30 days");
+    if (!Number.isFinite(resumeAt) || resumeAt < now + 60_000 || resumeAt > now + 62 * 24 * 60 * 60 * 1000) {
+      throw new Error("Resume time must be between 1 minute and 62 days");
     }
     const controlKey = controlStateStorageKey("monitor:items");
     const items = normalizeMonitorItems(await this.ctx.storage.get(controlKey) || []);
@@ -1428,7 +1430,8 @@ export class MonitorScheduler {
       resumeAt,
       pausedAt: now,
       updateVersion: String(metadata.updateVersion || ""),
-      requestedBy: String(metadata.requestedBy || "")
+      requestedBy: String(metadata.requestedBy || ""),
+      reason: String(metadata.reason || "")
     };
     await this.ctx.storage.put(`${SNOOZE_PREFIX}${target.key}`, snooze);
     await this.scheduleNextAlarm();
@@ -1496,6 +1499,7 @@ export class MonitorScheduler {
       const langState = await this.ctx.storage.get(controlStateStorageKey(`user:lang:${adminId}`));
       const en = langState === "en";
       for (const { item, snooze } of resumed) {
+        if (snooze.reason === "rollout_release_pause") continue;
         const pausedMinutes = Math.max(1, Math.round((now - Number(snooze.pausedAt || now)) / 60000));
         const text = en
           ? [

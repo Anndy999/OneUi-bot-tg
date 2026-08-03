@@ -35,6 +35,12 @@ import {
   reviewPromptText
 } from "./flagship-priority.js";
 import {
+  createRolloutProposalForUpdate,
+  isRolloutItemWithinSchedule,
+  rolloutProposalKeyboard,
+  rolloutProposalText
+} from "./rollout-chain.js";
+import {
   beijingDateKey,
   beijingParts,
   docUrl,
@@ -49,6 +55,7 @@ import {
 } from "./utils.js";
 import {
   adminIdForMessages,
+  getAdminChatIds,
   claimMonitorCronSlot,
   getAllowedUsers,
   getFirmwareQueryCache,
@@ -203,6 +210,7 @@ export async function selectDueMonitorItems(env, items, schedule, now = new Date
       ? now.getTime() >= nextAttemptAt
       : (!lastCheckedAt || now.getTime() >= intervalDueAt);
     const overdueMs = due ? Math.max(0, now.getTime() - dueAt) : 0;
+    const rolloutScheduled = await isRolloutItemWithinSchedule(env, item, now);
     return {
       item,
       boost,
@@ -213,12 +221,13 @@ export async function selectDueMonitorItems(env, items, schedule, now = new Date
       overdueMs,
       priorityScore: intelligence.priorityScore,
       scoreFactors: intelligence.factors,
-      priorityRank: Number(item.priorityRank || (item.priority === "high" ? 3 : item.priority === "low" ? 1 : 2))
+      priorityRank: Number(item.priorityRank || (item.priority === "high" ? 3 : item.priority === "low" ? 1 : 2)),
+      rolloutScheduled
     };
   });
 
   return evaluated
-    .filter((entry) => entry.due)
+    .filter((entry) => entry.due && entry.rolloutScheduled)
     .sort((a, b) => {
       if (Boolean(a.boost) !== Boolean(b.boost)) return a.boost ? -1 : 1;
       if (a.priorityScore !== b.priorityScore) return b.priorityScore - a.priorityScore;
@@ -595,7 +604,16 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       at: now.toISOString()
     });
     // A version change sends one notification and keeps the normal schedule.
-    const notificationPromise = notifyFirmwareUpdate(env, item, oldLatest, parsed);
+    const rollout = await createRolloutProposalForUpdate(env, item, parsed, now);
+    const updateNotice = notifyFirmwareUpdate(env, item, oldLatest, parsed, {
+      notifyManagers: !rollout?.proposal
+    });
+    const rolloutNotice = rollout?.proposal
+      ? notifyRolloutProposal(env, rollout.proposal)
+      : null;
+    const notificationPromise = rolloutNotice
+      ? Promise.allSettled([updateNotice, rolloutNotice])
+      : updateNotice;
     return {
       status: "updated",
       boostedTargets: boosts.length,
@@ -778,13 +796,13 @@ async function notifyFirstRun(env, item, parsed, now, adminId) {
   }
 }
 
-async function notifyFirmwareUpdate(env, item, oldLatest, parsed) {
+async function notifyFirmwareUpdate(env, item, oldLatest, parsed, options = {}) {
   const now = new Date();
-  const adminId = adminIdForMessages(env);
+  const adminIds = await getAdminChatIds(env);
   const notificationTasks = [];
   const fingerprint = firmwareVersionFingerprint(parsed.latest);
-  if (adminId) {
-    notificationTasks.push((async () => {
+  if (options.notifyManagers !== false) {
+    for (const adminId of adminIds) notificationTasks.push((async () => {
       try {
         const adminLang = await getUserLanguage(env, adminId);
         const delivery = await enqueueTelegramNotification(env, {
@@ -812,7 +830,7 @@ async function notifyFirmwareUpdate(env, item, oldLatest, parsed) {
     })());
   }
   if (notifyAllowedUsersOnUpdate(env) && item.notifyAllowedUsers !== false) {
-    notificationTasks.push(notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminId));
+    notificationTasks.push(notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminIds));
   }
   if (!notificationTasks.length) return { attempted: 0, queued: 0, sent: 0 };
 
@@ -825,6 +843,31 @@ async function notifyFirmwareUpdate(env, item, oldLatest, parsed) {
       sent: total.sent + Number(result.value?.sent || 0)
     };
   }, { attempted: 0, queued: 0, sent: 0 });
+}
+
+async function notifyRolloutProposal(env, proposal) {
+  const adminIds = await getAdminChatIds(env);
+  const results = await Promise.allSettled(adminIds.map(async (chatId) => {
+    const lang = await getUserLanguage(env, chatId);
+    return enqueueTelegramNotification(env, {
+      id: `rollout:${proposal.id}:${chatId}`,
+      chatId,
+      text: rolloutProposalText(proposal, lang),
+      replyMarkup: rolloutProposalKeyboard(proposal, lang),
+      monitorEvent: {
+        model: proposal.source.model,
+        csc: proposal.source.csc,
+        name: proposal.chainName,
+        audience: "manager",
+        source: "rollout_chain"
+      }
+    });
+  }));
+  return {
+    attempted: adminIds.length,
+    queued: results.filter((result) => result.status === "fulfilled" && result.value?.queued).length,
+    sent: results.filter((result) => result.status === "fulfilled" && result.value?.sent).length
+  };
 }
 
 async function notifyFlagshipPriorityPrompts(env, item, parsed, now, adminId) {
@@ -853,11 +896,12 @@ async function notifyFlagshipPriorityPrompts(env, item, parsed, now, adminId) {
   };
 }
 
-async function notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminId) {
+async function notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminIds = []) {
   const users = await getAllowedUsers(env);
+  const managerIds = new Set((Array.isArray(adminIds) ? adminIds : [adminIds]).map((id) => String(id || "")));
   const candidates = users.filter((user) => {
     const chatId = String(user.chatId || "").trim();
-    return chatId && chatId !== String(adminId || "");
+    return chatId && !managerIds.has(chatId);
   });
   const fingerprint = firmwareVersionFingerprint(parsed.latest);
   const recipients = [];
