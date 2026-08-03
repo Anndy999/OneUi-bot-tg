@@ -1,5 +1,6 @@
 import { validateModelCsc } from "./targets.js";
 import { normalizeMonitorItems } from "./config.js";
+import { randomId } from "./runtime/random-id.js";
 import {
   normalizeMonitorIntervalSettings,
   priorityScoreIntervalMinutes,
@@ -598,7 +599,7 @@ export class MonitorScheduler {
   async claimRecord(record, scheduleKey, now) {
     if (record.inFlight && Number(record.lockUntil || 0) > now) return null;
     const lockUntil = now + this.lockDurationMs();
-    const lock = crypto.randomUUID();
+    const lock = randomId();
     const recoveryKey = dueKey(lockUntil, record.key);
     const claimed = {
       ...record,
@@ -945,7 +946,7 @@ export class MonitorScheduler {
     if (current?.status === "sending" && Number(current.lockUntil || 0) > now) {
       return { ok: true, duplicate: false, busy: true, lock: "" };
     }
-    const lock = crypto.randomUUID();
+    const lock = randomId();
     await this.ctx.storage.put(key, {
       status: "sending",
       lock,

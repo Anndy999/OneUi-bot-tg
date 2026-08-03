@@ -1,5 +1,6 @@
 import { validateModelCsc, targetKey } from "./targets.js";
 import { normalizeFirmwareVersion } from "./utils.js";
+import { randomId } from "./runtime/random-id.js";
 import {
   getFlagshipProposal,
   putFlagshipProposal,
@@ -76,7 +77,7 @@ export function flagshipRuleForSource(env, model, csc) {
 export function buildFlagshipActivationProposal(env, sourceItem, parsed, now = new Date()) {
   const rule = flagshipRuleForSource(env, sourceItem.model, sourceItem.csc);
   if (!rule) return null;
-  const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  const id = randomId().replace(/-/g, "").slice(0, 16);
   return {
     id,
     type: "activate_previous_flagship",
@@ -98,7 +99,7 @@ export function buildFlagshipActivationProposal(env, sourceItem, parsed, now = n
 
 export function buildLinkedTargetReviewProposal(item, parsed, now = new Date()) {
   if (item.priority !== "high" || item.prioritySource !== "flagship_linkage") return null;
-  const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  const id = randomId().replace(/-/g, "").slice(0, 16);
   return {
     id,
     type: "review_linked_priority",
