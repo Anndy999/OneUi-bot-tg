@@ -1,0 +1,28 @@
+{
+  "name": "oneui-firmware-worker",
+  "version": "2.13.4",
+  "description": "Official Samsung SmartHistory firmware monitor with global coordination and flagship priority lifecycle on Cloudflare Workers.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "security-check": "node scripts/security-check.mjs",
+    "vps:dev": "node src/vps/server.js",
+    "db:migrate": "node scripts/migrate-vps.mjs",
+    "db:import-cloudflare": "node scripts/import-cloudflare-state.mjs",
+    "vps:start": "node src/vps/production-server.js",
+    "vps:worker": "node src/vps/worker-entry.js"
+  },
+  "dependencies": {
+    "bullmq": "^5.58.5",
+    "fastify": "^5.5.0",
+    "ioredis": "^5.6.1",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "wrangler": "4.107.0"
+  }
+}

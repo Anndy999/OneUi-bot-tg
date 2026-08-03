@@ -1,0 +1,29 @@
+[Unit]
+Description=OneUI Firmware Telegram Bot
+Wants=network-online.target
+After=network-online.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=oneui
+Group=oneui
+WorkingDirectory=/opt/oneui-bot
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/oneui-bot/oneui-bot.env
+ExecStart=/home/oneui/.nvm/versions/node/v22.23.2/bin/node /opt/oneui-bot/src/vps/production-server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/oneui-bot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

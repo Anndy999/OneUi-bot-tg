@@ -1,0 +1,161 @@
+name = "oneui-firmware-worker"
+main = "src/index.js"
+compatibility_date = "2026-07-04"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+DEFAULT_CSC = "CHC"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+DEFAULT_MONITOR_START_TIME = "00:00"
+DEFAULT_MONITOR_END_TIME = "23:59"
+DEFAULT_SKIP_WEEKENDS = "false"
+NOTIFY_ON_FIRST_RUN = "false"
+NOTIFY_ALLOWED_USERS_ON_UPDATE = "true"
+HISTORY_REQUEST_TIMEOUT_MS = "4000"
+HISTORY_TOTAL_DEADLINE_MS = "6000"
+FUS_SESSION_TTL_MS = "600000"
+FUS_CIRCUIT_FAILURE_THRESHOLD = "3"
+FUS_CIRCUIT_COOLDOWN_MS = "30000"
+FUS_MONITOR_LANES = "3"
+FUS_INTERACTIVE_LANES = "3"
+MONITOR_CONCURRENCY = "3"
+MONITOR_MAX_QUERIES_PER_HOUR = "300"
+MONITOR_MAX_CONCURRENT_QUERIES = "3"
+MONITOR_MIN_TARGET_INTERVAL_SECONDS = "60"
+MONITOR_ALLOW_KV_CRON_FALLBACK = "false"
+MONITOR_STATE_READ_CONCURRENCY = "8"
+MONITOR_SCHEDULER_ENABLED = "true"
+MONITOR_SCHEDULER_LOCK_MS = "300000"
+MONITOR_FAILURE_RETRY_BASE_SECONDS = "60"
+MONITOR_FAILURE_RETRY_MAX_SECONDS = "300"
+MONITOR_PERMANENT_ERROR_RETRY_SECONDS = "1800"
+MONITOR_PROGRESS_UPDATE_MS = "1500"
+MONITOR_WATCH_DURATION_SECONDS = "7200"
+MONITOR_HOT_DURATION_SECONDS = "180"
+MONITOR_COOLDOWN_DURATION_SECONDS = "600"
+TELEGRAM_NOTIFY_CONCURRENCY = "4"
+DAILY_MONITOR_SUMMARY_ENABLED = "true"
+DAILY_MONITOR_SUMMARY_HOUR = "21"
+NOTIFICATION_QUEUE_ENABLED = "true"
+FLAGSHIP_LINKAGE_ENABLED = "true"
+QUERY_COORDINATOR_ENABLED = "true"
+QUERY_COORDINATOR_CACHE_MS = "3000"
+QUERY_COORDINATOR_STORAGE_CACHE_SECONDS = "15"
+QUERY_COORDINATOR_NEGATIVE_CACHE_SECONDS = "30"
+RELEASE_WINDOW_ENABLED = "true"
+RELEASE_WINDOW_DURATION_MINUTES = "120"
+RELEASE_WINDOW_INTERVAL_MINUTES = "3"
+UPDATE_REMINDER_INTERVAL_MINUTES = "5"
+UPDATE_REMINDER_MAX_COUNT = "12"
+CACHE_ENABLED = "true"
+ADMIN_REALTIME_QUERY_ENABLED = "false"
+L1_CACHE_TTL_SECONDS = "120"
+FIRMWARE_CACHE_FRESH_SECONDS = "8"
+FIRMWARE_CACHE_STALE_SECONDS = "86400"
+NEGATIVE_CACHE_TTL_SECONDS = "20"
+QUERY_CACHE_TTL_SECONDS = "900"
+GLOBAL_QUERY_CACHE_TTL_SECONDS = "300"
+QUERY_RATE_LIMIT_SECONDS = "3"
+ALLOWED_USER_DAILY_MODEL_QUERY_LIMIT = "10"
+QUERY_STALE_WHILE_REVALIDATE_SECONDS = "120"
+TELEGRAM_QUERY_PLACEHOLDER_ENABLED = "true"
+UNAUTHORIZED_MODE = "reply"
+MONITOR_ITEMS_JSON = '''
+[
+  {"model":"SM-S9480","csc":"CHC","name":"S26 Ultra 国行","priority":"high"},
+  {"model":"SM-S9480","csc":"TGY","name":"S26 Ultra 港版","priority":"high"},
+  {"model":"SM-S948B","csc":"EUX","name":"S26 Ultra 欧版","priority":"high"}
+]
+'''
+
+RELEASE_WINDOW_GROUPS_JSON = '''
+[
+  {
+    "id":"galaxy-s26-ultra",
+    "name":"Galaxy S26 Ultra",
+    "targets":[
+      {"model":"SM-S9480","csc":"CHC","name":"S26 Ultra 国行"},
+      {"model":"SM-S9480","csc":"TGY","name":"S26 Ultra 港版"},
+      {"model":"SM-S9480","csc":"BRI","name":"S26 Ultra 台版"},
+      {"model":"SM-S948B","csc":"EUX","name":"S26 Ultra 欧版"}
+    ]
+  },
+  {
+    "id":"galaxy-s25-ultra",
+    "name":"Galaxy S25 Ultra",
+    "targets":[
+      {"model":"SM-S9380","csc":"CHC","name":"S25 Ultra 国行"},
+      {"model":"SM-S9380","csc":"TGY","name":"S25 Ultra 港版"},
+      {"model":"SM-S9380","csc":"BRI","name":"S25 Ultra 台版"},
+      {"model":"SM-S938B","csc":"EUX","name":"S25 Ultra 欧版"}
+    ]
+  }
+]
+'''
+
+FLAGSHIP_LINKAGE_RULES_JSON = '''
+[
+  {
+    "id":"s26-ultra-chc-to-s25-ultra",
+    "name":"S26 Ultra CHC → S25 Ultra",
+    "source":{"model":"SM-S9480","csc":"CHC","name":"S26 Ultra 国行"},
+    "previousTargets":[
+      {"model":"SM-S9380","csc":"CHC","name":"S25 Ultra 国行"},
+      {"model":"SM-S9380","csc":"TGY","name":"S25 Ultra 港版"}
+    ]
+  },
+  {
+    "id":"s26-ultra-tgy-to-s25-ultra",
+    "name":"S26 Ultra TGY → S25 Ultra",
+    "source":{"model":"SM-S9480","csc":"TGY","name":"S26 Ultra 港版"},
+    "previousTargets":[
+      {"model":"SM-S9380","csc":"TGY","name":"S25 Ultra 港版"}
+    ]
+  },
+  {
+    "id":"s26-ultra-eux-to-s25-ultra",
+    "name":"S26 Ultra EUX → S25 Ultra",
+    "source":{"model":"SM-S948B","csc":"EUX","name":"S26 Ultra 欧版"},
+    "previousTargets":[
+      {"model":"SM-S938B","csc":"EUX","name":"S25 Ultra 欧版"},
+      {"model":"SM-S9380","csc":"TGY","name":"S25 Ultra 港版"}
+    ]
+  }
+]
+'''
+
+[[kv_namespaces]]
+binding = "FIRMWARE_KV"
+id = "00000000000000000000000000000000"
+
+[[durable_objects.bindings]]
+name = "MONITOR_SCHEDULER"
+class_name = "MonitorScheduler"
+
+[[durable_objects.bindings]]
+name = "FIRMWARE_QUERY_COORDINATOR"
+class_name = "FirmwareQueryCoordinator"
+
+[[migrations]]
+tag = "v1-monitor-scheduler"
+new_sqlite_classes = ["MonitorScheduler"]
+
+[[migrations]]
+tag = "v2-firmware-query-coordinator"
+new_sqlite_classes = ["FirmwareQueryCoordinator"]
+
+[[queues.producers]]
+binding = "NOTIFICATION_QUEUE"
+queue = "oneui-firmware-notifications"
+
+[[queues.consumers]]
+queue = "oneui-firmware-notifications"
+max_batch_size = 10
+max_batch_timeout = 0
+max_retries = 5
+max_concurrency = 2
+dead_letter_queue = "oneui-firmware-notifications-dlq"
+retry_delay = 30
