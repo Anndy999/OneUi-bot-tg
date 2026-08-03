@@ -32,7 +32,7 @@ function requireInternal(request, reply, secret) {
 
 export function registerVpsRoutes(app, {
   context,
-  version = context?.config?.version || "2.13.4",
+  version = context?.config?.version || "2.14.0",
   webhookHandler,
   checkHandler,
   diagnosticsHandler,
