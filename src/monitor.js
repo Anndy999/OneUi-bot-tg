@@ -58,6 +58,7 @@ import {
   getMonitorLastCheck,
   getMonitorRuntime,
   getMonitorSchedule,
+  getUserDevices,
   getUserLanguage,
   listPendingUpdates,
   deletePendingUpdate,
@@ -854,11 +855,26 @@ async function notifyFlagshipPriorityPrompts(env, item, parsed, now, adminId) {
 
 async function notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminId) {
   const users = await getAllowedUsers(env);
-  const recipients = users.filter((user) => {
+  const candidates = users.filter((user) => {
     const chatId = String(user.chatId || "").trim();
     return chatId && chatId !== String(adminId || "");
   });
   const fingerprint = firmwareVersionFingerprint(parsed.latest);
+  const recipients = [];
+  for (const user of candidates) {
+    const chatId = String(user.chatId || "").trim();
+    // Preserve the historical broadcast behavior for users who have not yet
+    // configured My Devices. Once a user saves a device, the center becomes
+    // their opt-in subscription list for matching targets only.
+    const devices = await getUserDevices(env, chatId);
+    if (!devices.length || devices.some((device) =>
+      device.model === String(item.model || "").toUpperCase() &&
+      device.csc === String(item.csc || "").toUpperCase() &&
+      device.notifyEnabled !== false
+    )) {
+      recipients.push(user);
+    }
+  }
   const results = await mapLimited(recipients, telegramNotifyConcurrency(env), async (user) => {
     const chatId = String(user.chatId || "").trim();
     try {

@@ -46,6 +46,9 @@ const MONITOR_SCHEDULE_KEY = "monitor:schedule";
 const MONITOR_SUMMARY_SETTINGS_KEY = "monitor:summary-settings";
 const CACHE_SETTINGS_KEY = "cache:settings";
 const MONITOR_EVENTS_KEY = "monitor:events";
+const USER_DEVICES_KEY_PREFIX = "user:devices:";
+const USER_ONBOARDING_KEY_PREFIX = "user:onboarding:";
+const USER_DEVICE_LIMIT = 20;
 
 
 const stateMemoryCache = new Map();
@@ -107,6 +110,115 @@ function flagshipProposalKey(proposalId) {
 
 function userLanguageKey(chatId) {
   return `user:lang:${String(chatId)}`;
+}
+
+function userDevicesKey(chatId) {
+  return `${USER_DEVICES_KEY_PREFIX}${String(chatId || "").trim()}`;
+}
+
+function userOnboardingKey(chatId) {
+  return `${USER_ONBOARDING_KEY_PREFIX}${String(chatId || "").trim()}`;
+}
+
+function normalizeUserDevice(device = {}) {
+  let target;
+  try {
+    target = validateModelCsc(device.model, device.csc);
+  } catch {
+    return null;
+  }
+  const { model, csc } = target;
+  const fallbackName = `${model} ${csc}`;
+  return {
+    id: `${model}:${csc}`,
+    model,
+    csc,
+    name: String(device.name || fallbackName).trim().slice(0, 48) || fallbackName,
+    notifyEnabled: device.notifyEnabled !== false,
+    addedAt: String(device.addedAt || ""),
+    updatedAt: String(device.updatedAt || "")
+  };
+}
+
+export async function getUserDevices(env, chatId) {
+  const id = String(chatId || "").trim();
+  if (!id) return [];
+  const key = userDevicesKey(id);
+  const cached = memoryGet(key);
+  if (cached) return cached.map((device) => ({ ...device }));
+  const stored = await getControlStateWithLegacyMigration(env, key, []);
+  const normalized = (Array.isArray(stored) ? stored : [])
+    .map(normalizeUserDevice)
+    .filter(Boolean)
+    .slice(0, USER_DEVICE_LIMIT);
+  memoryPut(key, normalized, 30000);
+  return normalized.map((device) => ({ ...device }));
+}
+
+export async function upsertUserDevice(env, chatId, device = {}) {
+  const id = String(chatId || "").trim();
+  if (!id) throw new Error("Chat ID is required");
+  const normalized = normalizeUserDevice(device);
+  if (!normalized) throw new Error("Invalid device model or CSC");
+  const devices = await getUserDevices(env, id);
+  const index = devices.findIndex((entry) => entry.id === normalized.id);
+  const now = new Date().toISOString();
+  if (index >= 0) {
+    devices[index] = {
+      ...devices[index],
+      name: normalized.name,
+      notifyEnabled: normalized.notifyEnabled,
+      updatedAt: now
+    };
+  } else {
+    if (devices.length >= USER_DEVICE_LIMIT) throw new Error(`You can save up to ${USER_DEVICE_LIMIT} devices`);
+    devices.push({ ...normalized, addedAt: now, updatedAt: now });
+  }
+  await putControlStateOrLegacy(env, userDevicesKey(id), devices);
+  memoryPut(userDevicesKey(id), devices, 30000);
+  return { ...devices[index >= 0 ? index : devices.length - 1] };
+}
+
+export async function setUserDeviceNotification(env, chatId, model, csc, enabled) {
+  const id = String(chatId || "").trim();
+  const key = `${String(model || "").trim().toUpperCase()}:${String(csc || "").trim().toUpperCase()}`;
+  const devices = await getUserDevices(env, id);
+  const index = devices.findIndex((device) => device.id === key);
+  if (index < 0) return null;
+  devices[index] = { ...devices[index], notifyEnabled: Boolean(enabled), updatedAt: new Date().toISOString() };
+  await putControlStateOrLegacy(env, userDevicesKey(id), devices);
+  memoryPut(userDevicesKey(id), devices, 30000);
+  return { ...devices[index] };
+}
+
+export async function removeUserDevice(env, chatId, model, csc) {
+  const id = String(chatId || "").trim();
+  const key = `${String(model || "").trim().toUpperCase()}:${String(csc || "").trim().toUpperCase()}`;
+  const devices = await getUserDevices(env, id);
+  const next = devices.filter((device) => device.id !== key);
+  if (next.length === devices.length) return false;
+  await putControlStateOrLegacy(env, userDevicesKey(id), next);
+  memoryPut(userDevicesKey(id), next, 30000);
+  return true;
+}
+
+export async function hasCompletedOnboarding(env, chatId) {
+  const id = String(chatId || "").trim();
+  if (!id) return false;
+  const key = userOnboardingKey(id);
+  const stored = await getControlStateWithLegacyMigration(env, key, null);
+  return stored === true || stored?.completed === true;
+}
+
+export async function markOnboardingCompleted(env, chatId) {
+  const id = String(chatId || "").trim();
+  if (!id) return false;
+  const key = userOnboardingKey(id);
+  const completed = await hasCompletedOnboarding(env, id);
+  if (completed) return false;
+  await putControlStateOrLegacy(env, key, { completed: true, completedAt: new Date().toISOString() });
+  memoryPut(key, { completed: true }, 60000);
+  return true;
 }
 
 export function globalQueryCacheKey(model, csc) {

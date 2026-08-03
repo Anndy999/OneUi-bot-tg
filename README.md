@@ -419,6 +419,7 @@ WEBHOOK_SECRET
 /apply
 /whoami
 /status
+/devices
 ```
 
 固件查询仍直接发送 Model / CSC：

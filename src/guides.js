@@ -47,6 +47,7 @@ function englishGuide(identity) {
       "",
       "Send a Model / CSC directly, for example: 9480 CHC.",
       "A result can be refreshed, cache-cleared, or added to monitoring.",
+      "Use Add to My Devices to save a shortcut; /devices manages saved queries and new-version notifications.",
       "",
       "The main menu contains Monitoring, Access, and System & cache.",
       "Target details provide priority, pause/resume, realtime query, and delete actions.",
@@ -64,6 +65,7 @@ function englishGuide(identity) {
       "Send an exact Model / CSC: SM-S948B EUX",
       "",
       "Use the buttons below a result for realtime refresh and official notes.",
+      "Use Add to My Devices to save a shortcut; /devices manages saved queries and new-version notifications.",
       "Each approved user can query the same model up to 10 times per Beijing day; all CSCs share the counter.",
       "The main menu provides account info, status, and language settings."
     ].join("\n");

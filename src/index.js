@@ -79,13 +79,16 @@ import {
   getMonitorSchedule,
   getMonitorSummarySettings,
   getPendingUpdate,
+  getUserDevices,
   getUserLanguage,
+  hasCompletedOnboarding,
   identityLabel,
   isAuthorizedForQuery,
   listPendingUpdates,
   removeAllowedUser,
   removeAccessRequest,
   removeMonitorItem,
+  removeUserDevice,
   restoreMonitorOriginalPlan,
   putAckedUpdate,
   recordFirmwareQueryDemand,
@@ -97,9 +100,12 @@ import {
   setCacheSettings,
   setFirmwareQueryCache,
   setUserLanguage,
+  setUserDeviceNotification,
   snoozeMonitorItem,
   tryClaimAllowedUserDailyModelQuery,
   tryStartQueryRateLimit,
+  upsertUserDevice,
+  markOnboardingCompleted,
   upsertAccessRequest,
   upsertMonitorItem
 } from "./state.js";
@@ -141,7 +147,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.13.4";
+const APP_VERSION = "2.14.0";
 
 export default {
   async fetch(request, env, ctx) {
@@ -301,6 +307,7 @@ async function syncTelegramCommands(env) {
       { command: "apply", description: "\u7533\u8bf7\u67e5\u8be2\u6743\u9650" },
       { command: "whoami", description: "\u67e5\u770b\u6211\u7684 Chat ID" },
       { command: "status", description: "\u67e5\u770b\u673a\u5668\u4eba\u72b6\u6001" },
+      { command: "devices", description: "\u6211\u7684\u8bbe\u5907\u4e0e\u901a\u77e5" },
       { command: "admin", description: "\u6253\u5f00\u7ba1\u7406\u5458\u9762\u677f" },
       { command: "monsnooze", description: "\u5b9a\u65f6\u6682\u505c\u76d1\u63a7" }
     ]
@@ -616,11 +623,11 @@ function languageModeKeyboard(identity = "unauthorized", lang = "zh") {
 function mainMenuText(identity, lang = "zh") {
   if (lang === "en") {
     if (identity === "admin") return "Admin panel\n\nChoose a management area below. Firmware queries still accept Model / CSC text directly.";
-    if (identity === "allowed") return "Samsung Firmware Center\n\nSend a Model / CSC directly, for example: 9480 CHC.";
+    if (identity === "allowed") return "Samsung Firmware Center\n\nSend a Model / CSC directly, for example: 9480 CHC.\nUse My Devices to save shortcuts and choose update notifications.";
     return "Samsung Firmware Center\n\nRequest access first, then send a Model / CSC to query firmware.";
   }
   if (identity === "admin") return "管理员面板\n\n请选择管理区域。固件查询仍可直接发送 Model / CSC。";
-  if (identity === "allowed") return "Samsung 固件查询\n\n直接发送 Model / CSC 即可查询，例如：9480 CHC。";
+  if (identity === "allowed") return "Samsung 固件查询\n\n直接发送 Model / CSC 即可查询，例如：9480 CHC。\n可在“我的设备”保存快捷查询并管理新版本通知。";
   return "Samsung 固件查询\n\n请先申请查询权限，通过后可直接发送 Model / CSC。";
 }
 
@@ -648,6 +655,7 @@ function mainMenuKeyboard(identity, lang = "zh") {
           { text: en ? "Query help" : "查询说明", callback_data: "menu:query-help" },
           { text: en ? "My info" : "我的信息", callback_data: "user:whoami" }
         ],
+        [{ text: en ? "📱 My Devices" : "📱 我的设备", callback_data: "device:list" }],
         [
           { text: en ? "Status" : "机器人状态", callback_data: "user:status" },
           { text: en ? "Language" : "语言", callback_data: "menu:language" }
@@ -673,6 +681,62 @@ async function showMainMenu(env, chatId, identity, messageId = null) {
   const keyboard = mainMenuKeyboard(identity, lang);
   if (messageId) return safeEditOrSend(env, chatId, messageId, text, keyboard);
   return sendTelegramMessage(env, chatId, text, keyboard);
+}
+
+function onboardingText(identity, lang = "zh") {
+  if (lang === "en") {
+    return [
+      "Welcome to OneUI Firmware Center 👋",
+      "",
+      "1. Send Model + CSC, for example: SM-S948B EUX",
+      "2. Use the result card to refresh, open Samsung notes, or save the device",
+      "3. Open My Devices to query saved devices and manage new-version notifications",
+      "",
+      identity === "allowed"
+        ? "You can start querying now. Notifications are sent only when a monitored target has a new version."
+        : "Request access first to query firmware."
+    ].join("\n");
+  }
+  return [
+    "欢迎使用 OneUI 固件中心 👋",
+    "",
+    "1. 发送 Model + CSC，例如：SM-S948B EUX",
+    "2. 在结果卡片中实时刷新、查看三星说明，或保存设备",
+    "3. 打开“我的设备”快捷查询，并管理新版本通知",
+    "",
+    identity === "allowed"
+      ? "你现在可以开始查询。只有监控到新版本时才会推送通知。"
+      : "请先申请查询权限，授权后即可查询固件。"
+  ].join("\n");
+}
+
+function userDevicesKeyboard(devices, lang = "zh") {
+  const en = lang === "en";
+  const rows = [];
+  for (const device of devices) {
+    rows.push([
+      { text: `${en ? "🔎 Query" : "🔎 查询"} ${device.name}`.slice(0, 64), callback_data: `device:query:${device.model}:${device.csc}` },
+      { text: device.notifyEnabled !== false ? (en ? "🔔 ON" : "🔔 开启") : (en ? "🔕 OFF" : "🔕 关闭"), callback_data: `device:toggle:${device.model}:${device.csc}` }
+    ]);
+    rows.push([{ text: en ? "Remove" : "移除", callback_data: `device:remove:${device.model}:${device.csc}` }]);
+  }
+  rows.push([{ text: en ? "Back to home" : "返回首页", callback_data: "menu:home" }]);
+  return { inline_keyboard: rows };
+}
+
+async function renderUserDevices(env, chatId, messageId = null) {
+  const lang = await getUserLanguage(env, chatId);
+  const devices = await getUserDevices(env, chatId);
+  const text = devices.length
+    ? (lang === "en"
+      ? ["📱 My Devices", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} / ${device.csc}\n   New-version notifications: ${device.notifyEnabled !== false ? "ON" : "OFF"}`), "", "Use the buttons below to query or manage subscriptions."].join("\n")
+      : ["📱 我的设备", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} / ${device.csc}\n   新版本通知：${device.notifyEnabled !== false ? "开启" : "关闭"}`), "", "可使用下方按钮查询或管理订阅。"].join("\n"))
+    : (lang === "en"
+      ? "📱 My Devices\n\nNo devices saved yet. Add one from a firmware result card."
+      : "📱 我的设备\n\n还没有保存设备。完成一次固件查询后，可在结果卡片中添加。")
+  const markup = userDevicesKeyboard(devices, lang);
+  if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
+  return sendTelegramMessage(env, chatId, text, markup);
 }
 
 function queryHelpText(lang = "zh") {
@@ -712,6 +776,12 @@ function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed") {
       url: `https://doc.samsungmobile.com/${normalizedModel}/${normalizedCsc}/doc.html`
     }
   ]];
+  if (identity === "admin" || identity === "allowed") {
+    rows.push([{
+      text: lang === "en" ? "📱 Add to My Devices" : "📱 添加到我的设备",
+      callback_data: `device:add:${normalizedModel}:${normalizedCsc}`
+    }]);
+  }
   if (identity === "admin") {
     rows.push([
       {
@@ -1268,6 +1338,8 @@ function beginCallback(callbackId) {
 function callbackProgressText(data) {
   if (data.startsWith("query:refresh:") || data.startsWith("csc:query:")) return "正在实时查询… / Querying…";
   if (data.startsWith("csc:more:")) return "正在读取官方 CSC… / Loading…";
+  if (data.startsWith("device:query:")) return "正在查询… / Querying…";
+  if (/^device:(?:add|toggle|remove):/.test(data)) return "正在保存… / Saving…";
   if (data === "admin:checknow") return "正在启动检查… / Starting…";
   if (/^(?:admin:(?:schedule:|autoapprove:|cache:|realtime:|interval)|monitor-item:|monitor-update:|flagship:|access:|ack:)/.test(data)) {
     return "正在保存… / Saving…";
@@ -1363,6 +1435,63 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       ? formatWhoami(chatId, identity, lang)
       : await formatStatus(env, chatId, identity, lang);
     await safeEditOrSend(env, chatId, messageId, text, mainMenuKeyboard(identity, lang));
+    return;
+  }
+
+  if (data === "device:list") {
+    const identity = await getIdentity(env, chatId);
+    if (identity !== "admin" && identity !== "allowed") {
+      const lang = await getUserLanguage(env, chatId);
+      await safeEditOrSend(env, chatId, messageId, lang === "en"
+        ? "My Devices is available after query access is approved."
+        : "获得查询权限后即可使用“我的设备”。", mainMenuKeyboard(identity, lang));
+      return;
+    }
+    await renderUserDevices(env, chatId, messageId);
+    return;
+  }
+
+  if (data.startsWith("device:add:") || data.startsWith("device:toggle:") || data.startsWith("device:remove:") || data.startsWith("device:query:")) {
+    const identity = await getIdentity(env, chatId);
+    const lang = await getUserLanguage(env, chatId);
+    if (identity !== "admin" && identity !== "allowed") {
+      await safeEditOrSend(env, chatId, messageId, lang === "en" ? "Query access is required." : "需要查询权限。", mainMenuKeyboard(identity, lang));
+      return;
+    }
+    const [, action, model, csc] = data.split(":");
+    if (!model || !csc) return;
+    if (action === "add") {
+      await upsertUserDevice(env, chatId, { model, csc, name: `${model} ${csc}`, notifyEnabled: true });
+      await renderUserDevices(env, chatId, messageId);
+      return;
+    }
+    if (action === "toggle") {
+      const devices = await getUserDevices(env, chatId);
+      const current = devices.find((device) => device.model === model && device.csc === csc);
+      if (!current) {
+        await renderUserDevices(env, chatId, messageId);
+        return;
+      }
+      await setUserDeviceNotification(env, chatId, model, csc, current.notifyEnabled === false);
+      await renderUserDevices(env, chatId, messageId);
+      return;
+    }
+    if (action === "remove") {
+      await removeUserDevice(env, chatId, model, csc);
+      await renderUserDevices(env, chatId, messageId);
+      return;
+    }
+    if (!(await enforceInteractiveQueryLimits(env, chatId, identity, model, lang, messageId))) return;
+    await safeEditOrSend(env, chatId, messageId, lang === "en"
+      ? `Querying Samsung SmartHistory...\nModel: ${model}\nCSC: ${csc}`
+      : `正在查询 Samsung SmartHistory...\n型号：${model}\n地区：${csc}`);
+    runBackground(ctx, handleManualQuery(env, chatId, `${model} ${csc}`, {
+      identity,
+      ctx,
+      query: { model, csc },
+      targetMessageId: messageId,
+      silentPlaceholder: true
+    }));
     return;
   }
 
@@ -2504,7 +2633,14 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     if (args[0] === "zh" || args[0] === "en") {
       await setUserLanguage(env, chatId, args[0]);
     }
-    await showMainMenu(env, chatId, identity);
+    const firstStart = !await hasCompletedOnboarding(env, chatId);
+    if (firstStart) {
+      await markOnboardingCompleted(env, chatId);
+      const lang = await getUserLanguage(env, chatId);
+      await sendTelegramMessage(env, chatId, onboardingText(identity, lang), mainMenuKeyboard(identity, lang));
+    } else {
+      await showMainMenu(env, chatId, identity);
+    }
     return;
   }
 
@@ -2567,6 +2703,18 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
 
   if (command === "/status") {
     await sendTelegramMessage(env, chatId, await formatStatus(env, chatId, identity, await getUserLanguage(env, chatId)));
+    return;
+  }
+
+  if (command === "/devices" || command === "/mydevices" || command === "/subscriptions") {
+    if (!(await isAuthorizedForQuery(env, chatId))) {
+      const lang = await getUserLanguage(env, chatId);
+      await sendTelegramMessage(env, chatId, lang === "en"
+        ? "Query access is required before using My Devices."
+        : "获得查询权限后才能使用“我的设备”。", mainMenuKeyboard(identity, lang));
+      return;
+    }
+    await renderUserDevices(env, chatId);
     return;
   }
 

@@ -45,6 +45,7 @@ import {
   getMonitorSchedule,
   getMonitorSummarySettings,
   getPendingUpdate,
+  getUserDevices,
   getUserLanguage,
   putFlagshipProposal,
   putMonitorBoost,
@@ -58,8 +59,12 @@ import {
   setMonitorItems,
   setMonitorLastCheck,
   setUserLanguage,
+  setUserDeviceNotification,
   tryStartQueryRateLimit,
-  upsertMonitorItem
+  upsertMonitorItem,
+  upsertUserDevice,
+  removeUserDevice,
+  hasCompletedOnboarding,
 } from "../src/state.js";
 import { normalizeReleaseWindowGroups, releaseWindowPeers, validateModelCsc } from "../src/targets.js";
 import {
@@ -2934,7 +2939,62 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
   assert.ok(sync);
   const clears = payloads.filter((entry) => entry.url.includes("/deleteMyCommands"));
   assert.equal(clears.length, 4);
-  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "language", "apply", "whoami", "status", "admin", "monsnooze"]);
+  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "language", "apply", "whoami", "status", "devices", "admin", "monsnooze"]);
+});
+
+test("My Devices persists shortcuts, deduplicates targets, and toggles subscriptions", async () => {
+  resetStateMemoryCache();
+  const env = { FIRMWARE_KV: memoryKv() };
+  const first = await upsertUserDevice(env, "device-user", {
+    model: "sm-s948b",
+    csc: "eux",
+    name: "Daily phone"
+  });
+  assert.equal(first.id, "SM-S948B:EUX");
+  assert.equal(first.notifyEnabled, true);
+  const updated = await upsertUserDevice(env, "device-user", {
+    model: "SM-S948B",
+    csc: "EUX",
+    name: "Updated phone",
+    notifyEnabled: false
+  });
+  assert.equal(updated.name, "Updated phone");
+  assert.equal((await getUserDevices(env, "device-user")).length, 1);
+  await setUserDeviceNotification(env, "device-user", "SM-S948B", "EUX", true);
+  assert.equal((await getUserDevices(env, "device-user"))[0].notifyEnabled, true);
+  assert.equal(await removeUserDevice(env, "device-user", "SM-S948B", "EUX"), true);
+  assert.deepEqual(await getUserDevices(env, "device-user"), []);
+});
+
+test("first /start shows onboarding once and My Devices is available to the owner", async () => {
+  resetStateMemoryCache();
+  const payloads = [];
+  const env = {
+    FIRMWARE_KV: memoryKv(),
+    WEBHOOK_SECRET: "test-header-secret",
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "9911"
+  };
+  assert.equal(await hasCompletedOnboarding(env, "9911"), false);
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 700010,
+    message: { message_id: 1, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
+  }, payloads);
+  assert.equal(await hasCompletedOnboarding(env, "9911"), true);
+  assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")));
+  const secondPayloads = [];
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 700011,
+    message: { message_id: 2, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
+  }, secondPayloads);
+  assert.equal(secondPayloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")), false);
+  await upsertUserDevice(env, "9911", { model: "SM-S948B", csc: "EUX" });
+  const devicePayloads = [];
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 700012,
+    message: { message_id: 3, chat: { id: 9911 }, from: { id: 9911 }, text: "/devices" }
+  }, devicePayloads);
+  assert.ok(devicePayloads.some((entry) => String(entry.body.text || "").includes("我的设备")));
 });
 
 test("monitor target buttons change priority and require delete confirmation", async () => {
