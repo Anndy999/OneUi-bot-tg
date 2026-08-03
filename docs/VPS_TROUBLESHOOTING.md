@@ -108,3 +108,18 @@ and source archives outside `/opt/oneui-bot`, test that dumps can be read, and
 retain enough history to cover one successful update and one rollback. Treat
 Redis persistence as supplementary; PostgreSQL is the durable application
 store.
+
+## `npm: command not found` during update
+
+The OneUI service uses the Node.js installation owned by the `oneui` user.
+The update script calls that installation by its absolute path, so a normal
+update should not depend on root's interactive shell PATH. If the path is
+missing, inspect the installed runtime without printing the environment file:
+
+```bash
+sudo test -x /home/oneui/.nvm/versions/node/v22.23.2/bin/npm && echo npm-ok
+sudo systemctl show oneui-bot.service -p ExecStart --no-pager
+```
+
+Do not install a second Node.js runtime or change the system default Node.js
+without reviewing the systemd unit and the application runtime first.

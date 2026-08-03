@@ -5,6 +5,7 @@ PROJECT_DIR="/opt/oneui-bot"
 SERVICE="oneui-bot.service"
 ENV_FILE="/etc/oneui-bot/oneui-bot.env"
 HEALTH_URL="http://127.0.0.1:8787/health"
+NPM_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/npm"
 
 log() { printf "[oneui-update] %s\n" "$*"; }
 die() { printf "[oneui-update] ERROR: %s\n" "$*" >&2; exit 1; }
@@ -13,6 +14,7 @@ git_cmd() { git -c "safe.directory=${PROJECT_DIR}" "$@"; }
 [[ "${EUID}" -eq 0 ]] || die "请使用 sudo 运行此脚本。"
 [[ -d "${PROJECT_DIR}/.git" ]] || die "项目尚未配置 Git 仓库。"
 [[ -f "${ENV_FILE}" ]] || die "缺少运行时环境文件：${ENV_FILE}"
+[[ -x "${NPM_BIN}" ]] || die "未找到 OneUI Node.js/npm：${NPM_BIN}"
 
 cd "${PROJECT_DIR}"
 branch="$(git_cmd branch --show-current)"
@@ -28,13 +30,13 @@ if [[ "$(git_cmd rev-parse HEAD)" == "${previous_commit}" ]]; then
   log "没有新的代码提交，仍然执行健康检查。"
 else
   log "安装锁定依赖。"
-  npm ci --ignore-scripts
+  "${NPM_BIN}" ci --ignore-scripts
   log "运行测试。"
-  npm test
+  "${NPM_BIN}" test
   log "运行安全扫描。"
-  npm run security-check
+  "${NPM_BIN}" run security-check
   log "运行生产依赖审计。"
-  npm audit --omit=dev --audit-level=high
+  "${NPM_BIN}" audit --omit=dev --audit-level=high
 fi
 
 systemctl daemon-reload
