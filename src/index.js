@@ -20,6 +20,7 @@ import {
   addRolloutTarget,
   applyRolloutProposalDecision,
   getRolloutChains,
+  restartDependentRolloutChain,
   rolloutChainPanelText,
   setRolloutChainSettings,
   setRolloutChainStage
@@ -554,16 +555,17 @@ async function handlePendingDeleteAllConfirmation(env, chatId, identity, text) {
     return false;
   }
 
-  const [items, lang] = await Promise.all([
+  const [allItems, lang] = await Promise.all([
     getMonitorItems(env),
     getUserLanguage(env, chatId)
   ]);
-  await setMonitorItems(env, []);
+  const items = standardMonitorItems(allItems);
+  await setMonitorItems(env, allItems.filter(isRolloutManagedMonitor));
   await clearDeleteAllMonitorConfirmation(env, chatId);
   const panel = await formatMonitorCenterPanel(env, lang);
   const summary = lang === "en"
-    ? `\u2705 All monitoring targets deleted\n\nDeleted: ${items.length}`
-    : `\u2705 \u5df2\u5220\u9664\u6240\u6709\u76d1\u63a7\u8bbe\u5907\n\n\u5220\u9664\u6570\u91cf\uff1a${items.length}`;
+    ? `\u2705 Regular monitoring targets deleted\n\nDeleted: ${items.length}`
+    : `\u2705 \u5df2\u5220\u9664\u6240\u6709\u666e\u901a\u76d1\u63a7\u8bbe\u5907\n\n\u5220\u9664\u6570\u91cf\uff1a${items.length}`;
   await sendTelegramMessage(env, chatId, `${summary}\n\n${panel.text}`, panel.replyMarkup);
   return true;
 }
@@ -1110,9 +1112,17 @@ function monitorCenterButtonText(entry, lang = "zh") {
   return `${prefix} ${item.model} / ${item.csc}${detail}`;
 }
 
+function isRolloutManagedMonitor(item) {
+  return Boolean(item?.rolloutChainId && item?.rolloutStageId);
+}
+
+function standardMonitorItems(items) {
+  return items.filter((item) => !isRolloutManagedMonitor(item));
+}
+
 async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
   const en = lang === "en";
-  const items = await getMonitorItems(env);
+  const items = standardMonitorItems(await getMonitorItems(env));
   const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
   const entries = items.map((item, index) => ({
     item,
@@ -1163,7 +1173,7 @@ async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
       { text: en ? "HIGH priority" : "\u9ad8\u4f18\u5148\u7ea7", callback_data: "admin:high" }
     ],
     [
-      { text: en ? "Delete all monitors" : "\u5220\u9664\u6240\u6709\u76d1\u63a7", callback_data: "admin:monitor-delete-all" }
+      { text: en ? "Delete regular monitors" : "\u5220\u9664\u666e\u901a\u76d1\u63a7", callback_data: "admin:monitor-delete-all" }
     ],
     [{ text: en ? "Home" : "\u8fd4\u56de\u4e3b\u83dc\u5355", callback_data: "menu:home" }]
   );
@@ -1171,7 +1181,7 @@ async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
     en ? "\u{1F4CA} Monitoring center" : "\u{1F4CA} \u76d1\u63a7\u4e2d\u5fc3",
     "",
     `${en ? "Current view" : "\u5f53\u524d\u89c6\u56fe"}: ${monitorCenterLabel(selected, lang)}`,
-    `${en ? "Targets shown" : "\u8bbe\u5907\u5217\u8868"}: ${displayed.length}/${items.length}`
+    `${en ? "Regular monitors" : "\u666e\u901a\u76d1\u63a7"}: ${displayed.length}/${items.length}`
   ];
   if (!items.length) lines.push("", en ? "No monitoring targets yet." : "\u5f53\u524d\u6ca1\u6709\u76d1\u63a7\u8bbe\u5907\u3002");
   else if (!displayed.length) lines.push("", en ? "No targets match this status." : "\u5f53\u524d\u6ca1\u6709\u7b26\u5408\u6b64\u72b6\u6001\u7684\u8bbe\u5907\u3002");
@@ -1189,7 +1199,7 @@ function formatRuntimeTime(value, lang) {
 async function formatMonitorHealthPanel(env, lang = "zh") {
   {
     const en = lang === "en";
-    const items = await getMonitorItems(env);
+    const items = standardMonitorItems(await getMonitorItems(env));
     const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
     const failing = runtimes.filter((runtime) => Number(runtime.failureCount || 0) > 0).length;
     const lines = [
@@ -1804,7 +1814,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       return;
     }
     if (result.decision === "skip") {
-      await safeEditOrSend(env, chatId, messageId, lang === "en" ? "No rollout changes were made." : "\u672a\u4fee\u6539\u53d1\u5e03\u94fe\u3002", adminMenuKeyboard(lang));
+      await safeEditOrSend(env, chatId, messageId, lang === "en" ? "Kept the current region. This update will not advance the rollout." : "\u5df2\u4fdd\u6301\u5f53\u524d\u5730\u533a\uff0c\u672c\u6b21\u66f4\u65b0\u4e0d\u63a8\u8fdb\u53d1\u5e03\u94fe\u3002", adminMenuKeyboard(lang));
       return;
     }
     const text = lang === "en"
@@ -1849,6 +1859,17 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
       await renderRolloutChain(env, chatId, messageId, chainId);
     } catch (error) {
       await safeEditOrSend(env, chatId, messageId, String(error.message || error), { inline_keyboard: [[{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: `admin:rollout:${chainId}` }]] });
+    }
+    return;
+  }
+  if (data.startsWith("admin:rollout-restart:")) {
+    if (!await requireOwner(env, chatId)) return;
+    const chainId = data.slice("admin:rollout-restart:".length);
+    try {
+      await restartDependentRolloutChain(env, chainId);
+      await renderRolloutChain(env, chatId, messageId, chainId);
+    } catch (error) {
+      await safeEditOrSend(env, chatId, messageId, String(error.message || error), { inline_keyboard: [[{ text: lang === "en" ? "Back" : "返回", callback_data: `admin:rollout:${chainId}` }]] });
     }
     return;
   }
@@ -1923,7 +1944,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   }
 
   if (data === "admin:monitor-retry-failed") {
-    const items = await getMonitorItems(env);
+    const items = standardMonitorItems(await getMonitorItems(env));
     let queued = 0;
     for (const item of items) {
       if (item.enabled === false) continue;
@@ -1941,14 +1962,14 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   }
 
   if (data === "admin:monitor-delete-all") {
-    const items = await getMonitorItems(env);
+    const items = standardMonitorItems(await getMonitorItems(env));
     await safeEditOrSend(
       env,
       chatId,
       messageId,
       lang === "en"
-        ? `Delete all ${items.length} monitoring targets? This cannot be undone.`
-        : `\u786e\u8ba4\u5220\u9664\u5168\u90e8 ${items.length} \u4e2a\u76d1\u63a7\u8bbe\u5907\uff1f\u6b64\u64cd\u4f5c\u65e0\u6cd5\u64a4\u9500\u3002`,
+        ? `Delete all ${items.length} regular monitoring targets? Rollout-chain targets are protected.`
+        : `\u786e\u8ba4\u5220\u9664\u5168\u90e8 ${items.length} \u4e2a\u666e\u901a\u76d1\u63a7\u8bbe\u5907\uff1f\u53d1\u5e03\u94fe\u76ee\u6807\u4e0d\u4f1a\u88ab\u5220\u9664\u3002`,
       {
         inline_keyboard: [
           [{ text: lang === "en" ? "Continue" : "\u7ee7\u7eed\u786e\u8ba4", callback_data: "admin:monitor-delete-all-confirm" }],
@@ -2609,6 +2630,17 @@ async function handlePriorityLifecycleCallback(env, chatId, messageId, data) {
     return;
   }
 
+  if (isRolloutManagedMonitor(existing) && action !== "view") {
+    await safeEditOrSend(
+      env,
+      chatId,
+      messageId,
+      lang === "en" ? "This target is managed by its rollout chain." : "该设备由发布链管理，不能在普通监控中修改。",
+      { inline_keyboard: [[{ text: lang === "en" ? "View rollout" : "查看发布链", callback_data: `admin:rollout:${existing.rolloutChainId}` }]] }
+    );
+    return;
+  }
+
   if (action === "add" || action === "view") {
     const panel = await formatMonitorItemPanel(env, model, csc, lang);
     const text = added
@@ -2693,7 +2725,7 @@ async function handlePriorityLifecycleCallback(env, chatId, messageId, data) {
 }
 
 async function formatHighPriorityPanel(env, lang = "zh") {
-  const items = await getMonitorItems(env);
+  const items = standardMonitorItems(await getMonitorItems(env));
   const displayed = items.filter((item) => item.priority === "high" || (item.paused && item.prioritySource === "flagship_linkage"));
   if (!displayed.length) {
     return {
@@ -2737,7 +2769,7 @@ async function formatHighPriorityPanel(env, lang = "zh") {
 }
 
 async function formatMonitorPanel(env, lang = "zh") {
-  const items = await getMonitorItems(env);
+  const items = standardMonitorItems(await getMonitorItems(env));
   const en = lang === "en";
   if (!items.length) {
     return {
@@ -2771,6 +2803,18 @@ async function formatMonitorItemPanel(env, model, csc, lang = "zh") {
   const items = await getMonitorItems(env);
   const item = items.find((entry) => entry.model === model && entry.csc === csc);
   if (!item) return null;
+  if (isRolloutManagedMonitor(item)) {
+    const en = lang === "en";
+    return {
+      text: en
+        ? [`${item.name || `${model} / ${csc}`}`, `${model} · ${csc}`, "", `Managed by rollout: ${item.rolloutChainId.toUpperCase()} · ${item.rolloutStageId.toUpperCase()}`, "Use the Rollout panel to change its schedule or state."].join("\n")
+        : [`${item.name || `${model} / ${csc}`}`, `${model} · ${csc}`, "", `发布链管理：${item.rolloutChainId.toUpperCase()} · ${item.rolloutStageId.toUpperCase()}`, "请在“发布链”面板调整时间或状态。"].join("\n"),
+      replyMarkup: { inline_keyboard: [
+        [{ text: en ? "View rollout" : "查看发布链", callback_data: `admin:rollout:${item.rolloutChainId}` }, { text: en ? "Query" : "查询", callback_data: `query:refresh:${model}:${csc}` }],
+        [{ text: en ? "Back" : "返回", callback_data: "admin:monitor-menu" }]
+      ] }
+    };
+  }
   {
     const [runtime, intervalSettings] = await Promise.all([
       getMonitorRuntime(env, model, csc),
@@ -2991,6 +3035,17 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
       await sendTelegramMessage(env, chatId, "\u53d1\u5e03\u94fe\u5f53\u524d\u5730\u533a\u5df2\u66f4\u65b0\u3002");
     } catch (error) {
       await sendTelegramMessage(env, chatId, `\u8bbe\u7f6e\u5931\u8d25\uff1a${error.message}`);
+    }
+    return;
+  }
+
+  if (command === "/chainstart") {
+    if (!await requireOwner(env, chatId)) return;
+    try {
+      await restartDependentRolloutChain(env, args[0]);
+      await sendTelegramMessage(env, chatId, "从属发布链已从韩版重新启动。");
+    } catch (error) {
+      await sendTelegramMessage(env, chatId, `设置失败：${error.message}`);
     }
     return;
   }
@@ -3777,11 +3832,21 @@ function rolloutMenuKeyboard(chains, lang = "zh") {
   };
 }
 
+function rolloutMenuStatus(chain, chains, lang = "zh") {
+  const en = lang === "en";
+  if (chain.id === "s25" && !chain.enabled) {
+    return en ? "waiting for S26 Korea" : "等待 S26 韩版确认";
+  }
+  if (chain.status === "awaiting_confirmation") return en ? "awaiting decision" : "等待确认";
+  if (chain.status === "completed") return en ? "round complete" : "本轮完成";
+  return chain.enabled ? (en ? "monitoring" : "监控中") : (en ? "paused" : "已暂停");
+}
+
 async function renderRolloutMenu(env, chatId, messageId = null) {
   const [chains, lang] = await Promise.all([getRolloutChains(env), getUserLanguage(env, chatId)]);
   const text = lang === "en"
-    ? ["📣 Rollout chains", "", ...chains.chains.map((chain) => `${chain.name} · ${chain.status}`), "", "Configure exact Model / CSC targets before enabling a chain."].join("\n")
-    : ["\ud83d\udce3 \u53d1\u5e03\u94fe", "", ...chains.chains.map((chain) => `${chain.name} · ${chain.status === "active" ? "\u76d1\u63a7\u4e2d" : chain.status === "awaiting_confirmation" ? "\u7b49\u5f85\u786e\u8ba4" : "\u5f85\u914d\u7f6e"}`), "", "\u542f\u7528\u524d\u8bf7\u4e3a\u6bcf\u4e2a\u5730\u533a\u914d\u7f6e\u7cbe\u786e Model / CSC\u3002"].join("\n");
+    ? ["📣 Release monitoring", "", ...chains.chains.map((chain) => `${chain.name} · ${rolloutMenuStatus(chain, chains.chains, lang)}`), "", "Start S26 manually. S25 starts automatically after S26 Korea is confirmed.", "Any configured model in the current region triggers the decision card."].join("\n")
+    : ["\ud83d\udce3 \u53d1\u5e03\u94fe", "", ...chains.chains.map((chain) => `${chain.name} · ${rolloutMenuStatus(chain, chains.chains, lang)}`), "", "\u4ec5\u9700\u624b\u52a8\u542f\u7528 S26\uff1bS25 \u5c06\u5728 S26 \u97e9\u7248\u786e\u8ba4\u540e\u81ea\u52a8\u542f\u52a8\u3002", "\u5f53\u524d\u5730\u533a\u4efb\u610f\u4e00\u6b3e\u9884\u8bbe\u673a\u578b\u53d1\u73b0\u65b0\u7248\u672c\u5373\u8bf7\u6c42\u786e\u8ba4\u3002"].join("\n");
   const markup = rolloutMenuKeyboard(chains.chains, lang);
   if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
   return sendTelegramMessage(env, chatId, text, markup);
@@ -3792,13 +3857,19 @@ async function renderRolloutChain(env, chatId, messageId, chainId) {
   const chain = chains.chains.find((item) => item.id === chainId);
   if (!chain) return renderRolloutMenu(env, chatId, messageId);
   const en = lang === "en";
-  const text = `${rolloutChainPanelText(chain, lang)}\n\n${en ? `Add target: /chainadd ${chain.id} <kr|eu|hk|cn> <MODEL> <CSC> [name]` : `\u6dfb\u52a0\u8bbe\u5907\uff1a/chainadd ${chain.id} <kr|eu|hk|cn> <\u578b\u53f7> <CSC> [\u540d\u79f0]`}`;
+  const dependent = chain.id === "s25";
+  const owner = isOwnerChatId(env, chatId);
+  const text = `${rolloutChainPanelText(chain, lang)}\n\n${dependent
+    ? (en ? "S25 is started automatically after S26 Korea is confirmed." : "S25 会在 S26 韩版确认后自动启动。")
+    : (en ? "Start this chain manually. S25 will remain waiting until S26 Korea is confirmed." : "手动启动 S26 后，S25 将保持等待，直至 S26 韩版确认。")}`;
   const rows = [
     [10, 15, 30, 60].map((minutes) => ({ text: `${minutes}m`, callback_data: `admin:rollout-interval:${chain.id}:${minutes}` })),
-    [{ text: en ? "Daytime" : "\u767d\u5929", callback_data: `admin:rollout-time:${chain.id}:08:00:23:00` }, { text: en ? "All day" : "\u5168\u5929", callback_data: `admin:rollout-time:${chain.id}:00:00:23:59` }],
-    [{ text: chain.enabled ? (en ? "Pause chain" : "\u6682\u505c\u53d1\u5e03\u94fe") : (en ? "Enable chain" : "\u542f\u7528\u53d1\u5e03\u94fe"), callback_data: `admin:rollout-enable:${chain.id}:${chain.enabled ? "off" : "on"}` }],
-    [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:rollout-menu" }]
+    [{ text: en ? "Daytime" : "\u767d\u5929", callback_data: `admin:rollout-time:${chain.id}:08:00:23:00` }, { text: en ? "All day" : "\u5168\u5929", callback_data: `admin:rollout-time:${chain.id}:00:00:23:59` }]
   ];
+  if (!dependent) rows.push([{ text: chain.enabled ? (en ? "Pause S26" : "暂停 S26") : (en ? "Start S26" : "启动 S26"), callback_data: `admin:rollout-enable:${chain.id}:${chain.enabled ? "off" : "on"}` }]);
+  if (dependent && chain.enabled) rows.push([{ text: en ? "Pause S25" : "暂停 S25", callback_data: `admin:rollout-enable:${chain.id}:off` }]);
+  if (dependent && !chain.enabled && owner) rows.push([{ text: en ? "Owner: restart S25" : "所有者：重新启动 S25", callback_data: `admin:rollout-restart:${chain.id}` }]);
+  rows.push([{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:rollout-menu" }]);
   return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: rows });
 }
 
@@ -4218,6 +4289,11 @@ async function handleDelMonitor(env, chatId, args) {
   }
   try {
     const parsed = parseModelQuery(`${args[0]} ${args[1]}`, defaultCsc(env));
+    const existing = (await getMonitorItems(env)).find((item) => item.model === parsed.model && item.csc === parsed.csc);
+    if (isRolloutManagedMonitor(existing)) {
+      await sendTelegramMessage(env, chatId, "该设备由发布链管理，请在“发布链”中调整，不能使用 /del 删除。");
+      return;
+    }
     const removed = await removeMonitorItem(env, parsed.model, parsed.csc);
     await sendTelegramMessage(env, chatId, removed
       ? `✅ 已删除监控设备\n\n机型：${parsed.model}\n地区：${parsed.csc}`
@@ -4238,6 +4314,10 @@ async function handleMonitorPriority(env, chatId, args) {
   const existing = items.find((item) => item.model === parsed.model && item.csc === parsed.csc);
   if (!existing) {
     await sendTelegramMessage(env, chatId, `未找到监控设备：${parsed.model} / ${parsed.csc}`);
+    return;
+  }
+  if (isRolloutManagedMonitor(existing)) {
+    await sendTelegramMessage(env, chatId, "该设备由发布链管理，请在“发布链”中调整优先级和状态。");
     return;
   }
   const item = await upsertMonitorItem(env, {
@@ -4261,6 +4341,10 @@ async function handleMonitorItemEnabled(env, chatId, args, enabled) {
     const existing = items.find((item) => item.model === parsed.model && item.csc === parsed.csc);
     if (!existing) {
       await sendTelegramMessage(env, chatId, `未找到监控设备：${parsed.model} / ${parsed.csc}`);
+      return;
+    }
+    if (isRolloutManagedMonitor(existing)) {
+      await sendTelegramMessage(env, chatId, "该设备由发布链管理，请在“发布链”中调整状态。");
       return;
     }
     await cancelMonitorItemSnooze(env, parsed.model, parsed.csc);
@@ -4306,6 +4390,10 @@ async function handleMonitorSnoozeCommand(env, chatId, args) {
     const existing = items.find((item) => item.model === parsed.model && item.csc === parsed.csc);
     if (!existing) {
       await sendTelegramMessage(env, chatId, `未找到监控设备：${parsed.model} / ${parsed.csc}`);
+      return;
+    }
+    if (isRolloutManagedMonitor(existing)) {
+      await sendTelegramMessage(env, chatId, "该设备由发布链管理，不能单独暂停。请在“发布链”中处理。" );
       return;
     }
     const resumeAt = new Date(Date.now() + minutes * 60 * 1000);
@@ -4417,6 +4505,11 @@ async function handleMonitorIntervalCommand(env, chatId, args) {
           ? `Monitoring target not found: ${parsed.model} / ${parsed.csc}`
           : `未找到监控设备：${parsed.model} / ${parsed.csc}`);
       }
+      if (isRolloutManagedMonitor(existing)) {
+        throw new Error(lang === "en"
+          ? "This target is managed by its rollout chain; set its interval in the Rollout panel."
+          : "该设备由发布链管理，请在“发布链”中设置检查间隔。");
+      }
       const item = await upsertMonitorItem(env, { ...existing, intervalMinutes: Math.floor(minutes) });
       await sendTelegramMessage(env, chatId, lang === "en"
         ? [
@@ -4446,7 +4539,7 @@ async function handleMonitorIntervalCommand(env, chatId, args) {
 }
 
 async function formatMonitorList(env) {
-  const items = await getMonitorItems(env);
+  const items = standardMonitorItems(await getMonitorItems(env));
   {
   if (!items.length) return "\u5f53\u524d\u6ca1\u6709\u76d1\u63a7\u8bbe\u5907\u3002";
   const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));

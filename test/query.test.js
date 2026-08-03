@@ -74,6 +74,7 @@ import {
   applyRolloutProposalDecision,
   createRolloutProposalForUpdate,
   getRolloutChains,
+  restartDependentRolloutChain,
   setRolloutChainSettings
 } from "../src/rollout-chain.js";
 import { normalizeReleaseWindowGroups, releaseWindowPeers, validateModelCsc } from "../src/targets.js";
@@ -2952,6 +2953,21 @@ test("rollout chains include disabled Samsung regional retail presets", async ()
   ]);
 });
 
+test("S25 waits for S26 Korea and only the recovery path can start it manually", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await assert.rejects(
+    setRolloutChainSettings(env, "s25", { enabled: true }),
+    /自动启动/
+  );
+  await restartDependentRolloutChain(env, "s25");
+  const s25 = (await getRolloutChains(env)).chains.find((chain) => chain.id === "s25");
+  assert.equal(s25.enabled, true);
+  assert.equal(s25.activeStageId, "kr");
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S938N" && item.csc === "KOO").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S938B" && item.csc === "EUX").enabled, false);
+});
+
 test("administrator help explains role boundaries and administrator setup", () => {
   const text = adminHelpParts("zh").join("\n");
   assert.match(text, /权限：所有者由 TELEGRAM_CHAT_ID 确定/);
@@ -3117,6 +3133,29 @@ test("monitor target buttons change priority and require delete confirmation", a
 
   await callback(700005, "delete-confirm", "monitor-item:delete-confirm:SM-S938B:EUX");
   assert.equal((await getMonitorItems(env)).length, 0);
+});
+
+test("rollout targets are protected from ordinary monitor controls", async () => {
+  const payloads = [];
+  const env = {
+    FIRMWARE_KV: memoryKv(),
+    WEBHOOK_SECRET: "test-header-secret",
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "9932"
+  };
+  await setMonitorItems(env, [{
+    model: "SM-S948N", csc: "KOO", name: "S26 Ultra", priority: "high",
+    rolloutChainId: "s26", rolloutStageId: "kr"
+  }]);
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 7000051,
+    callback_query: {
+      id: "release-delete", data: "monitor-item:delete-request:SM-S948N:KOO",
+      from: { id: 9932, first_name: "Admin" }, message: { message_id: 4, chat: { id: 9932 } }
+    }
+  }, payloads);
+  assert.equal((await getMonitorItems(env)).length, 1);
+  assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("发布链管理")));
 });
 
 test("monitor target UI toggles allowed-user update delivery and exposes monitor health", async () => {

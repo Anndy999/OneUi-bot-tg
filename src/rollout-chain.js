@@ -213,6 +213,14 @@ function nextStage(chain, stageId) {
   return index >= 0 ? chain.stages[index + 1] || null : null;
 }
 
+function parentChainFor(chains, chainId) {
+  return chains.chains.find((candidate) => candidate.startChainOnFirstStage === chainId) || null;
+}
+
+function isDependentChain(chains, chain) {
+  return Boolean(parentChainFor(chains, chain?.id));
+}
+
 export async function addRolloutTarget(env, chainId, stageId, target) {
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
@@ -261,6 +269,10 @@ export async function setRolloutChainSettings(env, chainId, patch = {}) {
     chain.endTime = time;
   }
   if (patch.enabled !== undefined) {
+    if (patch.enabled === true && isDependentChain(chains, chain) && patch.allowDependentStart !== true) {
+      const parent = parentChainFor(chains, chain.id);
+      throw new Error(`${chain.name} 会在 ${parent?.name || "上级发布链"} 韩版确认后自动启动，不能手动提前启用`);
+    }
     const activeStage = findStage(chain, chain.activeStageId);
     if (patch.enabled && !activeStage?.targets.length) throw new Error("请先为当前地区添加至少一个精确 Model / CSC");
     chain.enabled = patch.enabled === true;
@@ -289,28 +301,30 @@ export async function setRolloutChainSettings(env, chainId, patch = {}) {
   return saveChains(env, chains);
 }
 
+// This is deliberately separate from the normal enable setting. The Telegram
+// handler exposes it to the owner only as a recovery action; administrators
+// cannot start a dependent chain ahead of its parent rollout.
+export async function restartDependentRolloutChain(env, chainId) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain || !isDependentChain(chains, chain)) throw new Error("该发布链不是可重新启动的从属链");
+  const firstStage = chain.stages[0];
+  if (!firstStage?.targets.length) throw new Error("请先为从属链韩版添加至少一个精确 Model / CSC");
+  chain.activeStageId = firstStage.id;
+  chain.pendingProposalId = "";
+  chain.status = "active";
+  chain.enabled = true;
+  await activateOnlyStage(env, chain, firstStage);
+  return saveChains(env, chains);
+}
+
 export async function setRolloutChainStage(env, chainId, stageId) {
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
   const stage = findStage(chain, stageId);
   if (!chain || !stage) throw new Error("发布链或地区不存在");
   if (!stage.targets.length) throw new Error("请先为该地区添加至少一个精确 Model / CSC");
-  for (const candidate of chain.stages) {
-    for (const target of candidate.targets) {
-      const active = candidate.id === stage.id && chain.enabled;
-      if (active) await cancelMonitorItemSnooze(env, target.model, target.csc);
-      await upsertMonitorItem(env, {
-        ...target,
-        enabled: active,
-        paused: !active,
-        pauseReason: active ? "" : "rollout_waiting",
-        priority: "high",
-        intervalMinutes: chain.intervalMinutes,
-        rolloutChainId: chain.id,
-        rolloutStageId: candidate.id
-      });
-    }
-  }
+  await activateOnlyStage(env, chain, stage);
   chain.activeStageId = stage.id;
   chain.status = chain.enabled ? "active" : "needs_configuration";
   chain.pendingProposalId = "";
@@ -397,6 +411,7 @@ export function rolloutProposalText(proposal, lang = "zh") {
       `Next: ${next}`,
       extra,
       "",
+      "Any configured model in this region can trigger this step.",
       "Confirm to pause this region until next month and advance the rollout."
     ].filter(Boolean).join("\n");
   }
@@ -410,6 +425,7 @@ export function rolloutProposalText(proposal, lang = "zh") {
     `下一步：${next}`,
     extra,
     "",
+    "本地区任意预设机型发现新版本即可触发。",
     "确认后将暂停当前地区至下月初，并推进发布链。"
   ].filter(Boolean).join("\n");
 }
@@ -419,7 +435,7 @@ export function rolloutProposalKeyboard(proposal, lang = "zh") {
     inline_keyboard: [
       [
         { text: lang === "en" ? "Confirm advance" : "确认切换", callback_data: `rollout:approve:${proposal.id}` },
-        { text: lang === "en" ? "Not now" : "暂不处理", callback_data: `rollout:skip:${proposal.id}` }
+        { text: lang === "en" ? "Keep current region" : "不推进，保持当前地区", callback_data: `rollout:skip:${proposal.id}` }
       ],
       [{ text: lang === "en" ? "View rollout" : "查看发布链", callback_data: `admin:rollout:${proposal.chainId}` }]
     ]
@@ -439,6 +455,27 @@ async function activateStage(env, chain, stage) {
       rolloutChainId: chain.id,
       rolloutStageId: stage.id
     });
+  }
+}
+
+async function activateOnlyStage(env, chain, stage) {
+  for (const candidate of chain.stages) {
+    for (const target of candidate.targets) {
+      const active = candidate.id === stage.id && chain.enabled;
+      // An owner correction or dependent-chain recovery supersedes every older
+      // timed pause. Otherwise an old stage could resume alongside the new one.
+      await cancelMonitorItemSnooze(env, target.model, target.csc);
+      await upsertMonitorItem(env, {
+        ...target,
+        enabled: active,
+        paused: !active,
+        pauseReason: active ? "" : "rollout_waiting",
+        priority: "high",
+        intervalMinutes: chain.intervalMinutes,
+        rolloutChainId: chain.id,
+        rolloutStageId: candidate.id
+      });
+    }
   }
 }
 
@@ -482,10 +519,13 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
   } else {
     chain.status = "completed";
   }
-  if (starter && !starter.enabled) {
+  if (starter) {
+    const starterStage = starter.stages[0];
     starter.enabled = true;
     starter.status = "active";
-    await activateStage(env, starter, findStage(starter, starter.activeStageId));
+    starter.activeStageId = starterStage.id;
+    starter.pendingProposalId = "";
+    await activateOnlyStage(env, starter, starterStage);
   }
   chain.pendingProposalId = "";
   proposal.status = "decided";
@@ -507,6 +547,7 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
 
 export function rolloutChainPanelText(chain, lang = "zh") {
   const current = findStage(chain, chain.activeStageId);
+  const next = nextStage(chain, chain.activeStageId);
   const stageLines = chain.stages.map((stage) => {
     const marker = stage.id === chain.activeStageId ? "▶️" : "•";
     return `${marker} ${stage.name}：${stage.targets.length ? `${stage.targets.length} 台` : "未配置"}`;
@@ -517,6 +558,8 @@ export function rolloutChainPanelText(chain, lang = "zh") {
       "",
       `Status: ${chain.status}`,
       `Current region: ${current?.name || "Not configured"}`,
+      `Trigger: any configured model`,
+      `Next: ${next?.name || "complete this round"}`,
       `Schedule: ${chain.startTime}–${chain.endTime} Beijing Time`,
       `Interval: ${chain.intervalMinutes} min`,
       "",
@@ -528,6 +571,8 @@ export function rolloutChainPanelText(chain, lang = "zh") {
     "",
     `状态：${chain.status === "active" ? "监控中" : chain.status === "awaiting_confirmation" ? "等待确认" : chain.status === "completed" ? "本轮完成" : "待配置"}`,
     `当前地区：${current?.name || "未配置"}`,
+    "触发：本地区任意预设机型",
+    `下一步：${next?.name || "本轮完成"}`,
     `时间：${chain.startTime}–${chain.endTime}（北京时间）`,
     `间隔：${chain.intervalMinutes} 分钟`,
     "",
