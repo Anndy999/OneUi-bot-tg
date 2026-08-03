@@ -265,10 +265,9 @@ export async function createRolloutProposalForUpdate(env, item, parsed, now = ne
   if (!configured) return null;
   const next = nextStage(chain, stageId);
   const startChain = stageId === chain.stages[0].id ? findChain(chains, chain.startChainOnFirstStage) : null;
-  if (next && !next.targets.length) return { blocked: true, reason: "next_stage_unconfigured", chain, stage, next };
-  if (startChain && !findStage(startChain, startChain.activeStageId)?.targets.length) {
-    return { blocked: true, reason: "starter_chain_unconfigured", chain, stage, startChain };
-  }
+  // Keep the detected update actionable even when the next stage has not
+  // been configured yet. The confirmation card remains valid after an
+  // administrator adds the missing exact Model / CSC targets.
   const id = randomId().replace(/-/g, "").slice(0, 16);
   const proposal = {
     id,

@@ -2952,6 +2952,17 @@ test("rollout chains require exact configured targets and create one approval pr
   assert.equal((await getRolloutChains(env)).chains.find((chain) => chain.id === "s26").status, "awaiting_confirmation");
 });
 
+test("rollout update stays actionable when the next region is configured later", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await addRolloutTarget(env, "s26", "kr", { model: "SM-S9480", csc: "KOO", name: "S26 KR" });
+  await setRolloutChainSettings(env, "s26", { enabled: true });
+  const created = await createRolloutProposalForUpdate(env, {
+    model: "SM-S9480", csc: "KOO", name: "S26 KR", rolloutChainId: "s26", rolloutStageId: "kr"
+  }, { latest: "S9480XXU1A" });
+  assert.ok(created?.proposal);
+  assert.equal(created.proposal.nextStageId, "eu");
+});
+
 test("a confirmed rollout pauses the finished region and activates the next regions", async () => {
   const scheduler = new MonitorScheduler({ storage: memoryDoStorage() }, {});
   const env = {
