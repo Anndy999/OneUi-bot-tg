@@ -19,6 +19,64 @@ const STAGES = [
   { id: "cn", name: "国行" }
 ];
 
+// Exact retail targets verified from Samsung's public product/support pages.
+// The rollout chains remain disabled until an administrator enables them.
+const OFFICIAL_PRESET_VERSION = 1;
+const OFFICIAL_TARGETS = {
+  s26: {
+    kr: [
+      { model: "SM-S942N", csc: "KOO", name: "Galaxy S26" },
+      { model: "SM-S947N", csc: "KOO", name: "Galaxy S26+" },
+      { model: "SM-S948N", csc: "KOO", name: "Galaxy S26 Ultra" }
+    ],
+    eu: [
+      { model: "SM-S942B", csc: "EUX", name: "Galaxy S26" },
+      { model: "SM-S947B", csc: "EUX", name: "Galaxy S26+" },
+      { model: "SM-S948B", csc: "EUX", name: "Galaxy S26 Ultra" }
+    ],
+    hk: [
+      { model: "SM-S9420", csc: "TGY", name: "Galaxy S26" },
+      { model: "SM-S9470", csc: "TGY", name: "Galaxy S26+" },
+      { model: "SM-S9480", csc: "TGY", name: "Galaxy S26 Ultra" }
+    ],
+    cn: [
+      { model: "SM-S9420", csc: "CHC", name: "Galaxy S26" },
+      { model: "SM-S9470", csc: "CHC", name: "Galaxy S26+" },
+      { model: "SM-S9480", csc: "CHC", name: "Galaxy S26 Ultra" }
+    ]
+  },
+  s25: {
+    kr: [
+      { model: "SM-S931N", csc: "KOO", name: "Galaxy S25" },
+      { model: "SM-S936N", csc: "KOO", name: "Galaxy S25+" },
+      { model: "SM-S937N", csc: "KOO", name: "Galaxy S25 Edge" },
+      { model: "SM-S938N", csc: "KOO", name: "Galaxy S25 Ultra" }
+    ],
+    eu: [
+      { model: "SM-S931B", csc: "EUX", name: "Galaxy S25" },
+      { model: "SM-S936B", csc: "EUX", name: "Galaxy S25+" },
+      { model: "SM-S937B", csc: "EUX", name: "Galaxy S25 Edge" },
+      { model: "SM-S938B", csc: "EUX", name: "Galaxy S25 Ultra" }
+    ],
+    hk: [
+      { model: "SM-S9310", csc: "TGY", name: "Galaxy S25" },
+      { model: "SM-S9360", csc: "TGY", name: "Galaxy S25+" },
+      { model: "SM-S9370", csc: "TGY", name: "Galaxy S25 Edge" },
+      { model: "SM-S9380", csc: "TGY", name: "Galaxy S25 Ultra" }
+    ],
+    cn: [
+      { model: "SM-S9310", csc: "CHC", name: "Galaxy S25" },
+      { model: "SM-S9360", csc: "CHC", name: "Galaxy S25+" },
+      { model: "SM-S9370", csc: "CHC", name: "Galaxy S25 Edge" },
+      { model: "SM-S9380", csc: "CHC", name: "Galaxy S25 Ultra" }
+    ]
+  }
+};
+
+function officialStageFallback(chainId, stage) {
+  return { ...stage, targets: OFFICIAL_TARGETS[chainId]?.[stage.id] || [] };
+}
+
 const DEFAULT_CHAINS = [
   { id: "s26", name: "26 系列", startChainOnFirstStage: "s25" },
   { id: "s25", name: "25 系列", startChainOnFirstStage: "" }
@@ -66,7 +124,10 @@ function normalizeStage(raw = {}, fallback) {
 
 function normalizeChain(raw = {}, fallback) {
   const stagesById = new Map((Array.isArray(raw.stages) ? raw.stages : []).map((stage) => [String(stage?.id || "").trim(), stage]));
-  const stages = STAGES.map((stage) => normalizeStage(stagesById.get(stage.id) || {}, stage));
+  const stages = STAGES.map((stage) => {
+    const fallbackStage = officialStageFallback(fallback.id, stage);
+    return normalizeStage(stagesById.get(stage.id) || fallbackStage, fallbackStage);
+  });
   const activeStageId = stages.some((stage) => stage.id === raw.activeStageId)
     ? raw.activeStageId
     : stages[0].id;
@@ -93,7 +154,8 @@ function normalizeChain(raw = {}, fallback) {
 
 export function defaultRolloutChains() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    officialPresetVersion: OFFICIAL_PRESET_VERSION,
     chains: DEFAULT_CHAINS.map((chain) => normalizeChain({}, chain)),
     updatedAt: new Date().toISOString()
   };
@@ -101,9 +163,16 @@ export function defaultRolloutChains() {
 
 export function normalizeRolloutChains(value) {
   const rawChains = Array.isArray(value?.chains) ? value.chains : [];
-  const byId = new Map(rawChains.map((chain) => [String(chain?.id || "").trim(), chain]));
+  const hasConfiguredTargets = rawChains.some((chain) =>
+    Array.isArray(chain?.stages) && chain.stages.some((stage) => Array.isArray(stage?.targets) && stage.targets.length > 0)
+  );
+  // Older releases persisted four empty stages. Seed only that untouched state
+  // once; an intentionally empty configuration remains untouched afterwards.
+  const seedOfficialTargets = !hasConfiguredTargets && !Number(value?.officialPresetVersion);
+  const byId = new Map((seedOfficialTargets ? [] : rawChains).map((chain) => [String(chain?.id || "").trim(), chain]));
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    officialPresetVersion: Number(value?.officialPresetVersion) || OFFICIAL_PRESET_VERSION,
     chains: DEFAULT_CHAINS.map((fallback) => normalizeChain(byId.get(fallback.id) || {}, fallback)),
     updatedAt: cleanText(value?.updatedAt, 40) || new Date().toISOString()
   };

@@ -1531,7 +1531,13 @@ async function handleCallback(callbackQuery, env, ctx = null) {
   if (data === "menu:help") {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
-    await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang));
+    if (identity === "admin") {
+      const parts = adminHelpParts(lang);
+      await safeEditOrSend(env, chatId, messageId, `${guideText(identity, lang)}\n\n${parts[0]}`, mainMenuKeyboard(identity, lang));
+      for (const part of parts.slice(1)) await sendTelegramMessage(env, chatId, part);
+    } else {
+      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang));
+    }
     return;
   }
 
@@ -2880,7 +2886,13 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
       await setUserLanguage(env, chatId, args[0]);
     }
     const lang = await getUserLanguage(env, chatId);
-    await sendTelegramMessage(env, chatId, guideText(identity, lang));
+    if (identity === "admin") {
+      const parts = adminHelpParts(lang);
+      await sendTelegramMessage(env, chatId, `${guideText(identity, lang)}\n\n${parts[0]}`);
+      for (const part of parts.slice(1)) await sendTelegramMessage(env, chatId, part);
+    } else {
+      await sendTelegramMessage(env, chatId, guideText(identity, lang));
+    }
     return;
   }
 

@@ -11,7 +11,8 @@ function chineseGuide(identity) {
       "\u76f4\u63a5\u53d1\u9001 Model / CSC \u67e5\u8be2\u56fa\u4ef6\uff0c\u4f8b\u5982\uff1a9480 CHC\u3002",
       "\u67e5\u8be2\u7ed3\u679c\u53ef\u5b9e\u65f6\u5237\u65b0\u3001\u6e05\u7406\u7f13\u5b58\u6216\u52a0\u5165\u76d1\u63a7\u3002",
       "",
-      "\u4e3b\u83dc\u5355\u5305\u542b\uff1a\u76d1\u63a7\u4e2d\u5fc3\u3001\u7528\u6237\u6743\u9650\u3001\u7cfb\u7edf\u4e0e\u7f13\u5b58\u3002",
+      "\u4e3b\u83dc\u5355\u5305\u542b\uff1a\u76d1\u63a7\u3001\u7528\u6237\u3001\u53d1\u5e03\u94fe\u3001\u7ba1\u7406\u5458\u3001\u7cfb\u7edf\u3002",
+      "\u53d1\u5e03\u94fe\u5728\u53d1\u73b0\u65b0\u56fa\u4ef6\u540e\u7531\u6240\u6709\u8005\u6216\u7ba1\u7406\u5458\u786e\u8ba4\u63a8\u8fdb\u3002",
       "\u53d1\u73b0\u65b0\u56fa\u4ef6\u540e\uff0c\u673a\u5668\u4eba\u4ec5\u53d1\u9001\u4e00\u6b21\u901a\u77e5\uff0c\u4e0d\u9700\u8981\u786e\u8ba4\uff0c\u76d1\u63a7\u4f1a\u6309\u539f\u8ba1\u5212\u7ee7\u7eed\u8fd0\u884c\u3002",
       "\u76d1\u63a7\u95f4\u9694\uff1a\u53d1\u9001 /moninterval 15 \u53ef\u5c06\u9ed8\u8ba4\u76d1\u63a7\u7edf\u4e00\u8bbe\u4e3a\u6bcf 15 \u5206\u949f\u4e00\u6b21\uff0c\u8303\u56f4 1-1440 \u5206\u949f\u3002",
       "",
@@ -86,6 +87,10 @@ export function adminHelpParts(lang = "zh") {
       [
         "Administrator fallback commands",
         "",
+        "Roles: the owner is TELEGRAM_CHAT_ID; added administrators can manage monitoring, users, and rollout confirmations.",
+        "Owner only: /admins (list), /adminadd CHAT_ID NAME (add), /admindel CHAT_ID (remove), /chainstage s26 eu (correct a rollout region).",
+        "Ask a new administrator to send /whoami privately first, then use the returned Chat ID with /adminadd.",
+        "",
         "/refresh MODEL CSC - Force a realtime firmware query",
         "/add MODEL CSC NAME - Add a monitoring target",
         "/del MODEL CSC - Remove a monitoring target",
@@ -118,6 +123,10 @@ export function adminHelpParts(lang = "zh") {
   return [
     [
       "\u7ba1\u7406\u5458\u5907\u7528\u547d\u4ee4",
+      "",
+      "\u6743\u9650\uff1a\u6240\u6709\u8005\u7531 TELEGRAM_CHAT_ID \u786e\u5b9a\uff1b\u65b0\u589e\u7ba1\u7406\u5458\u53ef\u7ba1\u7406\u76d1\u63a7\u3001\u7528\u6237\u548c\u53d1\u5e03\u94fe\u786e\u8ba4\u3002",
+      "\u4ec5\u6240\u6709\u8005\uff1a/admins \u67e5\u770b\u3001/adminadd CHAT_ID \u5907\u6ce8 \u6dfb\u52a0\u3001/admindel CHAT_ID \u79fb\u9664\u3001/chainstage s26 eu \u7ea0\u6b63\u53d1\u5e03\u5730\u533a\u3002",
+      "\u6dfb\u52a0\u7ba1\u7406\u5458\u524d\uff0c\u8ba9\u5bf9\u65b9\u5148\u79c1\u804a\u673a\u5668\u4eba\u53d1\u9001 /whoami\uff0c\u518d\u628a\u8fd4\u56de\u7684 Chat ID \u586b\u5165 /adminadd\u3002",
       "",
       "/refresh MODEL CSC - \u5f3a\u5236\u5b9e\u65f6\u67e5\u8be2",
       "/add MODEL CSC \u540d\u79f0 - \u6dfb\u52a0\u76d1\u63a7\u8bbe\u5907",

@@ -2937,6 +2937,28 @@ test("owner can add persistent administrators without changing the owner identit
   assert.deepEqual((await getAdditionalAdmins(env)).map((entry) => entry.chatId), ["992"]);
 });
 
+test("rollout chains include disabled Samsung regional retail presets", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  const chains = await getRolloutChains(env);
+  const s26 = chains.chains.find((chain) => chain.id === "s26");
+  const s25 = chains.chains.find((chain) => chain.id === "s25");
+  assert.equal(s26.enabled, false);
+  assert.equal(s25.enabled, false);
+  assert.deepEqual(s26.stages.find((stage) => stage.id === "kr").targets.map((target) => `${target.model}:${target.csc}`), [
+    "SM-S942N:KOO", "SM-S947N:KOO", "SM-S948N:KOO"
+  ]);
+  assert.deepEqual(s25.stages.find((stage) => stage.id === "hk").targets.map((target) => `${target.model}:${target.csc}`), [
+    "SM-S9310:TGY", "SM-S9360:TGY", "SM-S9370:TGY", "SM-S9380:TGY"
+  ]);
+});
+
+test("administrator help explains role boundaries and administrator setup", () => {
+  const text = adminHelpParts("zh").join("\n");
+  assert.match(text, /权限：所有者由 TELEGRAM_CHAT_ID 确定/);
+  assert.match(text, /对方先私聊机器人发送 \/whoami/);
+  assert.match(text, /仅所有者：\/admins/);
+});
+
 test("rollout chains require exact configured targets and create one approval proposal", async () => {
   const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
   await addRolloutTarget(env, "s26", "kr", { model: "SM-S9480", csc: "KOO", name: "S26 KR" });
