@@ -15,9 +15,10 @@ const sensitiveNames = [
   "CLOUDFLARE_KV_NAMESPACE_ID",
   "TELEGRAM_CHAT_ID",
   "WEBHOOK_SECRET",
-  "GITHUB_TOKEN"
+  "GITHUB_TOKEN",
+  "DOWNLOAD_API_SECRET"
 ];
-const safeLiteralPrefixes = ["test", "fake", "example", "placeholder", "your_", "<", "{"];
+const safeLiteralPrefixes = ["test", "fake", "example", "placeholder", "your_", "replace", "<", "{"];
 const findings = [];
 
 async function walk(directory) {
@@ -48,7 +49,7 @@ function isSafeLiteral(value) {
   const normalized = String(value || "").trim().replace(/^['"]|['"]$/g, "").toLowerCase();
   if (!normalized) return true;
   if (/^\d{1,5}$/.test(normalized)) return true;
-  return safeLiteralPrefixes.some((prefix) => normalized.startsWith(prefix));
+  return normalized.includes("replace_with") || safeLiteralPrefixes.some((prefix) => normalized.startsWith(prefix));
 }
 
 let files;

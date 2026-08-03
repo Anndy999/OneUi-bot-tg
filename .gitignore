@@ -17,3 +17,6 @@ migration-data/
 
 .npm-cache/
 *.zip
+
+# VPS firmware files and their local index never belong in Git.
+/data/firmware/

@@ -4,6 +4,9 @@ This deployment is local-only: the Node process listens on `127.0.0.1:8787`
 and Telegram uses outbound long polling. There is no required domain, Nginx,
 HTTPS/443 listener, or inbound Telegram Webhook.
 
+The optional firmware download process is a separate unit on
+`127.0.0.1:8788`. It does not require DNS or UFW while it is local-only.
+
 ## First checks
 
 ```bash
@@ -12,6 +15,20 @@ sudo systemctl status oneui-postgresql.service oneui-redis.service --no-pager -l
 curl --fail --silent --show-error http://127.0.0.1:8787/health
 sudo journalctl -u oneui-bot.service -n 120 --no-pager
 ```
+
+For the optional download interface:
+
+```bash
+sudo systemctl status oneui-download.service --no-pager -l
+curl --fail --silent --show-error http://127.0.0.1:8788/health
+sudo journalctl -u oneui-download.service -n 120 --no-pager
+```
+
+If the download unit fails, check that `/etc/oneui-bot/oneui-download.env`
+exists, contains no placeholder values, points to the dedicated Redis URL, and
+that `oneui` owns `/opt/oneui-bot/data/firmware`. Do not paste that environment
+file into logs or chat. A public domain and inbound port are not a fix for a
+local service failure.
 
 Never paste the environment file or full connection URLs into an issue or
 chat. Logs should contain error categories, not Tokens or passwords.
@@ -69,6 +86,12 @@ uses stable BullMQ job IDs to avoid ordinary duplicate enqueueing.
 
 ```bash
 sudo journalctl -u oneui-bot.service -f
+```
+
+Download logs are separate:
+
+```bash
+sudo journalctl -u oneui-download.service -f
 ```
 
 Look for BullMQ worker errors, Telegram API errors, or PostgreSQL/Redis

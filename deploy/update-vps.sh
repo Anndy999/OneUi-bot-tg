@@ -5,7 +5,10 @@ PROJECT_DIR="/opt/oneui-bot"
 SERVICE="oneui-bot.service"
 ENV_FILE="/etc/oneui-bot/oneui-bot.env"
 HEALTH_URL="http://127.0.0.1:8787/health"
+DOWNLOAD_SERVICE="oneui-download.service"
+DOWNLOAD_HEALTH_URL="http://127.0.0.1:8788/health"
 NPM_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/npm"
+download_was_active=false
 
 log() { printf "[oneui-update] %s\n" "$*"; }
 die() { printf "[oneui-update] ERROR: %s\n" "$*" >&2; exit 1; }
@@ -40,13 +43,24 @@ log "运行生产依赖审计。"
 "${NPM_BIN}" audit --omit=dev --audit-level=high
 
 systemctl daemon-reload
-log "仅重启 ${SERVICE}。PostgreSQL 和 Redis 不重启。"
+if systemctl is-active --quiet "${DOWNLOAD_SERVICE}"; then
+  download_was_active=true
+fi
+log "仅重启 OneUI 应用服务；PostgreSQL 和 Redis 不重启。"
 systemctl restart "${SERVICE}"
+if [[ "${download_was_active}" == true ]]; then
+  systemctl restart "${DOWNLOAD_SERVICE}"
+fi
 
 for _ in $(seq 1 30); do
-  if systemctl is-active --quiet "${SERVICE}" && curl -fsS --max-time 2 "${HEALTH_URL}" >/dev/null; then
+  download_ok=true
+  if [[ "${download_was_active}" == true ]] && ! systemctl is-active --quiet "${DOWNLOAD_SERVICE}"; then
+    download_ok=false
+  fi
+  if systemctl is-active --quiet "${SERVICE}" && curl -fsS --max-time 2 "${HEALTH_URL}" >/dev/null && [[ "${download_ok}" == true ]] && { [[ "${download_was_active}" != true ]] || curl -fsS --max-time 2 "${DOWNLOAD_HEALTH_URL}" >/dev/null; }; then
     log "更新成功，健康检查通过。"
     systemctl is-active "${SERVICE}"
+    if [[ "${download_was_active}" == true ]]; then systemctl is-active "${DOWNLOAD_SERVICE}"; fi
     exit 0
   fi
   sleep 1
@@ -54,4 +68,8 @@ done
 
 systemctl status "${SERVICE}" --no-pager -l || true
 journalctl -u "${SERVICE}" -n 80 --no-pager || true
+if [[ "${download_was_active}" == true ]]; then
+  systemctl status "${DOWNLOAD_SERVICE}" --no-pager -l || true
+  journalctl -u "${DOWNLOAD_SERVICE}" -n 80 --no-pager || true
+fi
 die "更新后健康检查失败；未自动覆盖本地 Git 状态。"

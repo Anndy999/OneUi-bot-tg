@@ -1,0 +1,30 @@
+[Unit]
+Description=OneUI Firmware Download API
+Requires=oneui-redis.service
+Wants=network-online.target
+After=network-online.target oneui-redis.service
+
+[Service]
+Type=simple
+User=oneui
+Group=oneui
+WorkingDirectory=/opt/oneui-bot
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/oneui-bot/oneui-download.env
+ExecStart=/home/oneui/.nvm/versions/node/v22.23.2/bin/node /opt/oneui-bot/src/vps/download-server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/oneui-bot/data/firmware
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

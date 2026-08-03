@@ -83,7 +83,57 @@ queue checks. The service is enabled with `systemctl enable`, so it starts
 after reboot. No inbound firewall rule, Nginx site, DNS record, certificate,
 or port 443 is needed.
 
-## 5. Logs and backup
+## 5. Optional independent firmware download interface
+
+The download interface is deliberately separate from `oneui-bot.service` and
+defaults to `127.0.0.1:8788`. It is not enabled by the normal bot bootstrap,
+so an unresolved domain does not block the Telegram bot. It uses the existing
+OneUI Redis instance for BullMQ and writes only to
+`/opt/oneui-bot/data/firmware`.
+
+When the VPS is ready, prepare the protected environment file without putting
+real values in Git or chat:
+
+```bash
+sudo install -d -o root -g oneui -m 0750 /etc/oneui-bot
+sudo install -m 0640 -o root -g oneui docs/VPS_DOWNLOAD_ENV.example /etc/oneui-bot/oneui-download.env
+sudoedit /etc/oneui-bot/oneui-download.env
+```
+
+Set a strong local API secret and the same dedicated OneUI `REDIS_URL` used by
+the download worker. Keep `DOWNLOAD_HOST=127.0.0.1`; do not expose port 8788
+until signed public links, HTTPS, and an approved firewall rule are ready.
+Then install the independent unit:
+
+```bash
+sudo /opt/oneui-bot/deploy/install-download-service.sh
+sudo /opt/oneui-bot/deploy/download-health-check.sh
+sudo journalctl -u oneui-download.service -n 100 --no-pager
+```
+
+At this stage administrators can reach it through an SSH tunnel. No domain,
+Nginx, 443, or UFW change is needed:
+
+```bash
+ssh -L 8788:127.0.0.1:8788 <vps-user>@<vps-ip> -p <ssh-port>
+```
+
+The API accepts only HTTPS URLs on the configured Samsung/FUS host allowlist,
+allows one active download, preserves a configured free-space reserve, and
+cleans stale partial/completed files. It does not yet provide public download
+links; that is intentionally a later, separately approved step.
+
+Current administrator API surface:
+
+- `GET /health` — local health and free-space status, no API key;
+- `POST /api/v1/downloads` — create a download with
+  `X-Download-Api-Key` and `sourceUrl`, `model`, `csc`, `version` JSON fields;
+- `GET /api/v1/downloads` or `/api/v1/downloads/<id>` — list/status;
+- `DELETE /api/v1/downloads/<id>` — cancel a queued or active download;
+- `GET /files/<id>` — retrieve a completed file, still protected by the same
+  administrator key.
+
+## 6. Logs and backup
 
 ```bash
 sudo journalctl -u oneui-bot.service -n 100 --no-pager
@@ -105,7 +155,7 @@ Redis is a cache/queue coordination dependency here; protect its persistence
 volume as defense in depth, but PostgreSQL remains the durable application
 store.
 
-## 6. Later updates
+## 7. Later updates
 
 After this one-time setup, the normal update is the single command in
 [`ONE_CLICK_UPDATE.md`](ONE_CLICK_UPDATE.md):

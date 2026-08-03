@@ -14,7 +14,8 @@
     "db:migrate": "node scripts/migrate-vps.mjs",
     "db:import-cloudflare": "node scripts/import-cloudflare-state.mjs",
     "vps:start": "node src/vps/production-server.js",
-    "vps:worker": "node src/vps/worker-entry.js"
+    "vps:worker": "node src/vps/worker-entry.js",
+    "vps:download": "node src/vps/download-server.js"
   },
   "dependencies": {
     "bullmq": "^5.58.5",

@@ -78,6 +78,16 @@ The commands above add only the OneUI Bot unit. They must not be used to
 restart or replace an existing PostgreSQL, Redis, Docker, Nginx or other
 service.
 
+## Optional firmware download interface
+
+Firmware downloading is isolated in `oneui-download.service` and listens on
+`127.0.0.1:8788` by default. It is intentionally separate from the Telegram
+bot and is not enabled by the normal bootstrap. See
+[`docs/ONE_CLICK_DEPLOY.md`](docs/ONE_CLICK_DEPLOY.md) for the protected
+environment file, local health check, SSH-tunnel access, and the later domain
+step. DNS, Nginx, HTTPS/443, and UFW are not needed while the interface stays
+local-only.
+
 ## Health and logs
 
 ```text

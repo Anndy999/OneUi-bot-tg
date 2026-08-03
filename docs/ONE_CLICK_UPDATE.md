@@ -10,7 +10,9 @@ The script is intentionally limited to the OneUI application. It verifies the
 checkout is on `main` and clean, fast-forwards from `origin/main`, then always
 installs the locked Node dependencies without lifecycle scripts, runs tests,
 runs the repository security scan, runs the production dependency audit,
-restarts only `oneui-bot.service`, and waits for `/health`. Re-running after a
+restarts `oneui-bot.service` and, if the optional download service is already
+active, restarts `oneui-download.service` and checks its local health endpoint.
+Re-running after a
 failed update therefore revalidates the same checkout instead of skipping
 tests.
 
@@ -28,6 +30,14 @@ sudo journalctl -u oneui-bot.service -n 80 --no-pager
 The health endpoint must report `ok: true`. It checks PostgreSQL and Redis
 connectivity, long-polling liveness, and queue counts without exposing
 credentials.
+
+If the independent download interface has been installed:
+
+```bash
+sudo systemctl is-active oneui-download.service
+curl --fail --silent --show-error http://127.0.0.1:8788/health
+sudo journalctl -u oneui-download.service -n 80 --no-pager
+```
 
 ## If an update fails
 
