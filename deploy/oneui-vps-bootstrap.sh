@@ -41,14 +41,7 @@ if [[ -e "/etc/systemd/system/${APP_SERVICE}" ]]; then
 fi
 
 if [[ -e "/etc/systemd/system/${PG_SERVICE}" || -e "/etc/systemd/system/${REDIS_SERVICE}" ]]; then
-  if [[ ! -e "/etc/systemd/system/${APP_SERVICE}" && ! -e "${ENV_FILE}" ]] \
-    && grep -q "Description=OneUI isolated PostgreSQL" "/etc/systemd/system/${PG_SERVICE}" 2>/dev/null \
-    && { [[ ! -e "/etc/systemd/system/${REDIS_SERVICE}" ]] || [[ ! -s "/etc/systemd/system/${REDIS_SERVICE}" ]] || grep -q "Description=OneUI isolated Redis" "/etc/systemd/system/${REDIS_SERVICE}" 2>/dev/null; }; then
-    log "清理上一次失败留下的 OneUI 部分 systemd 单元。"
-    rm -f "/etc/systemd/system/${PG_SERVICE}" "/etc/systemd/system/${REDIS_SERVICE}"
-  else
-    die "检测到已有 OneUI 专用 systemd 单元，为避免覆盖，脚本停止。"
-  fi
+  die "检测到已有 OneUI 专用 systemd 单元；为避免覆盖或删除现有配置，脚本停止。"
 fi
 
 if [[ -e "${ENV_FILE}" ]]; then
@@ -289,9 +282,8 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 EOF
 
-if ! curl -fsS --max-time 20 --data-urlencode 'drop_pending_updates=false' "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook" >/dev/null; then
-  die "无法删除 Telegram Webhook；机器人尚未启动。请检查网络或 Token 后重试。"
-fi
+log "保留 Telegram 当前 Webhook 状态；脚本不会调用 deleteWebhook 或 setWebhook。"
+log "启用长轮询前，请由管理员确认该 Bot Token 没有现存 Webhook，且没有其他轮询进程。"
 
 systemctl daemon-reload
 systemctl enable --now "${APP_SERVICE}"

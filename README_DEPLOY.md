@@ -24,9 +24,9 @@ Create the environment file outside this repository, for example:
 
 Do not paste or commit its contents. Required production values are
 `DATABASE_URL`, `REDIS_URL`, `WEBHOOK_SECRET`, `INTERNAL_API_SECRET` and
-`TELEGRAM_BOT_TOKEN`. Use the variable names in `.env.example` as the
-reference. Set the file permissions so only root and the `oneui` service user
-can read it.
+`TELEGRAM_BOT_TOKEN`. Use the variable names in
+[`docs/VPS_ENV.example`](docs/VPS_ENV.example) as the reference. Set the file
+permissions so only root and the `oneui` service user can read it.
 
 For a no-domain deployment, set:
 
@@ -44,6 +44,13 @@ before starting polling. Only one polling process may use a bot token.
 
 ## Migration and service
 
+For the complete no-domain, long-polling procedure, use:
+
+- [`docs/ONE_CLICK_DEPLOY.md`](docs/ONE_CLICK_DEPLOY.md)
+- [`docs/ONE_CLICK_UPDATE.md`](docs/ONE_CLICK_UPDATE.md)
+- [`docs/VPS_TROUBLESHOOTING.md`](docs/VPS_TROUBLESHOOTING.md)
+- [`docs/VPS_QUICK_REFERENCE.html`](docs/VPS_QUICK_REFERENCE.html)
+
 After PostgreSQL and Redis are reachable and the protected environment is
 available:
 
@@ -53,7 +60,10 @@ npm run db:migrate
 ```
 
 The systemd template is [deploy/oneui-bot.service](deploy/oneui-bot.service).
-Install it as a new service only; do not modify existing services:
+For the supported isolated PostgreSQL/Redis setup, run the one-time bootstrap
+in [`docs/ONE_CLICK_DEPLOY.md`](docs/ONE_CLICK_DEPLOY.md). The direct unit
+installation below is only valid after `oneui-postgresql.service` and
+`oneui-redis.service` already exist; do not modify existing services:
 
 ```text
 install -d -m 0750 -o root -g oneui /etc/oneui-bot

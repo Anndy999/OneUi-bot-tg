@@ -1,7 +1,8 @@
 [Unit]
 Description=OneUI Firmware Telegram Bot
+Requires=oneui-postgresql.service oneui-redis.service
 Wants=network-online.target
-After=network-online.target postgresql.service redis-server.service
+After=network-online.target oneui-postgresql.service oneui-redis.service
 
 [Service]
 Type=simple

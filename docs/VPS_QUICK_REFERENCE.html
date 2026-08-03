@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneUI VPS 快速参考</title>
+  <style>
+    :root { color-scheme: dark; --bg: #101418; --card: #182027; --text: #e8eef2; --muted: #aab8c2; --accent: #78d4ff; --warn: #ffd166; }
+    body { margin: 0; padding: 2rem; background: var(--bg); color: var(--text); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 980px; margin: auto; }
+    h1, h2 { color: var(--accent); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    section { background: var(--card); border: 1px solid #2b3943; border-radius: 12px; padding: 1rem 1.2rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre { overflow-x: auto; padding: .85rem; border-radius: 8px; background: #0b0f12; color: #d8f3ff; }
+    .warn { color: var(--warn); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OneUI VPS 快速参考</h1>
+  <p>目标：VPS 长轮询、专用 PostgreSQL/Redis、systemd 自启动。无需域名、Nginx、HTTPS、443 或 Telegram Webhook。</p>
+  <p class="warn">本页不包含任何真实 Token、密码或连接字符串。初始化命令涉及 root/sudo，但本任务未执行这些系统操作。</p>
+  <div class="grid">
+    <section>
+      <h2>一次性初始化</h2>
+      <pre>sudo bash /opt/oneui-bot/deploy/oneui-vps-bootstrap.sh</pre>
+      <p>脚本创建 OneUI 专用 PostgreSQL、Redis、应用 unit，执行现有迁移并启用开机自启动。保留现有用户配置需要人工准备 Cloudflare 状态快照。</p>
+    </section>
+    <section>
+      <h2>以后更新</h2>
+      <pre>sudo /opt/oneui-bot/deploy/update-vps.sh</pre>
+      <p>检查 main、快进更新、npm ci、测试、安全检查、生产依赖 audit、只重启 oneui-bot.service，并检查健康状态。</p>
+    </section>
+    <section>
+      <h2>健康与状态</h2>
+      <pre>curl --fail http://127.0.0.1:8787/health
+sudo systemctl status oneui-bot.service --no-pager
+sudo systemctl status oneui-postgresql.service oneui-redis.service --no-pager</pre>
+    </section>
+    <section>
+      <h2>日志</h2>
+      <pre>sudo journalctl -u oneui-bot.service -n 100 --no-pager
+sudo journalctl -u oneui-bot.service -f</pre>
+    </section>
+    <section>
+      <h2>长轮询要点</h2>
+      <ul><li><code>TELEGRAM_POLLING_ENABLED=true</code></li><li><code>VPS_SHADOW_MODE=false</code></li><li><code>TELEGRAM_SEND_ENABLED=true</code></li><li>同一 Bot Token 只能有一个轮询进程</li><li>本项目不会自动修改 Webhook 状态</li></ul>
+    </section>
+    <section>
+      <h2>失败处理</h2>
+      <p>更新失败时查看 systemd/journal 日志。不要 reset Git、删除用户数据、删除 Redis 数据或恢复数据库；先保留日志和备份，再选择经过批准的代码回滚或数据库恢复方案。</p>
+    </section>
+  </div>
+  <h2>备份</h2>
+  <p>使用 <code>deploy/backup.sh</code>，通过受保护的 secret store 注入 <code>DATABASE_URL</code>。将 PostgreSQL dump 和源代码归档复制到 VPS 外部，并定期验证可读性。数据库迁移不是普通更新的一部分，必须单独审批。</p>
+  <p>详细说明：<a href="ONE_CLICK_DEPLOY.md">部署</a> · <a href="ONE_CLICK_UPDATE.md">更新</a> · <a href="VPS_TROUBLESHOOTING.md">故障排查</a></p>
+</main>
+</body>
+</html>
