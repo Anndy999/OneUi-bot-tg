@@ -8,22 +8,23 @@ HEALTH_URL="http://127.0.0.1:8787/health"
 
 log() { printf "[oneui-update] %s\n" "$*"; }
 die() { printf "[oneui-update] ERROR: %s\n" "$*" >&2; exit 1; }
+git_cmd() { git -c "safe.directory=${PROJECT_DIR}" "$@"; }
 
 [[ "${EUID}" -eq 0 ]] || die "请使用 sudo 运行此脚本。"
 [[ -d "${PROJECT_DIR}/.git" ]] || die "项目尚未配置 Git 仓库。"
 [[ -f "${ENV_FILE}" ]] || die "缺少运行时环境文件：${ENV_FILE}"
 
 cd "${PROJECT_DIR}"
-branch="$(git branch --show-current)"
+branch="$(git_cmd branch --show-current)"
 [[ "${branch}" == "main" ]] || die "当前分支不是 main：${branch}"
-[[ -z "$(git status --porcelain --untracked-files=all)" ]] || die "工作目录有未提交变更，停止更新以避免覆盖本地修改。"
+[[ -z "$(git_cmd status --porcelain --untracked-files=all)" ]] || die "工作目录有未提交变更，停止更新以避免覆盖本地修改。"
 
-previous_commit="$(git rev-parse HEAD)"
+previous_commit="$(git_cmd rev-parse HEAD)"
 log "从 origin/main 获取更新。"
-git fetch --prune origin main
-git pull --ff-only origin main
+git_cmd fetch --prune origin main
+git_cmd pull --ff-only origin main
 
-if [[ "$(git rev-parse HEAD)" == "${previous_commit}" ]]; then
+if [[ "$(git_cmd rev-parse HEAD)" == "${previous_commit}" ]]; then
   log "没有新的代码提交，仍然执行健康检查。"
 else
   log "安装锁定依赖。"
