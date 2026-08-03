@@ -79,6 +79,7 @@ import {
   getAccessRequests,
   getAccessSettings,
   getAllowedUsers,
+  getAdminChatIds,
   getAdditionalAdmins,
   getCacheSettings,
   getDeleteAllMonitorConfirmation,
@@ -160,7 +161,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.14.0";
+const APP_VERSION = "2.15.0";
 
 export default {
   async fetch(request, env, ctx) {
@@ -300,6 +301,26 @@ async function telegramBotApi(env, method, payload = null) {
   }
 }
 
+const PUBLIC_TELEGRAM_COMMANDS = [
+  { command: "start", description: "打开主菜单" },
+  { command: "devices", description: "我的设备" },
+  { command: "status", description: "服务状态" },
+  { command: "language", description: "切换中英文" },
+  { command: "help", description: "使用说明" },
+  { command: "apply", description: "申请查询权限" },
+  { command: "whoami", description: "查看我的 Chat ID" }
+];
+
+const ADMIN_TELEGRAM_COMMANDS = [
+  ...PUBLIC_TELEGRAM_COMMANDS,
+  { command: "admin", description: "管理员面板" },
+  { command: "chain", description: "发布链" },
+  { command: "checknow", description: "立即检查" },
+  { command: "moninterval", description: "监控间隔" },
+  { command: "monsnooze", description: "暂停监控" },
+  { command: "adminhelp", description: "管理员命令" }
+];
+
 async function syncTelegramCommands(env) {
   // Clear inherited scopes first; Telegram otherwise may prefer an old
   // private-chat command menu over the current default menu.
@@ -313,17 +334,22 @@ async function syncTelegramCommands(env) {
     const cleared = await telegramBotApi(env, "deleteMyCommands", { scope });
     if (!cleared.ok) return cleared;
   }
-  return telegramBotApi(env, "setMyCommands", {
-    commands: [
-      { command: "start", description: "\u6253\u5f00\u4e3b\u83dc\u5355" },
-      { command: "language", description: "\u5207\u6362\u4e2d\u82f1\u6587" },
-      { command: "apply", description: "\u7533\u8bf7\u67e5\u8be2\u6743\u9650" },
-      { command: "whoami", description: "\u67e5\u770b\u6211\u7684 Chat ID" },
-      { command: "status", description: "\u67e5\u770b\u673a\u5668\u4eba\u72b6\u6001" },
-      { command: "devices", description: "\u6211\u7684\u8bbe\u5907\u4e0e\u901a\u77e5" },
-      { command: "admin", description: "\u6253\u5f00\u7ba1\u7406\u5458\u9762\u677f" },
-      { command: "monsnooze", description: "\u5b9a\u65f6\u6682\u505c\u76d1\u63a7" }
-    ]
+  const publicResult = await telegramBotApi(env, "setMyCommands", { commands: PUBLIC_TELEGRAM_COMMANDS });
+  if (!publicResult.ok) return publicResult;
+  for (const chatId of await getAdminChatIds(env)) {
+    const result = await telegramBotApi(env, "setMyCommands", {
+      scope: { type: "chat", chat_id: chatId },
+      commands: ADMIN_TELEGRAM_COMMANDS
+    });
+    if (!result.ok) return result;
+  }
+  return publicResult;
+}
+
+async function clearTelegramCommandsForChat(env, chatId) {
+  if (!chatId || !env.TELEGRAM_BOT_TOKEN) return;
+  await telegramBotApi(env, "deleteMyCommands", {
+    scope: { type: "chat", chat_id: String(chatId) }
   });
 }
 
@@ -634,33 +660,48 @@ function languageModeKeyboard(identity = "unauthorized", lang = "zh") {
   };
 }
 
-function mainMenuText(identity, lang = "zh") {
+async function mainMenuText(env, identity, lang = "zh") {
   if (lang === "en") {
-    if (identity === "admin") return "Admin panel\n\nManage monitoring, users, rollout chains, and system settings.";
+    if (identity === "admin") {
+      const [items, requests, chains] = await Promise.all([getMonitorItems(env), getAccessRequests(env), getRolloutChains(env)]);
+      const regular = standardMonitorItems(items);
+      const paused = regular.filter((item) => item.enabled === false).length;
+      const s26 = chains.chains.find((chain) => chain.id === "s26");
+      const s25 = chains.chains.find((chain) => chain.id === "s25");
+      return [
+        "Admin",
+        `Monitoring: ${regular.length} · paused ${paused}`,
+        `Rollout: S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`,
+        `Pending access: ${requests.length}`
+      ].join("\n");
+    }
     if (identity === "allowed") return "Samsung Firmware\n\nSend Model + CSC, for example: SM-S948B EUX.";
     return "Samsung Firmware\n\nRequest access to query firmware.";
   }
-  if (identity === "admin") return "\u7ba1\u7406\u5458\u9762\u677f\n\n\u7ba1\u7406\u76d1\u63a7\u3001\u7528\u6237\u3001\u53d1\u5e03\u94fe\u548c\u7cfb\u7edf\u8bbe\u7f6e\u3002";
+  if (identity === "admin") {
+    const [items, requests, chains] = await Promise.all([getMonitorItems(env), getAccessRequests(env), getRolloutChains(env)]);
+    const regular = standardMonitorItems(items);
+    const paused = regular.filter((item) => item.enabled === false).length;
+    const s26 = chains.chains.find((chain) => chain.id === "s26");
+    const s25 = chains.chains.find((chain) => chain.id === "s25");
+    return [
+      "管理员",
+      `监控：${regular.length} 个 · 暂停 ${paused}`,
+      `发布链：S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`,
+      `待审批：${requests.length}`
+    ].join("\n");
+  }
   if (identity === "allowed") return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u53d1\u9001\u201c\u578b\u53f7 CSC\u201d\u5373\u53ef\u67e5\u8be2\u3002\n\u4f8b\u5982\uff1aSM-S948B EUX";
   return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u7533\u8bf7\u6743\u9650\u540e\u5373\u53ef\u67e5\u8be2\u56fa\u4ef6\u3002";
-  /* legacy copy retained below for historical deployments */
-  if (lang === "en") {
-    if (identity === "admin") return "Admin panel\n\nChoose a management area below. Firmware queries still accept Model / CSC text directly.";
-    if (identity === "allowed") return "Samsung Firmware Center\n\nSend a Model / CSC directly, for example: 9480 CHC.\nUse My Devices to save shortcuts and choose update notifications.";
-    return "Samsung Firmware Center\n\nRequest access first, then send a Model / CSC to query firmware.";
-  }
-  if (identity === "admin") return "管理员面板\n\n请选择管理区域。固件查询仍可直接发送 Model / CSC。";
-  if (identity === "allowed") return "Samsung 固件查询\n\n直接发送 Model / CSC 即可查询，例如：9480 CHC。\n可在“我的设备”保存快捷查询并管理新版本通知。";
-  return "Samsung 固件查询\n\n请先申请查询权限，通过后可直接发送 Model / CSC。";
 }
 
 function mainMenuKeyboard(identity, lang = "zh") {
   const en = lang === "en";
   if (identity === "admin") {
     return { inline_keyboard: [
-      [{ text: en ? "Monitoring" : "\ud83d\udce1 \u76d1\u63a7", callback_data: "admin:monitor-menu" }, { text: en ? "Users" : "\ud83d\udc65 \u7528\u6237", callback_data: "admin:access-menu" }],
-      [{ text: en ? "Rollout" : "\ud83d\udce3 \u53d1\u5e03\u94fe", callback_data: "admin:rollout-menu" }, { text: en ? "Admins" : "\ud83d\udc51 \u7ba1\u7406\u5458", callback_data: "admin:admins" }],
-      [{ text: en ? "System" : "\u2699\ufe0f \u7cfb\u7edf", callback_data: "admin:system-menu" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+      [{ text: en ? "Monitoring" : "\ud83d\udce1 监控", callback_data: "admin:monitor-menu" }, { text: en ? "Rollout" : "\ud83d\udce3 发布链", callback_data: "admin:rollout-menu" }],
+      [{ text: en ? "Users" : "\ud83d\udc65 用户", callback_data: "admin:access-menu" }, { text: en ? "Admins" : "\ud83d\udc51 管理员", callback_data: "admin:admins" }],
+      [{ text: en ? "More" : "更多", callback_data: "menu:more" }]
     ] };
   }
   if (identity === "allowed") {
@@ -673,52 +714,25 @@ function mainMenuKeyboard(identity, lang = "zh") {
     [{ text: en ? "Request access" : "\ud83d\udd10 \u7533\u8bf7\u6743\u9650", callback_data: "user:apply" }],
     [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
   ] };
-  /* legacy keyboard retained below for callback compatibility */
-  if (identity === "admin") {
-    return {
-      inline_keyboard: [
-        [
-          { text: en ? "Monitoring" : "监控中心", callback_data: "admin:monitor-menu" },
-          { text: en ? "Access" : "用户权限", callback_data: "admin:access-menu" }
-        ],
-        [{ text: en ? "System & cache" : "\u7cfb\u7edf\u4e0e\u7f13\u5b58", callback_data: "admin:system-menu" }],
-        [
-          { text: en ? "Language" : "语言", callback_data: "menu:language" },
-          { text: en ? "Help" : "简明帮助", callback_data: "menu:help" }
-        ]
-      ]
-    };
-  }
-  if (identity === "allowed") {
-    return {
-      inline_keyboard: [
-        [
-          { text: en ? "Query help" : "查询说明", callback_data: "menu:query-help" },
-          { text: en ? "My info" : "我的信息", callback_data: "user:whoami" }
-        ],
-        [{ text: en ? "📱 My Devices" : "📱 我的设备", callback_data: "device:list" }],
-        [
-          { text: en ? "Status" : "机器人状态", callback_data: "user:status" },
-          { text: en ? "Language" : "语言", callback_data: "menu:language" }
-        ]
-      ]
-    };
-  }
-  return {
-    inline_keyboard: [
-      [{ text: en ? "Request access" : "申请查询权限", callback_data: "user:apply" }],
-      [
-        { text: en ? "My info" : "我的信息", callback_data: "user:whoami" },
-        { text: en ? "Language" : "语言", callback_data: "menu:language" }
-      ],
-      [{ text: en ? "Help" : "使用说明", callback_data: "menu:help" }]
-    ]
-  };
+}
+
+function adminMoreKeyboard(lang = "zh") {
+  const en = lang === "en";
+  return { inline_keyboard: [
+    [{ text: en ? "System" : "系统", callback_data: "admin:system-menu" }, { text: en ? "Help" : "帮助", callback_data: "menu:help" }],
+    [{ text: en ? "Commands" : "命令", callback_data: "admin:help" }],
+    [{ text: en ? "Language" : "语言", callback_data: "menu:language" }],
+    [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
+  ] };
+}
+
+function adminMoreText(lang = "zh") {
+  return lang === "en" ? "More\n\nSystem, help, and language." : "更多\n\n系统、帮助和语言设置。";
 }
 
 async function showMainMenu(env, chatId, identity, messageId = null) {
   const lang = await getUserLanguage(env, chatId);
-  const text = mainMenuText(identity, lang);
+  const text = await mainMenuText(env, identity, lang);
   const keyboard = mainMenuKeyboard(identity, lang);
   if (messageId) return safeEditOrSend(env, chatId, messageId, text, keyboard);
   return sendTelegramMessage(env, chatId, text, keyboard);
@@ -1042,8 +1056,8 @@ function adminMenuKeyboard(lang = "zh") {
   return mainMenuKeyboard("admin", lang);
 }
 
-function adminMenuText(lang = "zh") {
-  return mainMenuText("admin", lang);
+async function adminMenuText(env, lang = "zh") {
+  return mainMenuText(env, "admin", lang);
 }
 
 function monitorMenuKeyboard(lang = "zh") {
@@ -1051,22 +1065,31 @@ function monitorMenuKeyboard(lang = "zh") {
   return {
     inline_keyboard: [
       [
-        { text: en ? "Monitor targets" : "监控设备", callback_data: "admin:monitors" },
-        { text: en ? "HIGH priority" : "高优先级", callback_data: "admin:high" }
+        { text: en ? "Targets" : "目标", callback_data: "admin:monitors" },
+        { text: en ? "Priority" : "优先级", callback_data: "admin:high" }
       ],
       [
         { text: en ? "Check now" : "立即检查", callback_data: "admin:checknow" },
-        { text: en ? "Schedule" : "调度设置", callback_data: "admin:schedule-menu" }
+        { text: en ? "Schedule" : "调度", callback_data: "admin:schedule-menu" }
       ],
       [
-        { text: en ? "Monitor health" : "监控健康度", callback_data: "admin:monitor-health" },
-        { text: en ? "Recent events" : "最近事件", callback_data: "admin:monitor-events" }
+        { text: en ? "Health" : "健康", callback_data: "admin:monitor-health" },
+        { text: en ? "More" : "更多", callback_data: "admin:monitor-more" }
       ],
-      [{ text: en ? "Monitoring intervals" : "监控间隔设置", callback_data: "admin:intervals" }],
-      [{ text: en ? "Add target" : "\u6dfb\u52a0\u8bbe\u5907", callback_data: "admin:monitor-add-help" }],
-      [{ text: en ? "Back" : "返回主菜单", callback_data: "menu:home" }]
+      [{ text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" }],
+      [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
     ]
   };
+}
+
+function monitorMoreKeyboard(lang = "zh") {
+  const en = lang === "en";
+  return { inline_keyboard: [
+    [{ text: en ? "Health" : "健康", callback_data: "admin:monitor-health" }, { text: en ? "Events" : "事件", callback_data: "admin:monitor-events" }],
+    [{ text: en ? "Intervals" : "间隔", callback_data: "admin:intervals" }, { text: en ? "Priority" : "优先级", callback_data: "admin:high" }],
+    [{ text: en ? "Delete regular" : "删除普通监控", callback_data: "admin:monitor-delete-all" }],
+    [{ text: en ? "Back" : "返回", callback_data: "admin:monitor-menu" }]
+  ] };
 }
 
 function monitorCenterState(item, runtime = {}) {
@@ -1158,22 +1181,12 @@ async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
     }
     rows.push(
     [
-      { text: en ? "Add target" : "\u6dfb\u52a0\u8bbe\u5907", callback_data: "admin:monitor-add-help" },
+      { text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" },
       { text: en ? "Check now" : "\u7acb\u5373\u68c0\u67e5", callback_data: "admin:checknow" }
     ],
     [
-      { text: en ? "Schedule" : "\u8c03\u5ea6\u8bbe\u7f6e", callback_data: "admin:schedule-menu" },
-      { text: en ? "Intervals" : "\u76d1\u63a7\u95f4\u9694", callback_data: "admin:intervals" }
-    ],
-    [
-      { text: en ? "Monitor health" : "\u76d1\u63a7\u5065\u5eb7\u5ea6", callback_data: "admin:monitor-health" },
-      { text: en ? "Recent events" : "\u6700\u8fd1\u4e8b\u4ef6", callback_data: "admin:monitor-events" }
-    ],
-    [
-      { text: en ? "HIGH priority" : "\u9ad8\u4f18\u5148\u7ea7", callback_data: "admin:high" }
-    ],
-    [
-      { text: en ? "Delete regular monitors" : "\u5220\u9664\u666e\u901a\u76d1\u63a7", callback_data: "admin:monitor-delete-all" }
+      { text: en ? "Schedule" : "\u8c03\u5ea6", callback_data: "admin:schedule-menu" },
+      { text: en ? "More" : "更多", callback_data: "admin:monitor-more" }
     ],
     [{ text: en ? "Home" : "\u8fd4\u56de\u4e3b\u83dc\u5355", callback_data: "menu:home" }]
   );
@@ -1531,6 +1544,17 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     return;
   }
 
+  if (data === "menu:more") {
+    const identity = await getIdentity(env, chatId);
+    const lang = await getUserLanguage(env, chatId);
+    if (identity === "admin") {
+      await safeEditOrSend(env, chatId, messageId, adminMoreText(lang), adminMoreKeyboard(lang));
+    } else {
+      await safeEditOrSend(env, chatId, messageId, userSettingsText(lang), userSettingsKeyboard(identity, lang));
+    }
+    return;
+  }
+
   if (data === "menu:settings") {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
@@ -1542,9 +1566,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity === "admin") {
-      const parts = adminHelpParts(lang);
-      await safeEditOrSend(env, chatId, messageId, `${guideText(identity, lang)}\n\n${parts[0]}`, mainMenuKeyboard(identity, lang));
-      for (const part of parts.slice(1)) await sendTelegramMessage(env, chatId, part);
+      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), adminMoreKeyboard(lang));
     } else {
       await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang));
     }
@@ -1753,7 +1775,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const lang = data.endsWith(":en") ? "en" : "zh";
     await setUserLanguage(env, chatId, lang);
     const identity = await getIdentity(env, chatId);
-    await safeEditOrSend(env, chatId, messageId, mainMenuText(identity, lang), mainMenuKeyboard(identity, lang));
+     await safeEditOrSend(env, chatId, messageId, await mainMenuText(env, identity, lang), mainMenuKeyboard(identity, lang));
     return;
   }
 
@@ -1920,6 +1942,17 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   if (data === "admin:monitor-menu") {
     const panel = await formatMonitorCenterPanel(env, lang);
     await safeEditOrSend(env, chatId, messageId, panel.text, panel.replyMarkup);
+    return;
+  }
+
+  if (data === "admin:monitor-more") {
+    await safeEditOrSend(
+      env,
+      chatId,
+      messageId,
+      lang === "en" ? "More monitoring tools" : "更多监控工具",
+      monitorMoreKeyboard(lang)
+    );
     return;
   }
 
@@ -2965,7 +2998,7 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
   if (command === "/admin") {
     if (!(await requireAdmin(env, chatId, identity))) return;
     const lang = await getUserLanguage(env, chatId);
-    await sendTelegramMessage(env, chatId, adminMenuText(lang), adminMenuKeyboard(lang));
+    await sendTelegramMessage(env, chatId, await adminMenuText(env, lang), adminMenuKeyboard(lang));
     return;
   }
 
@@ -2983,6 +3016,7 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
       return;
     }
     const added = await addAdditionalAdmin(env, targetId, args.slice(1).join(" "), chatId);
+    await syncTelegramCommands(env).catch(() => null);
     await sendTelegramMessage(env, chatId, added.owner ? "\u8be5 Chat ID \u5df2\u662f\u6240\u6709\u8005\u3002" : (added.existing ? "\u7ba1\u7406\u5458\u4fe1\u606f\u5df2\u66f4\u65b0\u3002" : "\u7ba1\u7406\u5458\u5df2\u6dfb\u52a0\u3002"));
     return;
   }
@@ -2990,6 +3024,10 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
   if (command === "/admindel") {
     if (!await requireOwner(env, chatId)) return;
     const result = await removeAdditionalAdmin(env, args[0]);
+    if (result.removed) {
+      await clearTelegramCommandsForChat(env, args[0]);
+      await syncTelegramCommands(env).catch(() => null);
+    }
     await sendTelegramMessage(env, chatId, result.removed ? "\u7ba1\u7406\u5458\u5df2\u79fb\u9664\u3002" : "\u672a\u627e\u5230\u53ef\u79fb\u9664\u7684\u7ba1\u7406\u5458\u3002");
     return;
   }
@@ -3054,7 +3092,7 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     if (!(await requireAdmin(env, chatId, identity))) return;
     const result = await syncTelegramCommands(env);
     await sendTelegramMessage(env, chatId, result.ok
-      ? "快捷命令已同步。\n\n公开入口：/start、/apply、/whoami、/status"
+       ? "快捷命令已同步。\n\n普通用户和管理员已分别更新。"
       : `同步失败：${result.error || result.data?.description || "unknown error"}`);
     return;
   }

@@ -2921,11 +2921,10 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   const callbacks = sent.body.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
   assert.deepEqual(callbacks, [
     "admin:monitor-menu",
-    "admin:access-menu",
     "admin:rollout-menu",
+    "admin:access-menu",
     "admin:admins",
-    "admin:system-menu",
-    "menu:help"
+    "menu:more"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
@@ -3045,7 +3044,10 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
   assert.ok(sync);
   const clears = payloads.filter((entry) => entry.url.includes("/deleteMyCommands"));
   assert.equal(clears.length, 4);
-  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "language", "apply", "whoami", "status", "devices", "admin", "monsnooze"]);
+  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "devices", "status", "language", "help", "apply", "whoami"]);
+  const adminSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.type === "chat");
+  assert.ok(adminSync);
+  assert.ok(adminSync.body.commands.some((item) => item.command === "admin"));
 });
 
 test("My Devices persists shortcuts, deduplicates targets, and toggles subscriptions", async () => {
@@ -3262,7 +3264,12 @@ test("monitoring center exposes status filters and bulk deletion needs a typed f
   assert.ok(callbacks.includes("admin:monitor-filter:paused"));
   assert.ok(callbacks.includes("admin:monitor-filter:awaiting"));
   assert.ok(callbacks.includes("admin:monitor-filter:failing"));
-  assert.ok(callbacks.includes("admin:monitor-delete-all"));
+
+  await callback(7000501, "monitor-more", "admin:monitor-more");
+  const more = payloads.find((entry) => entry.body.reply_markup?.inline_keyboard?.flat().some((button) => button.callback_data === "admin:monitor-delete-all"));
+  assert.ok(more);
+  const moreCallbacks = more.body.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
+  assert.ok(moreCallbacks.includes("admin:monitor-delete-all"));
 
   await callback(700051, "delete-all", "admin:monitor-delete-all");
   await callback(700052, "delete-all-confirm", "admin:monitor-delete-all-confirm");
@@ -3448,7 +3455,7 @@ test("language and monitoring buttons stay writable when Workers KV rejects writ
 
   await callback(700009, "language-en", "lang:en", 6);
   assert.equal(await getUserLanguage(env, 996), "en");
-  assert.ok(payloads.some((entry) => entry.body.text?.startsWith("Admin panel")));
+  assert.ok(payloads.some((entry) => entry.body.text?.startsWith("Admin")));
 
   const before = await getMonitorSchedule(env);
   await callback(700010, "schedule-durable-toggle", "admin:schedule:toggle", 7);

@@ -554,27 +554,23 @@ export function rolloutChainPanelText(chain, lang = "zh") {
   });
   if (lang === "en") {
     return [
-      `📣 ${chain.name} rollout`,
-      "",
+      `📣 ${chain.name}`,
       `Status: ${chain.status}`,
-      `Current region: ${current?.name || "Not configured"}`,
-      `Trigger: any configured model`,
-      `Next: ${next?.name || "complete this round"}`,
-      `Schedule: ${chain.startTime}–${chain.endTime} Beijing Time`,
-      `Interval: ${chain.intervalMinutes} min`,
+      `Region: ${current?.name || "Not configured"}`,
+      `Next: ${next?.name || "complete"}`,
+      `Trigger: any preset model`,
+      `Schedule: ${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} min`,
       "",
       ...stageLines
     ].join("\n");
   }
   return [
-    `📣 ${chain.name} 发布链`,
-    "",
+    `📣 ${chain.name}`,
     `状态：${chain.status === "active" ? "监控中" : chain.status === "awaiting_confirmation" ? "等待确认" : chain.status === "completed" ? "本轮完成" : "待配置"}`,
-    `当前地区：${current?.name || "未配置"}`,
-    "触发：本地区任意预设机型",
+    `地区：${current?.name || "未配置"}`,
     `下一步：${next?.name || "本轮完成"}`,
-    `时间：${chain.startTime}–${chain.endTime}（北京时间）`,
-    `间隔：${chain.intervalMinutes} 分钟`,
+    "触发：任一预设机型",
+    `时间：${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} 分钟`,
     "",
     ...stageLines
   ].join("\n");
