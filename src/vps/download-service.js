@@ -13,6 +13,9 @@ import { resolveVpsOfficialFirmwareDownload } from "./fus-resolver.js";
 const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
 const FREE_SPACE_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
+const IO_BUFFER_BYTES = 4 * 1024 * 1024;
+const SPEED_WINDOW_MS = 10 * 1000;
+const SPEED_SAMPLE_MS = 1000;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   let value = index;
@@ -130,7 +133,7 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const progressBytes = decrypting ? Number(safe.decryptBytes || 0) : Number(safe.bytes || 0);
   const percent = safe.state === "completed" ? 100 : safe.totalBytes
@@ -142,7 +145,35 @@ function publicJob(job) {
   const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
     ? Math.max(0, Math.ceil((safe.totalBytes - progressBytes) / speedBytesPerSecond))
     : null;
-  return { ...safe, percent, speedBytesPerSecond, etaSeconds };
+  return { ...safe, percent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds };
+}
+
+function resetSpeedTracking(job, phase, bytesAtStart, timestamp) {
+  job.speedPhase = phase;
+  job.speedSamples = [{ at: Number(timestamp), bytes: Math.max(0, Number(bytesAtStart) || 0) }];
+  job.speedBytesPerSecond = 0;
+}
+
+export function updateRollingSpeed(job, phase, bytes, timestamp) {
+  const now = Number(timestamp);
+  const value = Math.max(0, Number(bytes) || 0);
+  if (job.speedPhase !== phase || !Array.isArray(job.speedSamples) || !job.speedSamples.length) {
+    resetSpeedTracking(job, phase, value, now);
+    return 0;
+  }
+  const samples = job.speedSamples;
+  const last = samples.at(-1);
+  const sampleAt = Math.max(Number(last.at) || now, now);
+  if (sampleAt - Number(last.at) >= SPEED_SAMPLE_MS) samples.push({ at: sampleAt, bytes: value });
+  else last.bytes = value;
+  const cutoff = sampleAt - SPEED_WINDOW_MS;
+  while (samples.length > 2 && Number(samples[1].at) <= cutoff) samples.shift();
+  const first = samples[0];
+  const latest = samples.at(-1);
+  const elapsedMs = Number(latest.at) - Number(first.at);
+  const speed = elapsedMs > 0 ? Math.floor(Math.max(0, Number(latest.bytes) - Number(first.bytes)) / (elapsedMs / 1000)) : 0;
+  job.speedBytesPerSecond = Math.max(0, speed);
+  return job.speedBytesPerSecond;
 }
 
 function decryptFileName(fileName) {
@@ -572,13 +603,12 @@ export class FirmwareDownloadService {
 
   async decryptFirmwarePart(job, encryptedPath, outputPath, controller) {
     const { createReadStream, createWriteStream } = await import("node:fs");
-    const reader = createReadStream(encryptedPath, { highWaterMark: 1024 * 1024 });
-    const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640 });
+    const reader = createReadStream(encryptedPath, { highWaterMark: IO_BUFFER_BYTES });
+    const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
     const decipher = createDecipheriv("aes-128-ecb", decryptionKey(job.decryption?.keySeed), null);
     decipher.setAutoPadding(false);
     let processed = 0;
     let lastPersist = 0;
-    const startedAt = this.now();
     try {
       for await (const chunk of reader) {
         if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
@@ -586,11 +616,11 @@ export class FirmwareDownloadService {
         if (output.length) await writeChunk(writer, output);
         processed += chunk.length;
         job.decryptBytes = processed;
-        const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
-        job.speedBytesPerSecond = Math.max(0, Math.floor(processed / elapsedSeconds));
-        if (this.now() - lastPersist > 1000) {
-          lastPersist = this.now();
-          job.updatedAt = new Date(this.now()).toISOString();
+        const now = this.now();
+        updateRollingSpeed(job, "decrypt", processed, now);
+        if (now - lastPersist > 1000) {
+          lastPersist = now;
+          job.updatedAt = new Date(now).toISOString();
           await this.persist();
         }
       }
@@ -680,12 +710,12 @@ export class FirmwareDownloadService {
     };
     const persistProgress = async (force = false) => {
       job.bytes = received();
-      if (!force && this.now() - lastPersist <= 1000) return;
-      lastPersist = this.now();
-      const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
       const startedBytes = Number(job.downloadStartBytes || 0);
-      job.speedBytesPerSecond = Math.max(0, Math.floor(Math.max(0, job.bytes - startedBytes) / Math.max(1, (this.now() - startedAt) / 1000)));
-      job.updatedAt = new Date(this.now()).toISOString();
+      const now = this.now();
+      updateRollingSpeed(job, "download", Math.max(0, job.bytes - startedBytes), now);
+      if (!force && now - lastPersist <= 1000) return;
+      lastPersist = now;
+      job.updatedAt = new Date(now).toISOString();
       await this.persist();
     };
     try {
@@ -778,9 +808,11 @@ export class FirmwareDownloadService {
     this.controllers.set(job.id, controller);
     try {
       job.state = "downloading";
-      job.downloadStartedAt = new Date(this.now()).toISOString();
+      const downloadStartedAt = this.now();
+      job.downloadStartedAt = new Date(downloadStartedAt).toISOString();
       job.downloadStartBytes = Number(job.bytes || 0);
-      job.updatedAt = new Date(this.now()).toISOString();
+      resetSpeedTracking(job, "download", 0, downloadStartedAt);
+      job.updatedAt = new Date(downloadStartedAt).toISOString();
       await this.persist();
       let resolved = null;
       if (job.downloadMode === "fus" || !job.sourceUrl) {
@@ -812,7 +844,7 @@ export class FirmwareDownloadService {
         const advertised = Number(response.headers.get("content-length") || 0);
         if (advertised > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
         job.totalBytes = advertised;
-        const writer = await import("node:fs").then(({ createWriteStream }) => createWriteStream(partPath, { flags: "w", mode: 0o640 }));
+        const writer = await import("node:fs").then(({ createWriteStream }) => createWriteStream(partPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES }));
         let received = 0;
         crc32 = 0xffffffff;
         let lastFreeCheckBytes = 0;
@@ -833,12 +865,11 @@ export class FirmwareDownloadService {
             await writeChunk(writer, chunk);
             crc32 = updateCrc32(crc32, chunk);
             job.bytes = received;
-            const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
-            const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
-            job.speedBytesPerSecond = Math.max(0, Math.floor(received / elapsedSeconds));
-            if (this.now() - lastPersist > 1000) {
-              lastPersist = this.now();
-              job.updatedAt = new Date(this.now()).toISOString();
+            const now = this.now();
+            updateRollingSpeed(job, "download", received, now);
+            if (now - lastPersist > 1000) {
+              lastPersist = now;
+              job.updatedAt = new Date(now).toISOString();
               await this.persist();
             }
           }
@@ -866,8 +897,9 @@ export class FirmwareDownloadService {
         const decryptPartPath = join(this.config.dir, `${job.id}.decrypt.part`);
         job.state = "decrypting";
         job.decryptBytes = 0;
-        job.speedBytesPerSecond = 0;
-        job.updatedAt = new Date(this.now()).toISOString();
+        const decryptStartedAt = this.now();
+        resetSpeedTracking(job, "decrypt", 0, decryptStartedAt);
+        job.updatedAt = new Date(decryptStartedAt).toISOString();
         await this.persist();
         await this.decryptFirmwarePart(job, partPath, decryptPartPath, controller);
         if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");

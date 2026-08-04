@@ -11,7 +11,8 @@ import {
   buildDownloadApp,
   createDownloadConfig,
   isAllowedOfficialHost,
-  startDownloadServer
+  startDownloadServer,
+  updateRollingSpeed
 } from "../src/vps/download-service.js";
 
 async function tempDir() {
@@ -27,6 +28,16 @@ test("download configuration defaults to an isolated local API", () => {
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
+});
+
+test("download speed uses a phase-local rolling window", () => {
+  const job = {};
+  updateRollingSpeed(job, "download", 0, 0);
+  updateRollingSpeed(job, "download", 100, 1000);
+  updateRollingSpeed(job, "download", 200, 2000);
+  assert.equal(job.speedBytesPerSecond, 100);
+  updateRollingSpeed(job, "decrypt", 0, 3000);
+  assert.equal(job.speedBytesPerSecond, 0);
 });
 
 test("download response-header deadline does not abort an active body stream", async () => {

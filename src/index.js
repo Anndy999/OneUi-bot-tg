@@ -866,7 +866,11 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
   if (active) {
     lines.push(`${lang === "en" ? "Progress" : "进度"}: ${downloadProgressBar(job.percent)}`);
     if (job.totalBytes) lines.push(`${formatBytes(job.bytes)} / ${formatBytes(job.totalBytes)}`);
-    if (job.speedBytesPerSecond) lines.push(`${lang === "en" ? "Speed" : "速度"}: ${formatBytes(job.speedBytesPerSecond)}/s · ${lang === "en" ? "ETA" : "剩余"}: ${formatDuration(job.etaSeconds)}`);
+    if (job.speedBytesPerSecond) {
+      const speedWindowSeconds = Number(job.speedWindowSeconds || 10);
+      const speedLabel = lang === "en" ? `Speed (last ${speedWindowSeconds}s)` : `速度（近${speedWindowSeconds}秒）`;
+      lines.push(`${speedLabel}: ${formatBytes(job.speedBytesPerSecond)}/s · ${lang === "en" ? "ETA" : "剩余"}: ${formatDuration(job.etaSeconds)}`);
+    }
   }
   if (job.state === "completed") lines.push(`${lang === "en" ? "File" : "文件"}: ${job.originalName || job.fileName || "firmware"}`);
   if (job.state === "failed" && job.error) lines.push(`${lang === "en" ? "Reason" : "原因"}: ${String(job.error).slice(0, 220)}`);
