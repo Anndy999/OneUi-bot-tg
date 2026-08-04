@@ -170,7 +170,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.17.0";
+const APP_VERSION = "2.17.1";
 
 export default {
   async fetch(request, env, ctx) {
@@ -825,8 +825,8 @@ function enBack(lang) { return lang === "en" ? "Back" : "返回"; }
 
 function downloadStateLabel(state, lang = "zh") {
   const labels = lang === "en"
-    ? { queued: "Queued", downloading: "Downloading", completed: "Completed", failed: "Failed", cancelled: "Stopped" }
-    : { queued: "排队中", downloading: "下载中", completed: "已完成", failed: "失败", cancelled: "已终止" };
+    ? { queued: "Queued", downloading: "Downloading", decrypting: "Decrypting", completed: "Completed", failed: "Failed", cancelled: "Stopped" }
+    : { queued: "排队中", downloading: "下载中", decrypting: "正在解密", completed: "已完成", failed: "失败", cancelled: "已终止" };
   return labels[state] || state || "-";
 }
 
@@ -855,7 +855,7 @@ function downloadProgressBar(percent) {
 
 function formatDownloadJob(job, lang = "zh", detailed = false) {
   if (!job) return lang === "en" ? "No download task." : "暂无下载任务。";
-  const active = ["queued", "downloading"].includes(job.state);
+  const active = ["queued", "downloading", "decrypting"].includes(job.state);
   const lines = [
     `${job.model || "?"} · ${job.csc || "?"}`,
     `${lang === "en" ? "Version" : "版本"}: ${job.version || "?"}`,
@@ -888,7 +888,7 @@ function downloadMenuKeyboard(jobs = [], lang = "zh") {
 function downloadTaskKeyboard(job, lang = "zh") {
   const en = lang === "en";
   const rows = [[{ text: en ? "Refresh" : "刷新", callback_data: `admin:dl:refresh:${job.id}` }]];
-  if (["queued", "downloading"].includes(job.state)) rows.push([{ text: en ? "Terminate" : "终止下载", callback_data: `admin:dl:stop:${job.id}` }]);
+  if (["queued", "downloading", "decrypting"].includes(job.state)) rows.push([{ text: en ? "Terminate" : "终止下载", callback_data: `admin:dl:stop:${job.id}` }]);
   else rows.push([{ text: en ? "Delete" : "删除任务与文件", callback_data: `admin:dl:delete:${job.id}` }]);
   rows.push([{ text: en ? "Downloads" : "下载列表", callback_data: "admin:download-menu" }]);
   return { inline_keyboard: rows };
@@ -1701,7 +1701,7 @@ async function renderDownloadDetails(env, chatId, messageId, id) {
   const job = result.download;
   const title = lang === "en" ? "Firmware download" : "固件下载";
   const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang));
-  if (["queued", "downloading"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
+  if (["queued", "downloading", "decrypting"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
   return response;
 }
 
@@ -1715,7 +1715,7 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
     try {
       const result = await getFirmwareDownload(env, id);
       const job = result.download;
-      if (!result.ok || !job || !["queued", "downloading"].includes(job.state) || polls > 1440) {
+      if (!result.ok || !job || !["queued", "downloading", "decrypting"].includes(job.state) || polls > 1440) {
         clearInterval(timer);
         downloadProgressWatches.delete(key);
         if (job) await renderDownloadDetails(env, chatId, messageId, id);

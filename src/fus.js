@@ -105,6 +105,17 @@ function logicCheck(input, nonce) {
   return [...seed].map((character) => source.charAt(character.charCodeAt(0) & 0x0f)).join("");
 }
 
+function firmwareDecryptionInfo(fileName, version, model, csc, logicValue) {
+  const name = String(fileName || "").toLowerCase();
+  if (name.endsWith(".enc2")) {
+    return { mode: "enc2", keySeed: `${String(csc || "").toUpperCase()}:${String(model || "").toUpperCase()}:${String(version || "")}` };
+  }
+  if (!name.endsWith(".enc4")) return null;
+  const keySeed = logicCheck(version, logicValue);
+  if (!keySeed) throw new Error("Samsung FUS did not return a usable decryption key for this firmware");
+  return { mode: "enc4", keySeed };
+}
+
 function collectTags(xml, tag) {
   const out = [];
   const pattern = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "gi");
@@ -779,6 +790,8 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
   const fileName = tagValue(xml, "BINARY_NAME");
   const modelPath = tagValue(xml, "MODEL_PATH");
   const byteSize = Number(tagValue(xml, "BINARY_BYTE_SIZE") || 0);
+  const resolvedVersion = tagValue(xml, "BINARY_SW_VERSION") || fusVersion;
+  const logicValue = tagValue(xml, "LOGIC_VALUE_FACTORY") || tagValue(xml, "LOGIC_VALUE_HOME");
   if (!fileName || !modelPath) throw new Error("Samsung FUS did not return a firmware bundle");
   const modelType = tagValue(xml, "DEVICE_MODEL_TYPE");
   if (!modelType) throw new Error("Samsung FUS did not return the firmware model type");
@@ -814,7 +827,8 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
     size: Number.isFinite(byteSize) ? byteSize : 0,
     model: normalizedModel,
     csc: normalizedCsc,
-    version: fusVersion,
+    version: resolvedVersion,
+    decryption: firmwareDecryptionInfo(fileName, resolvedVersion, normalizedModel, normalizedCsc, logicValue),
     source: "Samsung FUS"
   };
 }

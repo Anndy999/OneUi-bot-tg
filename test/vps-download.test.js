@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createCipheriv, createHash } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -132,6 +133,49 @@ test("download preview verifies Samsung metadata without queuing a job, and term
     assert.ok(resolves >= 2);
     assert.equal(await service.remove(job.id), true);
     assert.equal(service.get(job.id), null);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download service decrypts Samsung enc4 firmware before marking it complete", async () => {
+  const dir = await tempDir();
+  try {
+    const keySeed = "enc4-test-key-seed";
+    const plaintext = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+    const cipher = createCipheriv("aes-128-ecb", createHash("md5").update(keySeed, "utf8").digest(), null);
+    cipher.setAutoPadding(false);
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => ({
+        sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip.enc4",
+        sourceHeaders: { authorization: "FUS temporary-test-value" },
+        fileName: "SM-S9380_CHC_TEST.zip.enc4",
+        size: encrypted.length,
+        decryption: { mode: "enc4", keySeed }
+      }),
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": String(encrypted.length) }),
+        body: (async function* body() {
+          yield encrypted.subarray(0, 13);
+          yield encrypted.subarray(13);
+        })()
+      })
+    }).init({ startQueue: false });
+
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(completed.percent, 100);
+    assert.equal(Object.hasOwn(completed, "decryption"), false);
+    assert.deepEqual(await readFile(join(dir, completed.fileName)), plaintext);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

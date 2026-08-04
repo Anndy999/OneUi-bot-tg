@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { access, mkdir, readFile, rename, rm, stat, statfs, writeFile, readdir } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
@@ -12,7 +12,7 @@ import { resolveOfficialFirmwareDownload } from "../fus.js";
 
 const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
-const JOB_STATES = new Set(["queued", "downloading", "completed", "failed", "cancelled"]);
+const JOB_STATES = new Set(["queued", "downloading", "decrypting", "completed", "failed", "cancelled"]);
 
 function text(value, fallback = "") {
   const result = String(value ?? fallback).trim();
@@ -118,17 +118,43 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, filePath: _filePath, ...safe } = job;
-  const percent = safe.totalBytes ? Math.min(100, Math.floor((safe.bytes / safe.totalBytes) * 100)) : null;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, filePath: _filePath, ...safe } = job;
+  const decrypting = safe.state === "decrypting";
+  const progressBytes = decrypting ? Number(safe.decryptBytes || 0) : Number(safe.bytes || 0);
+  const percent = safe.state === "completed" ? 100 : safe.totalBytes
+    ? (decrypting
+      ? Math.min(99, 85 + Math.floor((progressBytes / safe.totalBytes) * 15))
+      : Math.min(100, Math.floor((progressBytes / safe.totalBytes) * 85)))
+    : null;
   const speedBytesPerSecond = Math.max(0, Number(safe.speedBytesPerSecond || 0));
   const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
-    ? Math.max(0, Math.ceil((safe.totalBytes - Number(safe.bytes || 0)) / speedBytesPerSecond))
+    ? Math.max(0, Math.ceil((safe.totalBytes - progressBytes) / speedBytesPerSecond))
     : null;
   return { ...safe, percent, speedBytesPerSecond, etaSeconds };
 }
 
+function decryptFileName(fileName) {
+  return String(fileName || "firmware.bin").replace(/\.enc(?:2|4)$/i, "") || "firmware.bin";
+}
+
+function isDecryptingFirmware(job) {
+  return Boolean(job?.decryption?.keySeed && /\.enc(?:2|4)$/i.test(String(job.encryptedFileName || job.originalName || "")));
+}
+
 function sourceUrlHash(sourceUrl) {
   return createHash("sha256").update(String(sourceUrl)).digest("hex").slice(0, 16);
+}
+
+function decryptionKey(keySeed) {
+  return createHash("md5").update(String(keySeed || ""), "utf8").digest();
+}
+
+async function writeChunk(writer, chunk) {
+  if (writer.write(chunk)) return;
+  await new Promise((resolveWrite, rejectWrite) => {
+    writer.once("drain", resolveWrite);
+    writer.once("error", rejectWrite);
+  });
 }
 
 function connectionOptions(redisUrl) {
@@ -210,7 +236,7 @@ export class FirmwareDownloadService {
       if (error.code !== "ENOENT") throw new Error(`download index is unreadable: ${error.message}`);
     }
     for (const job of this.jobs.values()) {
-      if (job.state === "downloading") job.state = "queued";
+      if (["downloading", "decrypting"].includes(job.state)) job.state = "queued";
     }
   }
 
@@ -273,7 +299,8 @@ export class FirmwareDownloadService {
     const resolved = await this.resolveImpl(this.fusEnv, payload.model, payload.csc, payload.version, { role: "admin" });
     const size = Math.max(0, Number(resolved.size || 0));
     if (size > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
-    if (size && free - size < this.config.minFreeBytes) {
+    const requiredBytes = isDecryptingFirmware({ ...resolved, originalName: resolved.fileName }) ? size * 2 : size;
+    if (requiredBytes && free - requiredBytes < this.config.minFreeBytes) {
       throw new Error("download would breach the configured free disk reserve");
     }
     return {
@@ -297,7 +324,7 @@ export class FirmwareDownloadService {
     if (sourceUrl) await assertPublicHost(sourceUrl, this.lookupImpl);
     const free = await this.freeBytes();
     if (free < this.config.minFreeBytes) throw new Error("insufficient free disk space for a new download");
-    const active = [...this.jobs.values()].find((job) => ["queued", "downloading"].includes(job.state));
+    const active = [...this.jobs.values()].find((job) => ["queued", "downloading", "decrypting"].includes(job.state));
     if (active) throw new Error(`another download is already active: ${active.id}`);
     const id = randomUUID();
     const sourceName = sourceUrl
@@ -373,13 +400,14 @@ export class FirmwareDownloadService {
     job.updatedAt = new Date(this.now()).toISOString();
     await this.persist();
     await rm(join(this.config.dir, `${job.id}.part`), { force: true });
+    await rm(join(this.config.dir, `${job.id}.decrypt.part`), { force: true });
     return true;
   }
 
   async remove(id) {
     const job = this.jobs.get(String(id));
     if (!job) return false;
-    if (["queued", "downloading"].includes(job.state)) {
+    if (["queued", "downloading", "decrypting"].includes(job.state)) {
       throw new Error("terminate the active download before deleting it");
     }
     if (this.queue) {
@@ -387,10 +415,48 @@ export class FirmwareDownloadService {
       await queued?.remove().catch(() => {});
     }
     await rm(join(this.config.dir, `${job.id}.part`), { force: true });
+    await rm(join(this.config.dir, `${job.id}.decrypt.part`), { force: true });
     if (job.fileName) await rm(join(this.config.dir, safeName(job.fileName)), { force: true });
     this.jobs.delete(job.id);
     await this.persist();
     return true;
+  }
+
+  async decryptFirmwarePart(job, encryptedPath, outputPath, controller) {
+    const { createReadStream, createWriteStream } = await import("node:fs");
+    const reader = createReadStream(encryptedPath, { highWaterMark: 1024 * 1024 });
+    const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640 });
+    const decipher = createDecipheriv("aes-128-ecb", decryptionKey(job.decryption?.keySeed), null);
+    decipher.setAutoPadding(false);
+    let processed = 0;
+    let lastPersist = 0;
+    const startedAt = this.now();
+    try {
+      for await (const chunk of reader) {
+        if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+        const output = decipher.update(chunk);
+        if (output.length) await writeChunk(writer, output);
+        processed += chunk.length;
+        job.decryptBytes = processed;
+        const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
+        job.speedBytesPerSecond = Math.max(0, Math.floor(processed / elapsedSeconds));
+        if (this.now() - lastPersist > 1000) {
+          lastPersist = this.now();
+          job.updatedAt = new Date(this.now()).toISOString();
+          await this.persist();
+        }
+      }
+      const final = decipher.final();
+      if (final.length) await writeChunk(writer, final);
+      await new Promise((resolveWrite, rejectWrite) => {
+        writer.end(resolveWrite);
+        writer.once("error", rejectWrite);
+      });
+    } catch (error) {
+      reader.destroy();
+      writer.destroy();
+      throw error;
+    }
   }
 
   async runJob(queueJob) {
@@ -411,7 +477,9 @@ export class FirmwareDownloadService {
         job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
         job.sourceHost = new URL(job.sourceUrl).hostname;
         job.sourceHeaders = resolved.sourceHeaders || null;
-        job.originalName = safeName(resolved.fileName, "firmware.bin");
+        job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
+        job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
+        job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
         job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
         if (resolved.version) job.version = resolved.version;
         await this.persist();
@@ -433,10 +501,7 @@ export class FirmwareDownloadService {
           if ((await this.freeBytes()) - chunk.length < this.config.minFreeBytes) {
             throw new Error("download stopped to preserve the configured free disk space");
           }
-          if (!writer.write(chunk)) await new Promise((resolveWrite, rejectWrite) => {
-            writer.once("drain", resolveWrite);
-            writer.once("error", rejectWrite);
-          });
+          await writeChunk(writer, chunk);
           job.bytes = received;
           const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
           const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
@@ -455,15 +520,37 @@ export class FirmwareDownloadService {
         writer.destroy();
         throw error;
       }
-      await rename(partPath, finalPath);
       job.bytes = received;
       job.totalBytes = advertised || received;
       job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
+      if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+      if (isDecryptingFirmware(job)) {
+        if ((await this.freeBytes()) - received < this.config.minFreeBytes) {
+          throw new Error("download completed but decrypting it would breach the configured free disk reserve");
+        }
+        const decryptPartPath = join(this.config.dir, `${job.id}.decrypt.part`);
+        job.state = "decrypting";
+        job.decryptBytes = 0;
+        job.speedBytesPerSecond = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
+        await this.decryptFirmwarePart(job, partPath, decryptPartPath, controller);
+        if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+        await rename(decryptPartPath, finalPath);
+        await rm(partPath, { force: true });
+      } else {
+        await rename(partPath, finalPath);
+      }
+      if (controller.signal.aborted) {
+        await rm(finalPath, { force: true });
+        throw controller.signal.reason || new Error("download cancelled by administrator");
+      }
       job.state = "completed";
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
     } catch (error) {
       await rm(partPath, { force: true });
+      await rm(join(this.config.dir, `${job.id}.decrypt.part`), { force: true });
       if (job.state !== "cancelled") {
         job.state = "failed";
         job.error = String(error?.message || error || "download failed").slice(0, 240);
@@ -606,7 +693,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.0") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.1") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

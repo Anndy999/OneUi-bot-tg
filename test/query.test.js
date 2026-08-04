@@ -235,7 +235,7 @@ test("Samsung FUS download resolution signs BinaryInform and completes BinaryIni
     if (value.includes("GenerateNonce")) return nonceResponse();
     if (value.includes("BinaryInform")) {
       assert.match(String(init.headers?.authorization || ""), /^FUS nonce="0123456789abcdef0123456789abcdef", signature=".+"/);
-      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status><BINARY_NAME>SM-S9480_CHC_TEST.zip</BINARY_NAME><MODEL_PATH>path/firmware.zip</MODEL_PATH><BINARY_BYTE_SIZE>5</BINARY_BYTE_SIZE><DEVICE_MODEL_TYPE>SM-S9480</DEVICE_MODEL_TYPE></Results></FUSBody></FUSMsg>", { status: 200 });
+      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status><BINARY_NAME>SM-S9480_CHC_TEST.zip.enc4</BINARY_NAME><MODEL_PATH>path/firmware.zip</MODEL_PATH><BINARY_BYTE_SIZE>5</BINARY_BYTE_SIZE><DEVICE_MODEL_TYPE>SM-S9480</DEVICE_MODEL_TYPE><LOGIC_VALUE_FACTORY>0123456789abcdef0123456789abcdef</LOGIC_VALUE_FACTORY></Results></FUSBody></FUSMsg>", { status: 200 });
     }
     if (value.includes("BinaryInit")) {
       assert.match(String(init.headers?.authorization || ""), /^FUS nonce="0123456789abcdef0123456789abcdef", signature=".+"/);
@@ -250,8 +250,10 @@ test("Samsung FUS download resolution signs BinaryInform and completes BinaryIni
     "CHC",
     "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1"
   );
-  assert.equal(result.fileName, "SM-S9480_CHC_TEST.zip");
+  assert.equal(result.fileName, "SM-S9480_CHC_TEST.zip.enc4");
   assert.equal(result.size, 5);
+  assert.equal(result.decryption.mode, "enc4");
+  assert.equal(result.decryption.keySeed.length, 32);
   assert.equal(calls.filter((entry) => entry.url.includes("BinaryInform")).length, 1);
   assert.equal(calls.filter((entry) => entry.url.includes("BinaryInit")).length, 1);
   assert.equal(result.sourceHeaders.cookie, "JSESSIONID=test-session");
