@@ -32,7 +32,9 @@ import {
   deleteFirmwareDownload,
   getFirmwareDownload,
   listFirmwareDownloads,
-  previewFirmwareDownload
+  pauseFirmwareDownload,
+  previewFirmwareDownload,
+  resumeFirmwareDownload
 } from "./vps/download-client.js";
 import { logQueryMetric } from "./metrics.js";
 import {
@@ -825,8 +827,8 @@ function enBack(lang) { return lang === "en" ? "Back" : "返回"; }
 
 function downloadStateLabel(state, lang = "zh") {
   const labels = lang === "en"
-    ? { queued: "Queued", downloading: "Downloading", decrypting: "Decrypting", completed: "Completed", failed: "Failed", cancelled: "Stopped" }
-    : { queued: "排队中", downloading: "下载中", decrypting: "正在解密", completed: "已完成", failed: "失败", cancelled: "已终止" };
+    ? { queued: "Queued", downloading: "Downloading", verifying: "Verifying", decrypting: "Decrypting", paused: "Paused", completed: "Completed", failed: "Failed", cancelled: "Stopped" }
+    : { queued: "排队中", downloading: "下载中", verifying: "正在校验", decrypting: "正在解密", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已终止" };
   return labels[state] || state || "-";
 }
 
@@ -855,7 +857,7 @@ function downloadProgressBar(percent) {
 
 function formatDownloadJob(job, lang = "zh", detailed = false) {
   if (!job) return lang === "en" ? "No download task." : "暂无下载任务。";
-  const active = ["queued", "downloading", "decrypting"].includes(job.state);
+  const active = ["queued", "downloading", "verifying", "decrypting", "paused"].includes(job.state);
   const lines = [
     `${job.model || "?"} · ${job.csc || "?"}`,
     `${lang === "en" ? "Version" : "版本"}: ${job.version || "?"}`,
@@ -888,7 +890,15 @@ function downloadMenuKeyboard(jobs = [], lang = "zh") {
 function downloadTaskKeyboard(job, lang = "zh") {
   const en = lang === "en";
   const rows = [[{ text: en ? "Refresh" : "刷新", callback_data: `admin:dl:refresh:${job.id}` }]];
-  if (["queued", "downloading", "decrypting"].includes(job.state)) rows.push([{ text: en ? "Terminate" : "终止下载", callback_data: `admin:dl:stop:${job.id}` }]);
+  if (["queued", "downloading"].includes(job.state)) rows.push([
+    { text: en ? "Pause" : "暂停", callback_data: `admin:dl:pause:${job.id}` },
+    { text: en ? "Terminate" : "终止下载", callback_data: `admin:dl:stop:${job.id}` }
+  ]);
+  else if (["verifying", "decrypting"].includes(job.state)) rows.push([{ text: en ? "Terminate" : "终止下载", callback_data: `admin:dl:stop:${job.id}` }]);
+  else if (job.state === "paused") rows.push([
+    { text: en ? "Resume" : "继续下载", callback_data: `admin:dl:resume:${job.id}` },
+    { text: en ? "Delete" : "删除", callback_data: `admin:dl:delete:${job.id}` }
+  ]);
   else rows.push([{ text: en ? "Delete" : "删除任务与文件", callback_data: `admin:dl:delete:${job.id}` }]);
   rows.push([{ text: en ? "Downloads" : "下载列表", callback_data: "admin:download-menu" }]);
   return { inline_keyboard: rows };
@@ -1712,7 +1722,7 @@ async function renderDownloadDetails(env, chatId, messageId, id) {
   const job = result.download;
   const title = lang === "en" ? "Firmware download" : "固件下载";
   const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang));
-  if (["queued", "downloading", "decrypting"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
+  if (["queued", "downloading", "verifying", "decrypting"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
   return response;
 }
 
@@ -1726,7 +1736,7 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
     try {
       const result = await getFirmwareDownload(env, id);
       const job = result.download;
-      if (!result.ok || !job || !["queued", "downloading", "decrypting"].includes(job.state) || polls > 1440) {
+      if (!result.ok || !job || !["queued", "downloading", "verifying", "decrypting"].includes(job.state) || polls > 1440) {
         clearInterval(timer);
         downloadProgressWatches.delete(key);
         if (job) await renderDownloadDetails(env, chatId, messageId, id);
@@ -2262,6 +2272,20 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     await renderDownloadDetails(env, chatId, messageId, id);
     return;
   }
+  if (data.startsWith("admin:dl:pause:")) {
+    const id = data.slice("admin:dl:pause:".length);
+    const result = await pauseFirmwareDownload(env, id);
+    if (!result.ok) await sendTelegramMessage(env, chatId, lang === "en" ? `Pause failed: ${result.error || "task is no longer active"}` : `暂停失败：${result.error || "任务已不在下载中"}`);
+    await renderDownloadDetails(env, chatId, messageId, id);
+    return;
+  }
+  if (data.startsWith("admin:dl:resume:")) {
+    const id = data.slice("admin:dl:resume:".length);
+    const result = await resumeFirmwareDownload(env, id);
+    if (!result.ok) await sendTelegramMessage(env, chatId, lang === "en" ? `Resume failed: ${result.error || "another task is active"}` : `继续下载失败：${result.error || "已有其他任务在运行"}`);
+    await renderDownloadDetails(env, chatId, messageId, id);
+    return;
+  }
   if (data.startsWith("admin:dl:stop:")) {
     const id = data.slice("admin:dl:stop:".length);
     const result = await cancelFirmwareDownload(env, id);
@@ -2281,7 +2305,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   }
   if (data.startsWith("admin:dl:delete:")) {
     const id = data.slice("admin:dl:delete:".length);
-    await safeEditOrSend(env, chatId, messageId, lang === "en" ? "Delete this completed/failed task and its saved firmware file? This cannot be undone." : "删除此已结束任务及其已保存的固件文件？此操作无法撤销。", { inline_keyboard: [[
+    await safeEditOrSend(env, chatId, messageId, lang === "en" ? "Delete this task and its stored partial or completed file? This cannot be undone." : "删除此任务及其已保存的部分或完整固件文件？此操作无法撤销。", { inline_keyboard: [[
       { text: lang === "en" ? "Delete" : "确认删除", callback_data: `admin:dl:deleteok:${id}` },
       { text: lang === "en" ? "Cancel" : "取消", callback_data: `admin:dl:view:${id}` }
     ]] });

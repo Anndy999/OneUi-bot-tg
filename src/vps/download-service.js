@@ -1,6 +1,6 @@
 import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { access, mkdir, readFile, rename, rm, stat, statfs, writeFile, readdir } from "node:fs/promises";
+import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, readdir } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
@@ -13,7 +13,7 @@ import { resolveVpsOfficialFirmwareDownload } from "./fus-resolver.js";
 const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
 const FREE_SPACE_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
-const JOB_STATES = new Set(["queued", "downloading", "decrypting", "completed", "failed", "cancelled"]);
+const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
@@ -53,9 +53,12 @@ export function createDownloadConfig(env = process.env) {
     completedTtlMs: integer(env.DOWNLOAD_COMPLETED_TTL_MS || 7 * 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 0, 365 * 24 * 60 * 60 * 1000),
     partTtlMs: integer(env.DOWNLOAD_PART_TTL_MS || 6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 60_000, 30 * 24 * 60 * 60 * 1000),
     responseHeaderTimeoutMs: integer(env.DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS || env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
-    parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 8, 8, 1, 8),
+    // Samsung's CDN is commonly rate-limited per TCP connection. Keep this
+    // bounded, but let a VPS use more than the original eight connections.
+    parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 16, 16, 1, 16),
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
+    parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
@@ -127,7 +130,7 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const progressBytes = decrypting ? Number(safe.decryptBytes || 0) : Number(safe.bytes || 0);
   const percent = safe.state === "completed" ? 100 : safe.totalBytes
@@ -288,6 +291,7 @@ export class FirmwareDownloadService {
     this.redis = null;
     this.cleanupTimer = null;
     this.createInFlight = false;
+    this.persistPromise = Promise.resolve();
     this.ready = false;
   }
 
@@ -336,14 +340,23 @@ export class FirmwareDownloadService {
       if (error.code !== "ENOENT") throw new Error(`download index is unreadable: ${error.message}`);
     }
     for (const job of this.jobs.values()) {
-      if (["downloading", "decrypting"].includes(job.state)) job.state = "queued";
+      // A process restart is equivalent to a safe pause.  Keeping the range
+      // map lets the next worker continue from the bytes already persisted.
+      if (["downloading", "verifying", "decrypting"].includes(job.state)) job.state = "queued";
     }
   }
 
   async persist() {
-    const temporary = `${this.indexPath}.tmp-${process.pid}`;
-    await writeFile(temporary, jsonSafe(Object.fromEntries(this.jobs)), { mode: 0o640 });
-    await rename(temporary, this.indexPath);
+    // Several parallel range workers can report progress together. Serialize
+    // snapshots so they never race over one temporary index file.
+    const snapshot = jsonSafe(Object.fromEntries(this.jobs));
+    const writeSnapshot = async () => {
+      const temporary = `${this.indexPath}.tmp-${process.pid}-${randomUUID()}`;
+      await writeFile(temporary, snapshot, { mode: 0o640 });
+      await rename(temporary, this.indexPath);
+    };
+    this.persistPromise = this.persistPromise.catch(() => {}).then(writeSnapshot);
+    return this.persistPromise;
   }
 
   async cleanupFiles() {
@@ -355,7 +368,8 @@ export class FirmwareDownloadService {
       const filePath = join(this.config.dir, entry.name);
       const info = await stat(filePath).catch(() => null);
       if (!info) continue;
-      if (entry.name.endsWith(".part") && info.mtimeMs < partCutoff) {
+      const pausedJob = [...this.jobs.values()].find((item) => item.state === "paused" && entry.name.startsWith(`${item.id}.`));
+      if (entry.name.endsWith(".part") && !pausedJob && info.mtimeMs < partCutoff) {
         await rm(filePath, { force: true });
         continue;
       }
@@ -424,7 +438,7 @@ export class FirmwareDownloadService {
     if (sourceUrl) await assertPublicHost(sourceUrl, this.lookupImpl);
     const free = await this.freeBytes();
     if (free < this.config.minFreeBytes) throw new Error("insufficient free disk space for a new download");
-    const active = [...this.jobs.values()].find((job) => ["queued", "downloading", "decrypting"].includes(job.state));
+    const active = [...this.jobs.values()].find((job) => ["queued", "downloading", "verifying", "decrypting"].includes(job.state));
     if (active) throw new Error(`another download is already active: ${active.id}`);
     const id = randomUUID();
     const sourceName = sourceUrl
@@ -496,6 +510,7 @@ export class FirmwareDownloadService {
       const queued = await this.queue.getJob(job.id);
       await queued?.remove().catch(() => {});
     }
+    delete job.parallel;
     job.state = "cancelled";
     job.updatedAt = new Date(this.now()).toISOString();
     await this.persist();
@@ -504,10 +519,43 @@ export class FirmwareDownloadService {
     return true;
   }
 
+  async pause(id) {
+    const job = this.jobs.get(String(id));
+    if (!job || !["queued", "downloading"].includes(job.state)) return false;
+    // Mark first so runJob can distinguish an intentional pause from a
+    // failure while its streams are unwinding.
+    job.state = "paused";
+    job.error = "";
+    job.speedBytesPerSecond = 0;
+    job.updatedAt = new Date(this.now()).toISOString();
+    await this.persist();
+    this.controllers.get(job.id)?.abort(new Error("download paused by administrator"));
+    if (this.queue) {
+      const queued = await this.queue.getJob(job.id);
+      await queued?.remove().catch(() => {});
+    }
+    return true;
+  }
+
+  async resume(id) {
+    const job = this.jobs.get(String(id));
+    if (!job || job.state !== "paused") return false;
+    if (this.controllers.has(job.id)) throw new Error("pause is still being applied; try again shortly");
+    const active = [...this.jobs.values()].find((item) => item.id !== job.id && ["queued", "downloading", "verifying", "decrypting"].includes(item.state));
+    if (active) throw new Error(`another download is already active: ${active.id}`);
+    job.state = "queued";
+    job.error = "";
+    job.speedBytesPerSecond = 0;
+    job.updatedAt = new Date(this.now()).toISOString();
+    await this.persist();
+    await this.enqueue(job.id);
+    return true;
+  }
+
   async remove(id) {
     const job = this.jobs.get(String(id));
     if (!job) return false;
-    if (["queued", "downloading", "decrypting"].includes(job.state)) {
+    if (["queued", "downloading", "verifying", "decrypting"].includes(job.state)) {
       throw new Error("terminate the active download before deleting it");
     }
     if (this.queue) {
@@ -573,86 +621,129 @@ export class FirmwareDownloadService {
     if (!Number.isSafeInteger(total) || total < this.config.parallelMinBytes) return false;
     if (total > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
     job.totalBytes = total;
-
-    const segmentCount = Math.min(this.config.parallelSegments, Math.max(2, Math.ceil(total / this.config.parallelMinBytes)));
-    const segmentSize = Math.ceil(total / segmentCount);
-    const file = await (await import("node:fs/promises")).open(partPath, "w+", 0o640);
-    await file.truncate(total);
+    const requestedSegmentCount = Math.min(this.config.parallelSegments, Math.max(2, Math.ceil(total / this.config.parallelMinBytes)));
+    const savedSegments = Array.isArray(job.parallel?.segments) ? job.parallel.segments : null;
+    const savedFile = await stat(partPath).catch(() => null);
+    const canResume = Boolean(
+      job.parallel?.total === total &&
+      savedFile?.size === total &&
+      savedSegments?.length >= 2 &&
+      savedSegments.every((segment, index) => {
+        const start = Number(segment?.start);
+        const end = Number(segment?.end);
+        const downloaded = Number(segment?.bytes);
+        return Number.isSafeInteger(start) && Number.isSafeInteger(end) && Number.isFinite(downloaded) &&
+          start >= 0 && end >= start && end < total && downloaded >= 0 && downloaded <= end - start + 1 &&
+          (index === 0 ? start === 0 : start === Number(savedSegments[index - 1]?.end) + 1);
+      }) && Number(savedSegments.at(-1)?.end) === total - 1
+    );
+    if (!canResume) {
+      const segmentSize = Math.ceil(total / requestedSegmentCount);
+      const file = await open(partPath, "w+", 0o640);
+      try {
+        await file.truncate(total);
+      } finally {
+        await file.close();
+      }
+      job.parallel = {
+        total,
+        segments: Array.from({ length: requestedSegmentCount }, (_, index) => {
+          const start = index * segmentSize;
+          return { start, end: Math.min(total - 1, start + segmentSize - 1), bytes: 0 };
+        })
+      };
+      job.bytes = 0;
+      await this.persist();
+    }
+    const segments = job.parallel.segments;
     const segmentController = new AbortController();
     const segmentSignal = AbortSignal.any
       ? AbortSignal.any([controller.signal, segmentController.signal])
       : controller.signal;
-    let received = 0;
+    const received = () => segments.reduce((sum, segment) => sum + Number(segment.bytes || 0), 0);
     let lastFreeCheckBytes = 0;
     let lastPersist = 0;
     let freeCheckInFlight = null;
     const checkFreeSpace = async (force = false) => {
-      if (!force && received - lastFreeCheckBytes < FREE_SPACE_CHECK_INTERVAL_BYTES) return;
+      const downloaded = received();
+      if (!force && downloaded - lastFreeCheckBytes < FREE_SPACE_CHECK_INTERVAL_BYTES) return;
       if (freeCheckInFlight) return freeCheckInFlight;
       freeCheckInFlight = (async () => {
-        const remainingRaw = Math.max(0, total - received);
+        const remainingRaw = Math.max(0, total - downloaded);
         const remainingOutput = isDecryptingFirmware(job) ? total : 0;
         if ((await this.freeBytes()) - remainingRaw - remainingOutput < this.config.minFreeBytes) {
           throw new Error("download stopped to preserve the configured free disk space");
         }
-        lastFreeCheckBytes = received;
+        lastFreeCheckBytes = downloaded;
       })();
       try { await freeCheckInFlight; } finally { freeCheckInFlight = null; }
     };
-    const persistProgress = async () => {
-      job.bytes = received;
-      if (this.now() - lastPersist <= 1000) return;
+    const persistProgress = async (force = false) => {
+      job.bytes = received();
+      if (!force && this.now() - lastPersist <= 1000) return;
       lastPersist = this.now();
       const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
-      job.speedBytesPerSecond = Math.max(0, Math.floor(received / Math.max(1, (this.now() - startedAt) / 1000)));
+      const startedBytes = Number(job.downloadStartBytes || 0);
+      job.speedBytesPerSecond = Math.max(0, Math.floor(Math.max(0, job.bytes - startedBytes) / Math.max(1, (this.now() - startedAt) / 1000)));
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
     };
     try {
       await checkFreeSpace(true);
-      const segmentTasks = Array.from({ length: segmentCount }, async (_, index) => {
+      const segmentTasks = segments.map(async (segment, index) => {
         await waitWithAbort(index * this.config.parallelStaggerMs, segmentSignal);
-        const start = index * segmentSize;
-        const end = Math.min(total - 1, start + segmentSize - 1);
-        const response = await this.fetchOfficial(job.sourceUrl, segmentSignal, {
-          ...(job.sourceHeaders || {}),
-          range: `bytes=${start}-${end}`,
-          "accept-encoding": "identity"
-        });
-        const range = contentRange(response.headers.get("content-range"));
-        if (response.status !== 206 || !range || range.start !== start || range.end !== end || range.total !== total) {
-          await response.body?.cancel?.().catch(() => {});
-          throw new Error("Samsung official source rejected parallel range download");
-        }
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("Samsung official source returned an empty segment");
-        const writer = createWriteStream(partPath, { flags: "r+", mode: 0o640, start, highWaterMark: 4 * 1024 * 1024 });
-        let writerError = null;
-        writer.on("error", (error) => {
-          writerError = error;
-        });
-        let writerEnded = false;
-        let position = start;
-        try {
-          while (true) {
-            if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
-            const { done, value } = await reader.read();
-            if (done) break;
-            await writeChunk(writer, value);
+        let attempts = 0;
+        while (segment.bytes < segment.end - segment.start + 1) {
+          if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
+          const start = segment.start + segment.bytes;
+          let response;
+          let reader;
+          let writer;
+          let writerEnded = false;
+          try {
+            response = await this.fetchOfficial(job.sourceUrl, segmentSignal, {
+              ...(job.sourceHeaders || {}),
+              range: `bytes=${start}-${segment.end}`,
+              "accept-encoding": "identity"
+            });
+            const range = contentRange(response.headers.get("content-range"));
+            if (response.status !== 206 || !range || range.start !== start || range.end !== segment.end || range.total !== total) {
+              throw new Error("Samsung official source rejected parallel range download");
+            }
+            reader = response.body?.getReader();
+            if (!reader) throw new Error("Samsung official source returned an empty segment");
+            writer = createWriteStream(partPath, { flags: "r+", mode: 0o640, start, highWaterMark: 4 * 1024 * 1024 });
+            let writerError = null;
+            writer.on("error", (error) => { writerError = error; });
+            let position = start;
+            while (true) {
+              if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
+              const { done, value } = await reader.read();
+              if (done) break;
+              const remaining = segment.end + 1 - position;
+              if (value.byteLength > remaining) throw new Error("Samsung official source returned an oversized segment");
+              await writeChunk(writer, value);
+              if (writerError) throw writerError;
+              position += value.byteLength;
+              segment.bytes += value.byteLength;
+              await checkFreeSpace();
+              await persistProgress();
+            }
+            await finishWriteStream(writer);
+            writerEnded = true;
             if (writerError) throw writerError;
-            position += value.byteLength;
-            received += value.byteLength;
-            await checkFreeSpace();
-            await persistProgress();
+            if (position !== segment.end + 1) throw new Error("Samsung official source returned an incomplete segment");
+          } catch (error) {
+            if (segmentSignal.aborted) throw error;
+            attempts += 1;
+            if (attempts > this.config.parallelRetries) throw error;
+            await waitWithAbort(250 * attempts, segmentSignal);
+            continue;
+          } finally {
+            await reader?.cancel?.().catch(() => {});
+            if (writer && !writerEnded) writer.destroy();
           }
-          await finishWriteStream(writer);
-          writerEnded = true;
-          if (writerError) throw writerError;
-        } finally {
-          await reader.cancel().catch(() => {});
-          if (!writerEnded) writer.destroy();
         }
-        if (position !== end + 1) throw new Error("Samsung official source returned an incomplete segment");
       });
       try {
         await Promise.all(segmentTasks);
@@ -665,27 +756,30 @@ export class FirmwareDownloadService {
       job.bytes = total;
       job.totalBytes = total;
       job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
+      delete job.parallel;
+      await persistProgress(true);
       return true;
     } catch (error) {
-      job.bytes = received;
+      job.bytes = received();
+      await persistProgress(true);
       if (controller.signal.aborted) throw error;
       this.logger.warn?.(`Parallel firmware download unavailable; falling back to one connection: ${error.message}`);
       await rm(partPath, { force: true });
+      delete job.parallel;
       return false;
-    } finally {
-      await file.close().catch(() => {});
     }
   }
 
   async runJob(queueJob) {
     const job = this.jobs.get(String(queueJob.data?.id));
-    if (!job || job.state === "cancelled" || job.state === "completed") return;
+    if (!job || ["paused", "cancelled", "completed"].includes(job.state)) return;
     const partPath = join(this.config.dir, `${job.id}.part`);
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
     try {
       job.state = "downloading";
       job.downloadStartedAt = new Date(this.now()).toISOString();
+      job.downloadStartBytes = Number(job.bytes || 0);
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
       let resolved = null;
@@ -707,6 +801,10 @@ export class FirmwareDownloadService {
       const parallelCompleted = await this.downloadParallel(partPath, job, controller);
       let crc32 = null;
       if (parallelCompleted) {
+        job.state = "verifying";
+        job.speedBytesPerSecond = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
         crc32 = await fileCrc32(partPath, controller.signal);
       } else {
         const response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
@@ -786,8 +884,15 @@ export class FirmwareDownloadService {
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
     } catch (error) {
+      if (job.state === "paused") {
+        job.speedBytesPerSecond = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
+        return;
+      }
       await rm(partPath, { force: true });
       await rm(join(this.config.dir, `${job.id}.decrypt.part`), { force: true });
+      delete job.parallel;
       if (job.state !== "cancelled") {
         job.state = "failed";
         job.error = String(error?.message || error || "download failed").slice(0, 240);
@@ -905,6 +1010,23 @@ export function buildDownloadApp({ app = Fastify({ logger: false }), service, ve
     if (!cancelled) { reply.code(404); return { ok: false, error: "Download not found or already finished" }; }
     return { ok: true, cancelled: true };
   });
+  app.post("/api/v1/downloads/:id/pause", async (request, reply) => {
+    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
+    const paused = await service.pause(request.params.id);
+    if (!paused) { reply.code(400); return { ok: false, error: "Download is not queued or downloading" }; }
+    return { ok: true, paused: true };
+  });
+  app.post("/api/v1/downloads/:id/resume", async (request, reply) => {
+    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
+    try {
+      const resumed = await service.resume(request.params.id);
+      if (!resumed) { reply.code(400); return { ok: false, error: "Download is not paused" }; }
+      return { ok: true, resumed: true };
+    } catch (error) {
+      reply.code(409);
+      return { ok: false, error: String(error?.message || error).slice(0, 240) };
+    }
+  });
   app.post("/api/v1/downloads/:id/delete", async (request, reply) => {
     if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
     try {
@@ -938,7 +1060,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.5") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.18.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

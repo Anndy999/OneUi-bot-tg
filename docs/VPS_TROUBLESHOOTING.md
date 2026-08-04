@@ -37,6 +37,33 @@ editing that protected file.
 Never paste the environment file or full connection URLs into an issue or
 chat. Logs should contain error categories, not Tokens or passwords.
 
+## Firmware download speed, pause, and resume
+
+Large Samsung files use bounded, staggered HTTP Range connections. The
+download unit defaults to 16 connections and permits at most 16. This can
+improve throughput when Samsung limits one TCP connection, but it cannot
+guarantee a speed higher than Samsung's route to the VPS.
+
+Use **暂停** in the administrator download detail view to preserve a
+Range-capable partial download, then **继续下载** to request only its unfinished
+ranges. A VPS or service restart also preserves the saved ranges. Do not remove
+`*.part` files manually: use the bot's **删除** action to discard the task and
+its partial data intentionally. Downloads in the verification or decryption
+phase can only be terminated; a paused download may be resumed only when no
+other task is active.
+
+If a speed change is needed, edit only the protected download environment file,
+then restart only the download service:
+
+```bash
+sudo systemctl restart oneui-download.service
+sudo systemctl status oneui-download.service --no-pager -l
+```
+
+Use `DOWNLOAD_PARALLEL_SEGMENTS=16` while the Samsung source remains stable;
+return to `12` or `8` if the source begins rejecting or slowing Range requests.
+Do not use unbounded connection counts.
+
 ## Service will not start
 
 Check the application unit and dependencies:

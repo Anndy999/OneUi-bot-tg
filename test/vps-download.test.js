@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
 import { createCipheriv, createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveVpsOfficialFirmwareDownload } from "../src/vps/fus-resolver.js";
@@ -22,6 +22,8 @@ test("download configuration defaults to an isolated local API", () => {
   const config = createDownloadConfig({});
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 8788);
+  assert.equal(config.parallelSegments, 16);
+  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 16);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
@@ -86,6 +88,78 @@ test("parallel Range download assembles the file and verifies the completed outp
     assert.ok(rangeHeaders.includes("bytes=0-0"));
     assert.equal(rangeHeaders.filter((value) => value !== "bytes=0-0").length, 2);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel download pauses safely and resumes only unfinished ranges", async () => {
+  const dir = await tempDir();
+  try {
+    const fixture = Buffer.from("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--resume-fixture", "utf8");
+    const rangeCalls = [];
+    let firstSegmentStarted;
+    const firstSegmentReady = new Promise((resolveReady) => { firstSegmentStarted = resolveReady; });
+    let stalledOnce = false;
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_STAGGER_MS: "0",
+      DOWNLOAD_PARALLEL_MIN_BYTES: "1",
+      DOWNLOAD_PARALLEL_RETRIES: "0"
+    });
+    const service = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async (_url, init = {}) => {
+        const rangeValue = String(init.headers?.range || init.headers?.Range || "");
+        rangeCalls.push(rangeValue);
+        const match = rangeValue.match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        const headers = {
+          "content-range": `bytes ${start}-${end}/${fixture.length}`,
+          "content-length": String(end - start + 1)
+        };
+        const firstSegmentEnd = Math.ceil(fixture.length / 2) - 1;
+        if (!stalledOnce && start === 0 && end === firstSegmentEnd) {
+          stalledOnce = true;
+          const chunk = fixture.subarray(start, start + 12);
+          const body = new ReadableStream({
+            start(controller) {
+              controller.enqueue(chunk);
+              firstSegmentStarted();
+              const onAbort = () => controller.error(init.signal?.reason || new Error("paused"));
+              init.signal?.addEventListener("abort", onAbort, { once: true });
+            }
+          });
+          return new Response(body, { status: 206, headers });
+        }
+        return new Response(fixture.subarray(start, end + 1), { status: 206, headers });
+      }
+    }).init({ startQueue: false });
+
+    const job = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/resume.zip" }, "owner");
+    const running = service.runJob({ data: { id: job.id } });
+    await firstSegmentReady;
+    assert.equal(await service.pause(job.id), true);
+    await assert.rejects(() => service.resume(job.id), /pause is still being applied/);
+    await running;
+
+    const paused = service.get(job.id);
+    assert.equal(paused.state, "paused");
+    assert.ok(paused.bytes > 0 && paused.bytes < fixture.length);
+    assert.equal((await stat(join(dir, `${job.id}.part`))).size, fixture.length);
+
+    assert.equal(await service.resume(job.id), true);
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    assert.ok(rangeCalls.includes(`bytes=12-${Math.ceil(fixture.length / 2) - 1}`));
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -170,6 +244,14 @@ test("download API requires an admin key and serves only completed files", async
     assert.equal(file.statusCode, 200);
     assert.equal(file.body, "hello world");
     assert.equal(file.headers["content-type"], "application/octet-stream");
+
+    const pausable = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/pause.bin" }, "owner");
+    const paused = await app.inject({ method: "POST", url: `/api/v1/downloads/${pausable.id}/pause`, headers: { "x-download-api-key": "test-download-secret" } });
+    assert.equal(paused.statusCode, 200);
+    assert.equal(service.get(pausable.id).state, "paused");
+    const resumed = await app.inject({ method: "POST", url: `/api/v1/downloads/${pausable.id}/resume`, headers: { "x-download-api-key": "test-download-secret" } });
+    assert.equal(resumed.statusCode, 200);
+    assert.equal(service.get(pausable.id).state, "queued");
 
     await app.close();
     await service.close();

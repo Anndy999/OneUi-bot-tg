@@ -65,6 +65,14 @@ export function cancelFirmwareDownload(env, id) {
   return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}`, { method: "DELETE" });
 }
 
+export function pauseFirmwareDownload(env, id) {
+  return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}/pause`, { method: "POST" });
+}
+
+export function resumeFirmwareDownload(env, id) {
+  return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}/resume`, { method: "POST" });
+}
+
 export function deleteFirmwareDownload(env, id) {
   return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}/delete`, { method: "POST" });
 }

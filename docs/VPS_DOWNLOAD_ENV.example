@@ -1,7 +1,7 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.17.3
+APP_VERSION=2.18.0
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
@@ -14,10 +14,15 @@ DOWNLOAD_COMPLETED_TTL_MS=604800000
 DOWNLOAD_PART_TTL_MS=21600000
 # Maximum wait for Samsung response headers. An active download is not cut off.
 DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS=60000
-DOWNLOAD_PARALLEL_SEGMENTS=8
+DOWNLOAD_PARALLEL_SEGMENTS=16
+# Valid range: 1-16. Use 12 or 8 only if Samsung begins throttling this VPS.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
 # Files smaller than this use one connection; failed range probes fall back automatically.
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
+# Retry a failed individual Range before falling back to one connection.
+DOWNLOAD_PARALLEL_RETRIES=3
+# A paused Range-capable download resumes its saved byte ranges after restart.
+# Do not manually delete *.part files; use the Telegram Delete button instead.
 DOWNLOAD_QUEUE_PREFIX=oneui-download
 REDIS_URL=redis://:REPLACE_WITH_REDIS_PASSWORD@127.0.0.1:56379/0
