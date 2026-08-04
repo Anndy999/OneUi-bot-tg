@@ -48,6 +48,50 @@ test("download response-header deadline does not abort an active body stream", a
   assert.equal(requestSignal.aborted, true);
 });
 
+test("parallel Range download assembles the file and verifies the completed output", async () => {
+  const dir = await tempDir();
+  try {
+    const fixture = Buffer.from("OneUI parallel Range download fixture 0123456789", "utf8");
+    const rangeHeaders = [];
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MIN_BYTES: "1"
+    });
+    const service = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async (_url, init = {}) => {
+        const rangeValue = init.headers?.range || init.headers?.Range || "";
+        rangeHeaders.push(String(rangeValue));
+        const match = String(rangeValue).match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        return new Response(fixture.subarray(start, end + 1), {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${fixture.length}`,
+            "content-length": String(end - start + 1)
+          }
+        });
+      }
+    }).init({ startQueue: false });
+    const job = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.bytes, fixture.length);
+    assert.ok(rangeHeaders.includes("bytes=0-0"));
+    assert.equal(rangeHeaders.filter((value) => value !== "bytes=0-0").length, 2);
+    assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("production download server refuses to start without Redis", async () => {
   await assert.rejects(
     () => startDownloadServer({ env: { DOWNLOAD_API_SECRET: "test-download-secret" } }),

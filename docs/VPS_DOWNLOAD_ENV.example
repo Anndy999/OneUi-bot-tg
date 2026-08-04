@@ -14,5 +14,10 @@ DOWNLOAD_COMPLETED_TTL_MS=604800000
 DOWNLOAD_PART_TTL_MS=21600000
 # Maximum wait for Samsung response headers. An active download is not cut off.
 DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS=60000
+DOWNLOAD_PARALLEL_SEGMENTS=8
+# Stagger parallel connection setup to avoid Samsung source throttling.
+DOWNLOAD_PARALLEL_STAGGER_MS=100
+# Files smaller than this use one connection; failed range probes fall back automatically.
+DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 DOWNLOAD_QUEUE_PREFIX=oneui-download
 REDIS_URL=redis://:REPLACE_WITH_REDIS_PASSWORD@127.0.0.1:56379/0
