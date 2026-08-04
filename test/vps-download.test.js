@@ -27,6 +27,27 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(isAllowedOfficialHost("example.com"), false);
 });
 
+test("download response-header deadline does not abort an active body stream", async () => {
+  let requestSignal;
+  const config = createDownloadConfig({});
+  config.responseHeaderTimeoutMs = 5;
+  const service = new FirmwareDownloadService({
+    config,
+    lookupImpl: async () => [{ address: "93.184.216.34" }],
+    fetchImpl: async (_url, init) => {
+      requestSignal = init.signal;
+      return new Response("firmware", { status: 200 });
+    }
+  });
+  const controller = new AbortController();
+  await service.fetchOfficial("https://fota-cloud-dn.ospserver.net/firmware/test.bin", controller.signal);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  assert.equal(requestSignal.aborted, false);
+  controller.abort();
+  await new Promise((resolveWait) => setTimeout(resolveWait, 0));
+  assert.equal(requestSignal.aborted, true);
+});
+
 test("production download server refuses to start without Redis", async () => {
   await assert.rejects(
     () => startDownloadServer({ env: { DOWNLOAD_API_SECRET: "test-download-secret" } }),

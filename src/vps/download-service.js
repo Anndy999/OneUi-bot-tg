@@ -51,7 +51,7 @@ export function createDownloadConfig(env = process.env) {
     minFreeBytes: bytes(env.DOWNLOAD_MIN_FREE_BYTES, 40 * 1024 ** 3),
     completedTtlMs: integer(env.DOWNLOAD_COMPLETED_TTL_MS || 7 * 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 0, 365 * 24 * 60 * 60 * 1000),
     partTtlMs: integer(env.DOWNLOAD_PART_TTL_MS || 6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 60_000, 30 * 24 * 60 * 60 * 1000),
-    requestTimeoutMs: integer(env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
+    responseHeaderTimeoutMs: integer(env.DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS || env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
@@ -160,6 +160,16 @@ async function writeChunk(writer, chunk) {
     writer.once("drain", resolveWrite);
     writer.once("error", rejectWrite);
   });
+}
+
+function responseHeaderDeadline(signal, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("official source response headers timed out")), timeoutMs);
+  timer.unref?.();
+  const combined = signal
+    ? (AbortSignal.any ? AbortSignal.any([signal, controller.signal]) : controller.signal)
+    : controller.signal;
+  return { signal: combined, clear: () => clearTimeout(timer) };
 }
 
 function updateCrc32(current, chunk) {
@@ -591,11 +601,19 @@ export class FirmwareDownloadService {
     let current = assertOfficialUrl(sourceUrl, this.config.allowedHosts);
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
       await assertPublicHost(current, this.lookupImpl);
-      const response = await this.fetchImpl(current, {
-        redirect: "manual",
-        signal: AbortSignal.any ? AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]) : signal,
-        headers: { "user-agent": "OneUI-Firmware-Downloader/1.0", ...requestHeaders }
-      });
+      const deadline = responseHeaderDeadline(signal, this.config.responseHeaderTimeoutMs);
+      let response;
+      try {
+        response = await this.fetchImpl(current, {
+          redirect: "manual",
+          signal: deadline.signal,
+          headers: { "user-agent": "OneUI-Firmware-Downloader/1.0", ...requestHeaders }
+        });
+      } finally {
+        // The timer protects only connection/response-header latency. The
+        // caller's signal remains attached to the response body for cancel.
+        deadline.clear();
+      }
       if (![301, 302, 303, 307, 308].includes(response.status)) return response;
       const location = response.headers.get("location");
       if (!location) throw new Error("official source returned a redirect without Location");
@@ -717,7 +735,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.3") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.4") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };
