@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession } from "../src/fus.js";
+import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareVersion } from "../src/fus.js";
 import { rankOfficialCscOptions } from "../src/csc-suggestions.js";
 import {
   clearFirmwareMemoryCaches,
@@ -1535,6 +1535,15 @@ test("expired FUS sessions are renewed before the next History request", async (
   await delay(15);
   await querySmartHistory(shortSessionEnv, "SM-S9380", "CHC", { timeoutMs: 1000 });
   assert.equal(nonceCalls, 2);
+});
+
+test("compact SmartHistory versions resolve through official Samsung metadata", async () => {
+  globalThis.fetch = async (url) => {
+    assert.match(String(url), /fota-cloud-dn\.ospserver\.net\/firmware\/TGY\/SM-S9480\/version\.xml/);
+    return new Response("<firmware><version><latest>S9480ZCS4AZG1/S9480OZS4AZG1/S9480ZCS4AZG1</latest></version></firmware>");
+  };
+  const resolved = await resolveOfficialFirmwareVersion({}, "SM-S9480", "TGY", "S9480ZCS4AZG1");
+  assert.equal(resolved, "S9480ZCS4AZG1/S9480OZS4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1");
 });
 
 test("FUS circuit breaker stops repeated upstream failures during cooldown", async () => {

@@ -365,6 +365,7 @@ export class FirmwareDownloadService {
         job.sourceHeaders = resolved.sourceHeaders || null;
         job.originalName = safeName(resolved.fileName, "firmware.bin");
         job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
+        if (resolved.version) job.version = resolved.version;
         await this.persist();
       }
       const finalPath = join(this.config.dir, job.fileName);
@@ -533,7 +534,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.16.0") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.16.1") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

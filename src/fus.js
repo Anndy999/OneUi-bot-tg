@@ -319,6 +319,41 @@ function binaryInformBody(model, csc, version, nonce) {
   ].join("\n");
 }
 
+function fourPartFirmwareVersion(value) {
+  const normalized = normalizeFirmwareVersion(value);
+  const parts = normalized.split("/").map((part) => part.trim()).filter(Boolean);
+  if (parts.length >= 4) return parts.join("/");
+  if (parts.length === 3) return [...parts, parts[0]].join("/");
+  return "";
+}
+
+/**
+ * SmartHistory can return only the PDA/build code for some newer models.
+ * Samsung's public version.xml remains the authoritative source for the
+ * complete FUS PDA/CSC/CP/PDA tuple needed by BinaryInform.
+ */
+export async function resolveOfficialFirmwareVersion(env, model, csc, version, options = {}) {
+  const direct = fourPartFirmwareVersion(version);
+  if (direct) return direct;
+
+  const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
+  const metadataUrl = `https://fota-cloud-dn.ospserver.net/firmware/${encodeURIComponent(normalizedCsc)}/${encodeURIComponent(normalizedModel)}/version.xml`;
+  const response = await fetch(metadataUrl, {
+    headers: { accept: "application/xml,text/xml", "user-agent": FUS_USER_AGENT },
+    signal: combinedSignal(options.signal, Number(options.timeoutMs || 4000))
+  });
+  if (!response.ok) {
+    throw new Error(`Samsung firmware metadata HTTP ${response.status}`);
+  }
+  const xml = await response.text();
+  const latest = tagValue(xml, "latest");
+  const resolved = fourPartFirmwareVersion(latest);
+  if (!resolved) {
+    throw new Error("Samsung official metadata did not return a complete firmware version");
+  }
+  return resolved;
+}
+
 function md5(input) {
   const str = unescape(encodeURIComponent(String(input || "")));
   const x = [];
@@ -641,14 +676,7 @@ export async function querySmartHistory(env, model, csc, options = {}) {
  */
 export async function resolveOfficialFirmwareDownload(env, model, csc, version, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
-  const normalizedVersion = normalizeFirmwareVersion(version);
-  if (!normalizedVersion || normalizedVersion.split("/").length < 3) {
-    throw new Error("Samsung firmware version is invalid");
-  }
-  const versionParts = normalizedVersion.split("/");
-  const fusVersion = versionParts.length === 3
-    ? [...versionParts, versionParts[0]].join("/")
-    : normalizedVersion;
+  const fusVersion = await resolveOfficialFirmwareVersion(env, normalizedModel, normalizedCsc, version, options);
   const timing = options.timing && typeof options.timing === "object" ? options.timing : null;
   const xml = await makeFusRequest(env, BINARY_INFORM_PATH, "", "", true, {
     ...options,
@@ -691,7 +719,7 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
     size: Number.isFinite(byteSize) ? byteSize : 0,
     model: normalizedModel,
     csc: normalizedCsc,
-    version: normalizedVersion,
+    version: fusVersion,
     source: "Samsung FUS"
   };
 }

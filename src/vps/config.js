@@ -16,7 +16,7 @@ export function createVpsConfig(env = process.env) {
     host: text(env.VPS_HOST, "127.0.0.1"),
     port: Math.max(1, Math.min(65535, Number(env.VPS_PORT || 8787))),
     publicBaseUrl: text(env.VPS_PUBLIC_BASE_URL),
-    version: text(env.APP_VERSION, "2.16.0"),
+    version: text(env.APP_VERSION, "2.16.1"),
     databaseUrl: text(env.DATABASE_URL),
     redisUrl: text(env.REDIS_URL),
     webhookSecret: text(env.WEBHOOK_SECRET),
