@@ -1,13 +1,13 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.15.0
+APP_VERSION=2.16.0
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
 DOWNLOAD_API_SECRET=REPLACE_WITH_A_RANDOM_SECRET
 # Keep only official Samsung/FUS hosts. Add a host only after verification.
-DOWNLOAD_ALLOWED_HOSTS=samsung.com,ospserver.net,cdngc.net
+DOWNLOAD_ALLOWED_HOSTS=samsung.com,samsungmobile.com,ospserver.net,cdngc.net
 DOWNLOAD_MAX_BYTES=21474836480
 DOWNLOAD_MIN_FREE_BYTES=42949672960
 DOWNLOAD_COMPLETED_TTL_MS=604800000

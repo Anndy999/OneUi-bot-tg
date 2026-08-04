@@ -4,7 +4,23 @@ import { validateModelCsc } from "./targets.js";
 const FUS_BASE = "https://neofussvr.sslcs.cdngc.net";
 const NONCE_PATH = "/NF_SmartDownloadGenerateNonce.do";
 const HISTORY_PATH = "/SmartHistory.do";
+const BINARY_INFORM_PATH = "/NF_SmartDownloadBinaryInform.do";
 const FUS_USER_AGENT = "SMART 2.0";
+const MODERN_NONCE_KEY = "vicopx7dqu06emacgpnpy8j8zwhduwlh";
+
+async function decryptModernNonce(value) {
+  try {
+    const encoded = String(value || "").slice(0, 16).padEnd(16, "0");
+    const binary = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
+    if (binary.length !== 16 || !globalThis.crypto?.subtle) return "";
+    const key = new TextEncoder().encode(MODERN_NONCE_KEY);
+    const cryptoKey = await globalThis.crypto.subtle.importKey("raw", key, "AES-CBC", false, ["decrypt"]);
+    const plain = await globalThis.crypto.subtle.decrypt({ name: "AES-CBC", iv: key.slice(0, 16) }, cryptoKey, binary);
+    return new TextDecoder().decode(plain);
+  } catch {
+    return "";
+  }
+}
 
 function decodeXml(value) {
   return String(value || "")
@@ -26,6 +42,13 @@ function tagValue(xml, tag) {
   const dataMatch = inner.match(/<Data\b[^>]*>([\s\S]*?)<\/Data>/i);
   if (dataMatch) return decodeXml(dataMatch[1] || "").trim();
   return stripXml(inner) || inner;
+}
+
+function logicCheck(input, nonce) {
+  const source = String(input || "");
+  const seed = String(nonce || "");
+  if (source.length < 16 || !seed) return "";
+  return [...seed].map((character) => source.charAt(character.charCodeAt(0) & 0x0f)).join("");
 }
 
 function collectTags(xml, tag) {
@@ -267,6 +290,35 @@ function smartHistoryBody(model, csc) {
   ].join("\n");
 }
 
+function binaryInformBody(model, csc, version, nonce) {
+  return [
+    "<FUSMsg>",
+    "  <FUSHdr>",
+    `    ${textNode("ProtoVer", "1")}`,
+    `    ${textNode("SessionID", "0")}`,
+    `    ${textNode("MsgID", "1")}`,
+    "  </FUSHdr>",
+    "  <FUSBody>",
+    "    <Put>",
+    `      ${textNode("CmdID", "1")}`,
+    `      ${dataNode("REQUEST_TYPE", "2")}`,
+    `      ${dataNode("BINARY_SW_VERSION", version)}`,
+    `      ${dataNode("DEVICE_SN_NUMBER", "")}`,
+    `      ${dataNode("BINARY_LOCAL_CODE", csc)}`,
+    `      ${dataNode("BINARY_MODEL_NAME", model)}`,
+    `      ${dataNode("ACCESS_MODE", "1")}`,
+    `      ${dataNode("BINARY_NATURE", "1")}`,
+    `      ${dataNode("LOGIC_CHECK", logicCheck(version, nonce))}`,
+    "    </Put>",
+    "    <Get>",
+    `      ${textNode("CmdID", "2")}`,
+    `      ${textNode("BINARY_SW_VERSION", "")}`,
+    "    </Get>",
+    "  </FUSBody>",
+    "</FUSMsg>"
+  ].join("\n");
+}
+
 function md5(input) {
   const str = unescape(encodeURIComponent(String(input || "")));
   const x = [];
@@ -400,12 +452,13 @@ export async function makeSignatureHash(nonce, signature) {
   return md5(`${a}:FUS:${b}`);
 }
 
-async function authHeader(lane, signature = "") {
+async function authHeader(lane, signature = "", options = {}) {
   const sig = String(signature || "").trim();
+  const serverNonce = lane.session?.serverNonce || lane.session?.nonce || "";
   if (sig) {
-    return `FUS nonce="${lane.session?.nonce || ""}", signature="${await makeSignatureHash(lane.session?.nonce || "", sig)}", nc="00000001", type="auth", realm="interface"`;
+    return `FUS nonce="${serverNonce}", signature="${await makeSignatureHash(serverNonce, sig)}", nc="00000001", type="auth", realm="interface"`;
   }
-  return `FUS nonce="${lane.session?.nonce || ""}", signature="${lane.session?.auth || ""}", nc="", type="", realm=""`;
+  return `FUS nonce="${options.includeNonce === false ? "" : serverNonce}", signature="${lane.session?.auth || ""}", nc="", type="", realm=""`;
 }
 
 function isAuthFailure(response, body) {
@@ -437,7 +490,10 @@ async function postFus(path, data, authorization, lane, options = {}) {
   if (lane.session && lane.session === activeSession) {
     if (cookie) lane.session.cookie = cookie;
     if (nonce) {
-      lane.session.nonce = nonce;
+      const decrypted = await decryptModernNonce(nonce);
+      lane.session.serverNonce = nonce;
+      lane.session.nonce = decrypted || nonce;
+      lane.session.auth = lane.session.nonce;
       lane.session.createdAt = Date.now();
     }
   }
@@ -454,10 +510,12 @@ export async function generateNonce(env, options = {}) {
     throw error;
   }
   if (!nonce) throw new Error("SmartHistory nonce is empty");
+  const decrypted = await decryptModernNonce(nonce) || nonce;
   lane.session = {
-    nonce,
+    serverNonce: nonce,
+    nonce: decrypted,
     cookie,
-    auth: "",
+    auth: decrypted,
     createdAt: Date.now()
   };
   return lane.session;
@@ -493,9 +551,12 @@ async function ensureNonceWithOptions(env, lane, options = {}) {
 
 async function makeFusRequestUnlocked(env, lane, requestPath, data, signature, retry, options) {
   await ensureNonceWithOptions(env, lane, options);
-  const authorization = await authHeader(lane, signature);
+  const authorization = await authHeader(lane, signature, options);
   const requestStartedAt = Date.now();
-  const { response, text } = await postFus(requestPath, data, authorization, lane, options);
+  const requestData = typeof options.bodyFactory === "function"
+    ? await options.bodyFactory(lane.session)
+    : data;
+  const { response, text } = await postFus(requestPath, requestData, authorization, lane, options);
   if (options.timing && typeof options.timing === "object") {
     options.timing.smartHistoryMs = Number(options.timing.smartHistoryMs || 0) +
       (Date.now() - requestStartedAt);
@@ -570,6 +631,69 @@ export async function querySmartHistory(env, model, csc, options = {}) {
       (Date.now() - parseStartedAt);
   }
   return parsed;
+}
+
+/**
+ * Resolve a Samsung FUS firmware bundle to the short-lived official cloud
+ * URL and authorization header required by the binary download endpoint.
+ * The URL is intentionally consumed by the VPS download service and is never
+ * exposed in Telegram responses.
+ */
+export async function resolveOfficialFirmwareDownload(env, model, csc, version, options = {}) {
+  const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
+  const normalizedVersion = normalizeFirmwareVersion(version);
+  if (!normalizedVersion || normalizedVersion.split("/").length < 3) {
+    throw new Error("Samsung firmware version is invalid");
+  }
+  const versionParts = normalizedVersion.split("/");
+  const fusVersion = versionParts.length === 3
+    ? [...versionParts, versionParts[0]].join("/")
+    : normalizedVersion;
+  const timing = options.timing && typeof options.timing === "object" ? options.timing : null;
+  const xml = await makeFusRequest(env, BINARY_INFORM_PATH, "", "", true, {
+    ...options,
+    role: "admin",
+    model: normalizedModel,
+    csc: normalizedCsc,
+    includeNonce: false,
+    bodyFactory: (session) => binaryInformBody(
+      normalizedModel,
+      normalizedCsc,
+      fusVersion,
+      session?.nonce || ""
+    ),
+    timing
+  });
+  const status = tagValue(xml, "Status");
+  if (status && status !== "200" && status !== "S00") {
+    const error = new Error(`Samsung FUS binary inform returned ${status}`);
+    error.code = "FUS_BINARY_INFORM_FAILED";
+    error.status = Number(status) || 0;
+    throw error;
+  }
+  const fileName = tagValue(xml, "BINARY_NAME");
+  const modelPath = tagValue(xml, "MODEL_PATH");
+  const byteSize = Number(tagValue(xml, "BINARY_BYTE_SIZE") || 0);
+  if (!fileName || !modelPath) throw new Error("Samsung FUS did not return a firmware bundle");
+  const lane = getLane("admin");
+  const serverNonce = lane.session?.serverNonce || "";
+  const auth = lane.session?.auth || "";
+  if (!serverNonce || !auth) throw new Error("Samsung FUS authorization is incomplete");
+  const filePath = `${modelPath}${fileName}`;
+  const sourceUrl = `http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=${encodeURIComponent(filePath)}`;
+  return {
+    sourceUrl,
+    sourceHeaders: {
+      authorization: `FUS nonce="${serverNonce}", signature="${auth}", nc="", type="", realm=""`,
+      "user-agent": FUS_USER_AGENT
+    },
+    fileName,
+    size: Number.isFinite(byteSize) ? byteSize : 0,
+    model: normalizedModel,
+    csc: normalizedCsc,
+    version: normalizedVersion,
+    source: "Samsung FUS"
+  };
 }
 
 export function resetFusSession() {

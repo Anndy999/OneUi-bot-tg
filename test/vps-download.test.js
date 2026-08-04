@@ -20,7 +20,7 @@ test("download configuration defaults to an isolated local API", () => {
   const config = createDownloadConfig({});
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 8788);
-  assert.deepEqual(config.allowedHosts, ["samsung.com", "ospserver.net", "cdngc.net"]);
+  assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
 });
@@ -90,6 +90,42 @@ test("download API rejects non-official and non-HTTPS URLs", async () => {
     }).init({ startQueue: false });
     await assert.rejects(() => service.create({ sourceUrl: "http://example.com/file.bin" }), /HTTPS/);
     await assert.rejects(() => service.create({ sourceUrl: "https://example.com/file.bin" }), /official Samsung allowlist/);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download service resolves a Samsung FUS job inside the VPS worker", async () => {
+  const dir = await tempDir();
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => ({
+        sourceUrl: "http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=path%2Ffirmware.zip",
+        sourceHeaders: { authorization: "FUS temporary-test-value", "user-agent": "SMART 2.0" },
+        fileName: "SM-S9380_CHC_TEST.zip",
+        size: 5
+      }),
+      fetchImpl: async (_url, options) => {
+        assert.equal(options.headers.authorization, "FUS temporary-test-value");
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-length": "5" }),
+          body: (async function* body() { yield Buffer.from("hello"); })()
+        };
+      }
+    }).init({ startQueue: false });
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    assert.equal(job.downloadMode, "fus");
+    assert.equal(Object.hasOwn(job, "sourceUrl"), false);
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(Object.hasOwn(completed, "sourceHeaders"), false);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

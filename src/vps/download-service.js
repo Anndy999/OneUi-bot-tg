@@ -8,8 +8,9 @@ import Fastify from "fastify";
 import { Queue, Worker } from "bullmq";
 import Redis from "ioredis";
 import { constantTimeSecretEquals } from "./config.js";
+import { resolveOfficialFirmwareDownload } from "../fus.js";
 
-const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "ospserver.net", "cdngc.net"];
+const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
 const JOB_STATES = new Set(["queued", "downloading", "completed", "failed", "cancelled"]);
 
@@ -46,7 +47,7 @@ export function createDownloadConfig(env = process.env) {
     completedTtlMs: integer(env.DOWNLOAD_COMPLETED_TTL_MS || 7 * 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 0, 365 * 24 * 60 * 60 * 1000),
     partTtlMs: integer(env.DOWNLOAD_PART_TTL_MS || 6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 60_000, 30 * 24 * 60 * 60 * 1000),
     requestTimeoutMs: integer(env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
-    allowedHosts: configuredHosts.length ? configuredHosts : DEFAULT_ALLOWED_HOSTS
+    allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
 
@@ -59,10 +60,14 @@ export function isAllowedOfficialHost(hostname, allowedHosts = DEFAULT_ALLOWED_H
   });
 }
 
-function assertHttpsOfficialUrl(value, allowedHosts) {
+function assertOfficialUrl(value, allowedHosts) {
   let url;
-  try { url = new URL(String(value || "")); } catch { throw new Error("sourceUrl must be a valid HTTPS URL"); }
-  if (url.protocol !== "https:") throw new Error("sourceUrl must use HTTPS");
+  try { url = new URL(String(value || "")); } catch { throw new Error("sourceUrl must be a valid official URL"); }
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  const allowsSamsungFusHttp = host === "cloud-neofussvr.samsungmobile.com" || host === "cloud-neofussvr.sslcs.cdngc.net";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && allowsSamsungFusHttp)) {
+    throw new Error("sourceUrl must use HTTPS unless it is the official Samsung FUS cloud endpoint");
+  }
   if (url.username || url.password) throw new Error("sourceUrl must not include credentials");
   if (!isAllowedOfficialHost(url.hostname, allowedHosts)) throw new Error("sourceUrl host is not in the official Samsung allowlist");
   return url;
@@ -113,7 +118,7 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, filePath: _filePath, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, filePath: _filePath, ...safe } = job;
   return { ...safe, percent: safe.totalBytes ? Math.min(100, Math.floor((safe.bytes / safe.totalBytes) * 100)) : null };
 }
 
@@ -137,11 +142,13 @@ function connectionOptions(redisUrl) {
 }
 
 export class FirmwareDownloadService {
-  constructor({ config = createDownloadConfig(), logger = console, fetchImpl = fetch, lookupImpl = lookup, now = () => Date.now() } = {}) {
+  constructor({ config = createDownloadConfig(), logger = console, fetchImpl = fetch, lookupImpl = lookup, resolveImpl = resolveOfficialFirmwareDownload, now = () => Date.now(), fusEnv = process.env } = {}) {
     this.config = config;
     this.logger = logger;
     this.fetchImpl = fetchImpl;
     this.lookupImpl = lookupImpl;
+    this.resolveImpl = resolveImpl;
+    this.fusEnv = fusEnv;
     this.now = now;
     this.jobs = new Map();
     this.controllers = new Map();
@@ -253,14 +260,20 @@ export class FirmwareDownloadService {
 
   async createDownload(payload = {}, requestedBy = "admin") {
     if (!this.ready) throw new Error("download service is not ready");
-    const sourceUrl = assertHttpsOfficialUrl(payload.sourceUrl, this.config.allowedHosts);
-    await assertPublicHost(sourceUrl, this.lookupImpl);
+    const hasSourceUrl = Boolean(String(payload.sourceUrl || "").trim());
+    if (!hasSourceUrl && !(payload.model && payload.csc && payload.version)) {
+      throw new Error("model, csc, and version are required when sourceUrl is omitted");
+    }
+    const sourceUrl = hasSourceUrl ? assertOfficialUrl(payload.sourceUrl, this.config.allowedHosts) : null;
+    if (sourceUrl) await assertPublicHost(sourceUrl, this.lookupImpl);
     const free = await this.freeBytes();
     if (free < this.config.minFreeBytes) throw new Error("insufficient free disk space for a new download");
     const active = [...this.jobs.values()].find((job) => ["queued", "downloading"].includes(job.state));
     if (active) throw new Error(`another download is already active: ${active.id}`);
     const id = randomUUID();
-    const sourceName = safeName(decodeURIComponent(sourceUrl.pathname.split("/").pop() || "firmware.bin"));
+    const sourceName = sourceUrl
+      ? safeName(decodeURIComponent(sourceUrl.pathname.split("/").pop() || "firmware.bin"))
+      : "firmware.bin";
     const extension = extname(sourceName).slice(0, 12) || ".bin";
     const job = {
       id,
@@ -270,9 +283,11 @@ export class FirmwareDownloadService {
       version: safeName(payload.version, "unknown"),
       fileName: `${id}${extension}`,
       originalName: sourceName,
-      sourceHost: sourceUrl.hostname,
-      sourceUrl,
-      sourceUrlHash: sourceUrlHash(sourceUrl),
+      sourceHost: sourceUrl?.hostname || "",
+      sourceUrl: sourceUrl?.toString() || "",
+      sourceUrlHash: sourceUrl ? sourceUrlHash(sourceUrl) : "",
+      sourceHeaders: null,
+      downloadMode: sourceUrl ? "url" : "fus",
       requestedBy: String(requestedBy || "admin").slice(0, 80),
       bytes: 0,
       totalBytes: 0,
@@ -335,14 +350,25 @@ export class FirmwareDownloadService {
     const job = this.jobs.get(String(queueJob.data?.id));
     if (!job || job.state === "cancelled" || job.state === "completed") return;
     const partPath = join(this.config.dir, `${job.id}.part`);
-    const finalPath = join(this.config.dir, job.fileName);
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
     try {
       job.state = "downloading";
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
-      const response = await this.fetchOfficial(job.sourceUrl, controller.signal);
+      let resolved = null;
+      if (job.downloadMode === "fus" || !job.sourceUrl) {
+        resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
+        job.sourceUrl = resolved.sourceUrl;
+        job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
+        job.sourceHost = new URL(job.sourceUrl).hostname;
+        job.sourceHeaders = resolved.sourceHeaders || null;
+        job.originalName = safeName(resolved.fileName, "firmware.bin");
+        job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
+        await this.persist();
+      }
+      const finalPath = join(this.config.dir, job.fileName);
+      const response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
       if (!response.ok) throw new Error(`official source returned HTTP ${response.status}`);
       const advertised = Number(response.headers.get("content-length") || 0);
       if (advertised > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
@@ -397,19 +423,19 @@ export class FirmwareDownloadService {
     }
   }
 
-  async fetchOfficial(sourceUrl, signal) {
-    let current = assertHttpsOfficialUrl(sourceUrl, this.config.allowedHosts);
+  async fetchOfficial(sourceUrl, signal, requestHeaders = {}) {
+    let current = assertOfficialUrl(sourceUrl, this.config.allowedHosts);
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
       await assertPublicHost(current, this.lookupImpl);
       const response = await this.fetchImpl(current, {
         redirect: "manual",
         signal: AbortSignal.any ? AbortSignal.any([signal, AbortSignal.timeout(this.config.requestTimeoutMs)]) : signal,
-        headers: { "user-agent": "OneUI-Firmware-Downloader/1.0" }
+        headers: { "user-agent": "OneUI-Firmware-Downloader/1.0", ...requestHeaders }
       });
       if (![301, 302, 303, 307, 308].includes(response.status)) return response;
       const location = response.headers.get("location");
       if (!location) throw new Error("official source returned a redirect without Location");
-      current = assertHttpsOfficialUrl(new URL(location, current), this.config.allowedHosts);
+      current = assertOfficialUrl(new URL(location, current), this.config.allowedHosts);
     }
     throw new Error("too many redirects from official source");
   }
@@ -506,8 +532,8 @@ export async function startDownloadServer({ env = process.env, logger = console 
   const config = createDownloadConfig(env);
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
-  const service = await new FirmwareDownloadService({ config, logger }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.15.0") });
+  const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.16.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

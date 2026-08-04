@@ -26,6 +26,11 @@ import {
   setRolloutChainStage
 } from "./rollout-chain.js";
 import { querySmartHistory } from "./fus.js";
+import {
+  cancelFirmwareDownload,
+  createFirmwareDownload,
+  listFirmwareDownloads
+} from "./vps/download-client.js";
 import { logQueryMetric } from "./metrics.js";
 import {
   diagnosticsPanel,
@@ -123,6 +128,7 @@ import {
   upsertAccessRequest,
   upsertMonitorItem
 } from "./state.js";
+import { kvGetJson, kvPutJson } from "./state.js";
 import {
   classifySamsungSourceHealth,
   formatSamsungSourceHealth,
@@ -161,7 +167,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.15.0";
+const APP_VERSION = "2.16.0";
 
 export default {
   async fetch(request, env, ctx) {
@@ -312,6 +318,7 @@ const PUBLIC_TELEGRAM_COMMANDS = [
 ];
 
 const ADMIN_TELEGRAM_COMMANDS = [
+  { command: "download", description: "official firmware download" },
   ...PUBLIC_TELEGRAM_COMMANDS,
   { command: "admin", description: "管理员面板" },
   { command: "chain", description: "发布链" },
@@ -526,6 +533,10 @@ export async function processTelegramUpdate(update, env, origin = "", ctx = null
     return jsonResponse({ ok: true });
   }
 
+  if (identity === "admin" && await handleAdminDownloadText(env, chatId, text, ctx)) {
+    return jsonResponse({ ok: true });
+  }
+
   if (identity === "admin" && await handleAdminMenuText(env, chatId, text)) {
     return jsonResponse({ ok: true });
   }
@@ -701,7 +712,7 @@ function mainMenuKeyboard(identity, lang = "zh") {
     return { inline_keyboard: [
       [{ text: en ? "Monitoring" : "\ud83d\udce1 监控", callback_data: "admin:monitor-menu" }, { text: en ? "Rollout" : "\ud83d\udce3 发布链", callback_data: "admin:rollout-menu" }],
       [{ text: en ? "Users" : "\ud83d\udc65 用户", callback_data: "admin:access-menu" }, { text: en ? "Admins" : "\ud83d\udc51 管理员", callback_data: "admin:admins" }],
-      [{ text: en ? "More" : "更多", callback_data: "menu:more" }]
+      [{ text: en ? "Downloads" : "📦 下载", callback_data: "admin:download-menu" }, { text: en ? "More" : "更多", callback_data: "menu:more" }]
     ] };
   }
   if (identity === "allowed") {
@@ -725,6 +736,89 @@ function adminMoreKeyboard(lang = "zh") {
     [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
   ] };
 }
+
+const ADMIN_DOWNLOAD_SESSION_TTL_SECONDS = 10 * 60;
+
+function adminDownloadSessionKey(chatId) {
+  return `admin:download-session:${String(chatId || "")}`;
+}
+
+async function beginAdminDownloadInput(env, chatId) {
+  await kvPutJson(env, adminDownloadSessionKey(chatId), {
+    createdAt: new Date().toISOString(),
+    action: "create"
+  }, { expirationTtl: ADMIN_DOWNLOAD_SESSION_TTL_SECONDS });
+}
+
+async function clearAdminDownloadInput(env, chatId) {
+  if (!env.FIRMWARE_KV?.delete) return;
+  await env.FIRMWARE_KV.delete(adminDownloadSessionKey(chatId));
+}
+
+async function hasAdminDownloadInput(env, chatId) {
+  return Boolean(await kvGetJson(env, adminDownloadSessionKey(chatId), null));
+}
+
+function formatDownloadJob(job, lang = "zh") {
+  if (!job) return lang === "en" ? "No firmware download jobs." : "暂无固件下载任务。";
+  const stateLabels = lang === "en"
+    ? { queued: "queued", downloading: "downloading", completed: "completed", failed: "failed", cancelled: "cancelled" }
+    : { queued: "排队中", downloading: "下载中", completed: "已完成", failed: "失败", cancelled: "已取消" };
+  const progress = job.totalBytes
+    ? `${job.percent ?? 0}% (${job.bytes || 0}/${job.totalBytes})`
+    : `${job.percent ?? 0}%`;
+  const lines = [
+    `${job.model || "?"} ${job.csc || "?"}`,
+    `版本：${job.version || "?"}`,
+    `状态：${stateLabels[job.state] || job.state}`,
+    job.state === "downloading" || job.state === "queued" ? `进度：${progress}` : "",
+    job.state === "completed" ? `文件：${job.originalName || job.fileName || "firmware"}` : "",
+    job.state === "failed" && job.error ? `原因：${job.error}` : "",
+    `任务：${String(job.id || "").slice(0, 12)}`
+  ].filter(Boolean);
+  if (lang === "en") {
+    return [
+      `${job.model || "?"} ${job.csc || "?"}`,
+      `Version: ${job.version || "?"}`,
+      `State: ${stateLabels[job.state] || job.state}`,
+      job.state === "downloading" || job.state === "queued" ? `Progress: ${progress}` : "",
+      job.state === "completed" ? `File: ${job.originalName || job.fileName || "firmware"}` : "",
+      job.state === "failed" && job.error ? `Error: ${job.error}` : "",
+      `Job: ${String(job.id || "").slice(0, 12)}`
+    ].filter(Boolean).join("\n");
+  }
+  return lines.join("\n");
+}
+
+function downloadMenuKeyboard(jobs = [], lang = "zh") {
+  const en = lang === "en";
+  const active = jobs.find((job) => ["queued", "downloading"].includes(job.state));
+  const rows = [
+    [{ text: en ? "New download" : "新建下载", callback_data: "admin:download-new" }, { text: en ? "Refresh" : "刷新", callback_data: "admin:download-menu" }]
+  ];
+  if (active) rows.push([{ text: en ? "Cancel active" : "取消当前任务", callback_data: `admin:download-cancel:${active.id}` }]);
+  rows.push([{ text: en ? "Back" : "返回", callback_data: "menu:home" }]);
+  return { inline_keyboard: rows };
+}
+
+async function renderDownloadMenu(env, chatId, messageId = null) {
+  const lang = await getUserLanguage(env, chatId);
+  const result = await listFirmwareDownloads(env);
+  if (!result.ok) {
+    const text = result.configured === false
+      ? (lang === "en" ? "Download service is not configured on the bot." : "下载服务尚未配置到机器人。")
+      : (lang === "en" ? `Download service unavailable: ${result.error || "check VPS service"}` : `下载服务不可用：${result.error || "请检查 VPS 服务"}`);
+    return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: [[{ text: enBack(lang), callback_data: "menu:home" }]] });
+  }
+  const jobs = Array.isArray(result.downloads) ? result.downloads : [];
+  const recent = jobs.slice(0, 5);
+  const text = lang === "en"
+    ? ["Firmware downloads", "", recent.length ? recent.map((job) => formatDownloadJob(job, lang)).join("\n\n") : "No jobs yet.", "", "Only administrators can start downloads. Files are saved on the VPS."].join("\n")
+    : ["固件下载", "", recent.length ? recent.map((job) => formatDownloadJob(job, lang)).join("\n\n") : "暂无任务。", "", "仅管理员可发起下载，文件保存到 VPS。"].join("\n");
+  return safeEditOrSend(env, chatId, messageId, text, downloadMenuKeyboard(jobs, lang));
+}
+
+function enBack(lang) { return lang === "en" ? "Back" : "返回"; }
 
 function adminMoreText(lang = "zh") {
   return lang === "en" ? "More\n\nSystem, help, and language." : "更多\n\n系统、帮助和语言设置。";
@@ -869,6 +963,7 @@ function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed") {
     { text: en ? "Monitor" : "\u52a0\u5165\u76d1\u63a7", callback_data: `monitor-item:add:${normalizedModel}:${normalizedCsc}` },
     { text: en ? "Clear cache" : "\u6e05\u7f13\u5b58", callback_data: `admin:cache-target:${normalizedModel}:${normalizedCsc}` }
   ]);
+  if (identity === "admin") rows.push([{ text: en ? "Download firmware" : "\u4e0b\u8f7d\u56fa\u4ef6", callback_data: `admin:download-start:${normalizedModel}:${normalizedCsc}` }]);
   rows.push([{ text: en ? "Home" : "\u9996\u9875", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
   }
@@ -1420,6 +1515,71 @@ function parseAccessDecisionText(text) {
   return null;
 }
 
+function parseAdminDownloadInput(text) {
+  const tokens = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return null;
+  let version = "";
+  if (tokens.length >= 3 && tokens.at(-1).includes("/")) version = tokens.pop();
+  const csc = tokens.pop();
+  const parsed = parseFirmwareInput(`${tokens.join(" ")} ${csc}`);
+  if (!parsed.matched) return null;
+  return { model: parsed.model, csc: parsed.csc, version };
+}
+
+async function startAdminFirmwareDownload(env, chatId, request, options = {}) {
+  const lang = await getUserLanguage(env, chatId);
+  const messageId = options.messageId || null;
+  const progress = lang === "en"
+    ? `Preparing official Samsung download...\n\n${request.model} ${request.csc}`
+    : `正在准备三星官方下载…\n\n${request.model} ${request.csc}`;
+  await (messageId
+    ? safeEditOrSend(env, chatId, messageId, progress)
+    : sendTelegramMessage(env, chatId, progress));
+  try {
+    let version = request.version;
+    if (!version) {
+      const result = await querySmartHistory(env, request.model, request.csc, { role: "admin" });
+      version = result.latest;
+    }
+    const created = await createFirmwareDownload(env, {
+      model: request.model,
+      csc: request.csc,
+      version
+    }, chatId);
+    if (!created.ok) throw new Error(created.error || "download service rejected the request");
+    const job = created.download;
+    const text = lang === "en"
+      ? `Download queued.\n\n${formatDownloadJob(job, lang)}\n\nUse Downloads → Refresh to view progress.`
+      : `下载任务已创建。\n\n${formatDownloadJob(job, lang)}\n\n可在“下载 → 刷新”查看进度。`;
+    return messageId
+      ? safeEditOrSend(env, chatId, messageId, text, downloadMenuKeyboard([job], lang))
+      : sendTelegramMessage(env, chatId, text, downloadMenuKeyboard([job], lang));
+  } catch (error) {
+    const text = lang === "en"
+      ? `Download was not started.\n\n${String(error?.message || error).slice(0, 240)}`
+      : `下载未启动。\n\n${String(error?.message || error).slice(0, 240)}`;
+    return messageId
+      ? safeEditOrSend(env, chatId, messageId, text, downloadMenuKeyboard([], lang))
+      : sendTelegramMessage(env, chatId, text, downloadMenuKeyboard([], lang));
+  }
+}
+
+async function handleAdminDownloadText(env, chatId, text, ctx = null) {
+  if (!await hasAdminDownloadInput(env, chatId)) return false;
+  await clearAdminDownloadInput(env, chatId);
+  const request = parseAdminDownloadInput(text);
+  const lang = await getUserLanguage(env, chatId);
+  if (!request) {
+    await sendTelegramMessage(env, chatId, lang === "en"
+      ? "Format: MODEL CSC [VERSION]\nExample: SM-S938B CHC"
+      : "格式：型号 CSC [版本]\n例如：SM-S938B CHC");
+    return true;
+  }
+  runBackground(ctx, startAdminFirmwareDownload(env, chatId, request));
+  await sendTelegramMessage(env, chatId, lang === "en" ? "Request received." : "已收到下载请求。正在准备…");
+  return true;
+}
+
 async function handleAdminMenuText(env, chatId, text) {
   const value = String(text || "").trim();
   if (value === "📝 白名单申请") {
@@ -1858,6 +2018,38 @@ async function handleCallback(callbackQuery, env, ctx = null) {
 
 async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   const lang = await getUserLanguage(env, chatId);
+  if (data === "admin:download-menu") {
+    await renderDownloadMenu(env, chatId, messageId);
+    return;
+  }
+  if (data === "admin:download-new") {
+    await beginAdminDownloadInput(env, chatId);
+    await safeEditOrSend(
+      env,
+      chatId,
+      messageId,
+      lang === "en"
+        ? "Send: MODEL CSC [VERSION]\nExample: SM-S938B CHC\nLeave VERSION empty to use the latest exact Samsung SmartHistory version."
+        : "发送：型号 CSC [版本]\n例如：SM-S938B CHC\n不填写版本时，使用三星 SmartHistory 返回的最新精确版本。",
+      { inline_keyboard: [[{ text: enBack(lang), callback_data: "admin:download-menu" }]] }
+    );
+    return;
+  }
+  if (data.startsWith("admin:download-cancel:")) {
+    const id = data.slice("admin:download-cancel:".length);
+    const cancelled = await cancelFirmwareDownload(env, id);
+    await renderDownloadMenu(env, chatId, messageId);
+    if (!cancelled.ok) {
+      await sendTelegramMessage(env, chatId, lang === "en" ? `Cancel failed: ${cancelled.error || "job already finished"}` : `取消失败：${cancelled.error || "任务可能已完成"}`);
+    }
+    return;
+  }
+  if (data.startsWith("admin:download-start:")) {
+    const [, , model, csc] = data.split(":");
+    if (!model || !csc) return;
+    runBackground(ctx, startAdminFirmwareDownload(env, chatId, { model, csc }, { messageId }));
+    return;
+  }
   if (data === "admin:rollout-menu") {
     await renderRolloutMenu(env, chatId, messageId);
     return;
@@ -2999,6 +3191,26 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     if (!(await requireAdmin(env, chatId, identity))) return;
     const lang = await getUserLanguage(env, chatId);
     await sendTelegramMessage(env, chatId, await adminMenuText(env, lang), adminMenuKeyboard(lang));
+    return;
+  }
+
+  if (command === "/download") {
+    if (!(await requireAdmin(env, chatId, identity))) return;
+    if (args.length) {
+      const request = parseAdminDownloadInput(args.join(" "));
+      if (!request) {
+        await sendTelegramMessage(env, chatId, "用法：/download MODEL CSC [VERSION]");
+        return;
+      }
+      runBackground(ctx, startAdminFirmwareDownload(env, chatId, request));
+      await sendTelegramMessage(env, chatId, "已收到下载请求。正在准备…");
+      return;
+    }
+    await beginAdminDownloadInput(env, chatId);
+    const lang = await getUserLanguage(env, chatId);
+    await sendTelegramMessage(env, chatId, lang === "en"
+      ? "Send: MODEL CSC [VERSION]"
+      : "发送：型号 CSC [版本]", downloadMenuKeyboard([], lang));
     return;
   }
 

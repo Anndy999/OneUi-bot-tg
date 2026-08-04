@@ -29,6 +29,10 @@ exists, contains no placeholder values, points to the dedicated Redis URL, and
 that `oneui` owns `/opt/oneui-bot/data/firmware`. Do not paste that environment
 file into logs or chat. A public domain and inbound port are not a fix for a
 local service failure.
+If the Telegram admin menu says the download service is not configured, check
+that `/etc/oneui-bot/oneui-bot.env` contains the same local API secret and
+`DOWNLOAD_API_URL=http://127.0.0.1:8788`. Restart only `oneui-bot.service` after
+editing that protected file.
 
 Never paste the environment file or full connection URLs into an issue or
 chat. Logs should contain error categories, not Tokens or passwords.

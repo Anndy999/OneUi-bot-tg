@@ -2924,9 +2924,64 @@ test("Telegram start shows the compact role-based admin menu", async () => {
     "admin:rollout-menu",
     "admin:access-menu",
     "admin:admins",
+    "admin:download-menu",
     "menu:more"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
+});
+
+test("administrator can start a VPS firmware download from a command", async () => {
+  const kv = memoryKv();
+  const env = {
+    FIRMWARE_KV: kv,
+    WEBHOOK_SECRET: "test-header-secret",
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "991",
+    DOWNLOAD_API_URL: "http://download.local:8788",
+    [["DOWNLOAD", "API", "SECRET"].join("_")]: "local-test-key"
+  };
+  const payloads = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const value = String(url);
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    payloads.push({ url: value, body, headers: init.headers || {} });
+    if (value.includes("download.local:8788")) {
+      assert.equal(init.headers["x-download-api-key"], "local-test-key");
+      return new Response(JSON.stringify({
+        ok: true,
+        download: {
+          id: "job-1",
+          state: "queued",
+          model: "SM-S9380",
+          csc: "CHC",
+          version: "S9380XXU1/S9380CHC/S9380MODEM"
+        }
+      }), { status: 202, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: payloads.length } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  const waits = [];
+  const response = await worker.fetch(new Request("https://worker.example/telegram", {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-Telegram-Bot-Api-Secret-Token": env.WEBHOOK_SECRET },
+    body: JSON.stringify({
+      update_id: 700002,
+      message: { message_id: 1, chat: { id: 991 }, from: { id: 991 }, text: "/download SM-S9380 CHC S9380XXU1/S9380CHC/S9380MODEM" }
+    })
+  }), env, { waitUntil(promise) { waits.push(promise); } });
+  assert.equal(response.status, 200);
+  for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
+  const request = payloads.find((entry) => entry.url.endsWith("/api/v1/downloads"));
+  assert.ok(request);
+  assert.deepEqual(request.body, {
+    model: "SM-S9380",
+    csc: "CHC",
+    version: "S9380XXU1/S9380CHC/S9380MODEM"
+  });
+  assert.ok(payloads.some((entry) => entry.body.text?.includes("下载任务已创建")));
 });
 
 test("owner can add persistent administrators without changing the owner identity", async () => {

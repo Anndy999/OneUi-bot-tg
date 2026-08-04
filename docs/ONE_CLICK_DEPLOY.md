@@ -103,6 +103,11 @@ sudoedit /etc/oneui-bot/oneui-download.env
 Set a strong local API secret and the same dedicated OneUI `REDIS_URL` used by
 the download worker. Keep `DOWNLOAD_HOST=127.0.0.1`; do not expose port 8788
 until signed public links, HTTPS, and an approved firewall rule are ready.
+Add the same API secret to the `DOWNLOAD_API_SECRET` variable in
+`/etc/oneui-bot/oneui-bot.env` and set the API URL to
+`http://127.0.0.1:8788`.
+The bot uses this local authenticated API; never paste the secret into a
+Telegram message or commit it.
 Then install the independent unit:
 
 ```bash
@@ -118,16 +123,19 @@ Nginx, 443, or UFW change is needed:
 ssh -L 8788:127.0.0.1:8788 <vps-user>@<vps-ip> -p <ssh-port>
 ```
 
-The API accepts only HTTPS URLs on the configured Samsung/FUS host allowlist,
-allows one active download, preserves a configured free-space reserve, and
-cleans stale partial/completed files. It does not yet provide public download
-links; that is intentionally a later, separately approved step.
+The API accepts only official Samsung/FUS hosts, allows the Samsung FUS cloud
+HTTP endpoint only for the exact official host, allows one active download,
+preserves a configured free-space reserve, and cleans stale
+partial/completed files. The Telegram admin menu resolves the exact Samsung
+firmware version and starts the download without asking an administrator to
+copy a temporary FUS URL. Public download links remain a separate later step.
 
 Current administrator API surface:
 
 - `GET /health` — local health and free-space status, no API key;
 - `POST /api/v1/downloads` — create a download with
-  `X-Download-Api-Key` and `sourceUrl`, `model`, `csc`, `version` JSON fields;
+  `X-Download-Api-Key` and `model`, `csc`, `version` JSON fields. A direct
+  `sourceUrl` remains supported for verified official sources;
 - `GET /api/v1/downloads` or `/api/v1/downloads/<id>` — list/status;
 - `DELETE /api/v1/downloads/<id>` — cancel a queued or active download;
 - `GET /files/<id>` — retrieve a completed file, still protected by the same
