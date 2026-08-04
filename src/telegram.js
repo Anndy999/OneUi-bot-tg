@@ -11,12 +11,20 @@ async function telegramApi(env, method, payload, options = {}) {
 
   const maxAttempts = Math.max(1, Number(options.maxAttempts ?? 2));
   const timeoutMs = Math.max(250, Number(options.timeoutMs ?? 5000));
+  const requestPayload = { ...payload };
+  if (requestPayload.reply_markup === null) {
+    // Telegram expects an object when reply_markup is present. An empty
+    // inline keyboard removes the old keyboard when editing a message;
+    // outgoing messages should simply omit the optional field.
+    if (method === "editMessageText") requestPayload.reply_markup = { inline_keyboard: [] };
+    else delete requestPayload.reply_markup;
+  }
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(requestPayload),
         signal: AbortSignal.timeout(timeoutMs)
       });
       const data = await response.json().catch(() => ({}));

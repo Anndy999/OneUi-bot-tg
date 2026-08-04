@@ -1919,6 +1919,32 @@ test("Telegram edit treats message-is-not-modified as success and does not send 
   assert.equal(calls, 1);
 });
 
+test("Telegram failure replies remove a null inline keyboard safely", async () => {
+  const payloads = [];
+  globalThis.fetch = async (_url, init = {}) => {
+    const payload = JSON.parse(String(init.body || "{}"));
+    payloads.push(payload);
+    if (payload.reply_markup === null) {
+      return new Response(JSON.stringify({
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: object expected as reply markup"
+      }), {
+        status: 400,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 10 } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+
+  const ok = await safeEditOrSend({ TELEGRAM_BOT_TOKEN: "test-token" }, "1", 10, "query failed", null);
+  assert.equal(ok, true);
+  assert.deepEqual(payloads[0].reply_markup, { inline_keyboard: [] });
+  assert.equal(payloads.length, 1);
+});
 test("Telegram send result exposes the created message id for progress edits", async () => {
   globalThis.fetch = async () => new Response(JSON.stringify({
     ok: true,
