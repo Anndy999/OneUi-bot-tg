@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node --test --test-concurrency=1",
+    "test": "node --import ./scripts/node-webcrypto-setup.mjs --test --test-concurrency=1",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "tail": "wrangler tail",

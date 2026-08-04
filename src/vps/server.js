@@ -1,3 +1,4 @@
+import "./node-webcrypto.js";
 import { buildVpsApp } from "./app.js";
 
 const { app, context } = buildVpsApp({

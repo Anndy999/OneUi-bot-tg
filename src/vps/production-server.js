@@ -1,3 +1,4 @@
+import "./node-webcrypto.js";
 import { buildVpsApp } from "./app.js";
 import { handleTelegramWebhook } from "../index.js";
 import { createVpsProductionRuntime } from "./production.js";

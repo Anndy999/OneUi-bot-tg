@@ -10,6 +10,10 @@ const FUS_USER_AGENT = "SMART 2.0";
 const MODERN_NONCE_KEY = "vicopx7dqu06emacgpnpy8j8zwhduwlh";
 const MODERN_AUTH_KEY = "9u7qab84rpc16gvk";
 
+function webCrypto() {
+  return globalThis.crypto;
+}
+
 function base64ToBytes(value) {
   const binary = atob(String(value || ""));
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
@@ -42,10 +46,11 @@ function padPkcs7(value) {
 async function decryptModernNonce(value) {
   try {
     const binary = base64ToBytes(value);
-    if (!binary.length || binary.length % 16 !== 0 || !globalThis.crypto?.subtle) return "";
+    const crypto = webCrypto();
+    if (!binary.length || binary.length % 16 !== 0 || !crypto?.subtle) return "";
     const key = new TextEncoder().encode(MODERN_NONCE_KEY);
-    const cryptoKey = await globalThis.crypto.subtle.importKey("raw", key, "AES-CBC", false, ["decrypt"]);
-    const plain = await globalThis.crypto.subtle.decrypt({ name: "AES-CBC", iv: key.slice(0, 16) }, cryptoKey, binary);
+    const cryptoKey = await crypto.subtle.importKey("raw", key, "AES-CBC", false, ["decrypt"]);
+    const plain = await crypto.subtle.decrypt({ name: "AES-CBC", iv: key.slice(0, 16) }, cryptoKey, binary);
     return new TextDecoder().decode(unpadPkcs7(new Uint8Array(plain)));
   } catch {
     return "";
@@ -54,12 +59,13 @@ async function decryptModernNonce(value) {
 
 async function makeModernFusSignature(nonce) {
   const value = String(nonce || "");
-  if (value.length < 16 || !globalThis.crypto?.subtle) return "";
+  const crypto = webCrypto();
+  if (value.length < 16 || !crypto?.subtle) return "";
   try {
     const keyPrefix = Array.from({ length: 16 }, (_, index) => MODERN_NONCE_KEY[value.charCodeAt(index) % 16]).join("");
     const key = new TextEncoder().encode(`${keyPrefix}${MODERN_AUTH_KEY}`);
-    const cryptoKey = await globalThis.crypto.subtle.importKey("raw", key, "AES-CBC", false, ["encrypt"]);
-    const encrypted = await globalThis.crypto.subtle.encrypt(
+    const cryptoKey = await crypto.subtle.importKey("raw", key, "AES-CBC", false, ["encrypt"]);
+    const encrypted = await crypto.subtle.encrypt(
       { name: "AES-CBC", iv: key.slice(0, 16) },
       cryptoKey,
       padPkcs7(new TextEncoder().encode(value))
