@@ -1,7 +1,7 @@
 import {
   historyTotalDeadlineMs
 } from "./config.js";
-import { queryFirmwareHistory } from "./samsung.js";
+import { queryFirmwareHybrid } from "./samsung.js";
 import { buildFirmwareCacheRecord } from "./firmware-cache.js";
 import { getFirmwareQueryCache, setFirmwareQueryCache } from "./state.js";
 import { validateModelCsc } from "./targets.js";
@@ -79,7 +79,13 @@ function coordinatorStub(env, model, csc) {
 
 export async function coordinatedFirmwareQuery(env, model, csc, options = {}) {
   const binding = coordinatorStub(env, model, csc);
-  if (!binding) return queryFirmwareHistory(env, model, csc, options);
+  if (!binding) {
+    return queryFirmwareHybrid(env, model, csc, {
+      ...options,
+      allowOfficialMetadataFallback: !options.monitor,
+      preferOfficialMetadata: !options.monitor
+    });
+  }
 
   const timeoutMs = Math.max(1000, historyTotalDeadlineMs(env) + 1500);
   const response = await binding.stub.fetch("https://firmware-query/query", {
@@ -238,26 +244,34 @@ export class FirmwareQueryCoordinator {
     if (!this.inFlight) {
       const role = body.role === "monitor" ? "monitor" : body.role === "admin" ? "admin" : "interactive";
       this.inFlight = Promise.resolve()
-        .then(() => queryFirmwareHistory(this.env, target.model, target.csc, {
+        .then(() => queryFirmwareHybrid(this.env, target.model, target.csc, {
           role,
-          monitor: role === "monitor"
+          monitor: role === "monitor",
+          allowOfficialMetadataFallback: role !== "monitor",
+          preferOfficialMetadata: role !== "monitor"
         }))
         .then(async (result) => {
-          const previousCanonical = this.positive?.result?.canonicalCache ||
-            (this.env.FIRMWARE_KV ? await getFirmwareQueryCache(this.env, target.model, target.csc) : null);
-          const canonicalCache = buildFirmwareCacheRecord(
-            this.env,
-            previousCanonical,
-            target.model,
-            target.csc,
-            result.parsed
+          const isExactHistory = result.parsed?.sourceType === "smart_history";
+          const previousCanonical = isExactHistory && (
+            this.positive?.result?.canonicalCache ||
+            (this.env.FIRMWARE_KV ? await getFirmwareQueryCache(this.env, target.model, target.csc) : null)
           );
+          const canonicalCache = isExactHistory
+            ? buildFirmwareCacheRecord(
+              this.env,
+              previousCanonical,
+              target.model,
+              target.csc,
+              result.parsed
+            )
+            : null;
           const compact = compactResult({ ...result, canonicalCache });
           const now = Date.now();
           this.cached = {
             result: compact,
             expiresAt: now + cacheTtlMs(this.env)
           };
+          if (!canonicalCache) return compact;
           this.positive = {
             result: compact,
             expiresAt: Math.min(

@@ -3930,14 +3930,18 @@ async function handleManualQuery(env, chatId, text, options = {}) {
       }
     ));
     const coordinatorHopMs = Date.now() - coordinatorStartedAt;
-    const cacheValue = result.canonicalCache || buildFirmwareCacheRecord(
-      env,
-      staleCache,
-      query.model,
-      query.csc,
-      result.parsed
+    const cacheValue = result.canonicalCache || (
+      result.parsed?.sourceType === "version_xml"
+        ? result.parsed
+        : buildFirmwareCacheRecord(
+          env,
+          staleCache,
+          query.model,
+          query.csc,
+          result.parsed
+        )
     );
-    if (cacheSettings.enabled) {
+    if (cacheSettings.enabled && cacheValue.sourceType === "smart_history") {
       setL1Firmware(query.model, query.csc, cacheValue, l1CacheTtlSeconds(env));
       setFirmwareMemoryCache(query.model, query.csc, cacheValue);
       if (!result.canonicalCache) {

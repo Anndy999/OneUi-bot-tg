@@ -2,7 +2,7 @@ import {
   historyRequestTimeoutMs,
   historyTotalDeadlineMs
 } from "./config.js";
-import { querySmartHistory } from "./fus.js";
+import { querySmartHistory, resolveOfficialFirmwareVersion } from "./fus.js";
 import { parseSamsungFirmwareString } from "./firmware-version.js";
 import { docUrl } from "./utils.js";
 import { validateModelCsc } from "./targets.js";
@@ -112,6 +112,39 @@ function requireExactCsc(parsed, csc) {
   throw error;
 }
 
+function canUseOfficialMetadataFallback(error) {
+  const code = String(error?.code || "");
+  if (code === "FUS_SMART_HISTORY_EMPTY") return true;
+  return code === "FUS_SMART_HISTORY_STATUS" && String(error?.status || "") === "S02";
+}
+
+function officialMetadataResult(model, csc, version, historyError, queryTiming) {
+  const parts = String(version || "").split("/").map((part) => part.trim()).filter(Boolean);
+  const pda = parts[0] || String(version || "");
+  const parsed = {
+    latest: version,
+    pda,
+    cscVersion: parts[1] || pda,
+    modem: parts[2] || pda,
+    android: "未知",
+    rawAndroid: "",
+    rawLatest: version,
+    versionDetails: parseSamsungFirmwareString(pda),
+    buildDate: "",
+    smartHistory: null,
+    rawOutput: ""
+  };
+  return wrapParsed(parsed, model, csc, "", {
+    source: "Samsung FOTA version.xml",
+    sourceType: "version_xml",
+    selectedSource: "version_xml",
+    fallbackUsed: Boolean(historyError),
+    fallbackReason: historyError ? String(historyError.message || historyError) : null,
+    degraded: Boolean(historyError),
+    queryTiming
+  });
+}
+
 export async function queryFirmwareHistory(env, model, csc, options = {}) {
   const normalized = validateModelCsc(model, csc);
   const startedAt = Date.now();
@@ -130,11 +163,64 @@ export async function queryFirmwareHistory(env, model, csc, options = {}) {
   return result;
 }
 
-// Backwards-compatible public name. v2.5 is deliberately History-only:
-// legacy non-authoritative endpoints are intentionally excluded because they can lag or omit
-// newly published One UI branches.
 export async function queryFirmwareHybrid(env, model, csc, options = {}) {
-  return queryFirmwareHistory(env, model, csc, options);
+  // Monitoring stays History-only so an incomplete official metadata record
+  // can never trigger a false update notification. Interactive and admin
+  // queries can use Samsung's official version.xml, matching Bifrost's FOTA
+  // first strategy, with SmartHistory as the richer fallback.
+  if (options.monitor || options.allowOfficialMetadataFallback !== true) {
+    return queryFirmwareHistory(env, model, csc, options);
+  }
+
+  const normalized = validateModelCsc(model, csc);
+  const startedAt = Date.now();
+  if (options.preferOfficialMetadata === true) {
+    const metadataStartedAt = Date.now();
+    try {
+      const version = await resolveOfficialFirmwareVersion(
+        env,
+        normalized.model,
+        normalized.csc,
+        "",
+        options
+      );
+      return officialMetadataResult(normalized.model, normalized.csc, version, null, {
+        officialMetadataMs: Date.now() - metadataStartedAt,
+        totalMs: Date.now() - startedAt,
+        singleFlightJoined: false
+      });
+    } catch (metadataError) {
+      try {
+        return await queryFirmwareHistory(env, normalized.model, normalized.csc, options);
+      } catch (historyError) {
+        // Preserve the more useful official endpoint error when both Samsung
+        // endpoints have no usable record for this exact model/CSC.
+        if (canUseOfficialMetadataFallback(historyError)) throw metadataError;
+        throw historyError;
+      }
+    }
+  }
+
+  try {
+    return await queryFirmwareHistory(env, normalized.model, normalized.csc, options);
+  } catch (historyError) {
+    if (!canUseOfficialMetadataFallback(historyError)) throw historyError;
+    const historyMs = Date.now() - startedAt;
+    const metadataStartedAt = Date.now();
+    const version = await resolveOfficialFirmwareVersion(
+      env,
+      normalized.model,
+      normalized.csc,
+      "",
+      options
+    );
+    return officialMetadataResult(normalized.model, normalized.csc, version, historyError, {
+      historyMs,
+      officialMetadataMs: Date.now() - metadataStartedAt,
+      totalMs: Date.now() - startedAt,
+      singleFlightJoined: false
+    });
+  }
 }
 
 export async function queryFirmware(model, csc, env = {}) {

@@ -429,10 +429,14 @@ export function formatFirmwareResult(result, options = {}) {
       `Build date: ${buildDate}`
     ];
     if (Number.isFinite(elapsedMs)) lines.push("", `⏱ Query latency: ${elapsedMs} ms`);
-    if (result.fallbackUsed || options.fallbackReason || result.degraded) {
+    if (result.sourceType === "version_xml") {
+      lines.push("", "⚠️ Showing the latest official Samsung version.xml metadata.");
+    } else if (result.fallbackUsed || options.fallbackReason || result.degraded) {
       lines.push("", "⚠️ Samsung is temporarily unavailable. This is the last exact CSC SmartHistory record and may not include a newly released build.");
     }
-    lines.push(`📡 Samsung SmartHistory · ${cacheLabel}`);
+    lines.push(result.sourceType === "version_xml"
+      ? "📡 Samsung FOTA version.xml · official metadata"
+      : `📡 Samsung SmartHistory · ${cacheLabel}`);
     return lines.join("\n");
   }
 
@@ -448,10 +452,14 @@ export function formatFirmwareResult(result, options = {}) {
     `构建日期：${buildDate}`
   ];
   if (Number.isFinite(elapsedMs)) lines.push("", `⏱ 查询耗时：${elapsedMs} ms`);
-  if (result.fallbackUsed || options.fallbackReason || result.degraded) {
+  if (result.sourceType === "version_xml") {
+    lines.push("", "⚠️ 当前使用三星官方 version.xml 元数据，SmartHistory 暂无可用记录。");
+  } else if (result.fallbackUsed || options.fallbackReason || result.degraded) {
     lines.push("", "⚠️ 三星服务器暂时无法连接，当前返回最后一次精确 CSC 的 SmartHistory 记录，可能尚未包含刚发布的新版本。");
   }
-  lines.push(`📡 Samsung SmartHistory · ${cacheLabel}`);
+  lines.push(result.sourceType === "version_xml"
+    ? "📡 Samsung FOTA version.xml · 官方元数据"
+    : `📡 Samsung SmartHistory · ${cacheLabel}`);
   return lines.join("\n");
 }
 

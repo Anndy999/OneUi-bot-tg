@@ -466,6 +466,51 @@ test("History-only queries never request version XML", async () => {
   assert.equal(xmlCalls, 0);
 });
 
+test("interactive queries prefer official version.xml for every CSC", async () => {
+  resetFusSession();
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("version.xml")) {
+      return new Response("<firmware><version><latest>S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1</latest></version></firmware>");
+    }
+    throw new Error(`Unexpected non-official query URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S9480", "CHC", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true,
+    preferOfficialMetadata: true
+  });
+  assert.equal(result.latest, "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1");
+  assert.equal(result.sourceType, "version_xml");
+  assert.equal(result.selectedSource, "version_xml");
+  assert.equal(result.degraded, false);
+});
+
+test("interactive query uses SmartHistory when official version.xml is unavailable", async () => {
+  resetFusSession();
+  const version = "S9380NEW1/S9380CHC1/S9380MODEM1";
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("version.xml")) return new Response("unavailable", { status: 403 });
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([
+        historyRow({ sequence: "1", localCsc: "CHC", version })
+      ]));
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S9380", "CHC", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true,
+    preferOfficialMetadata: true
+  });
+  assert.equal(result.latest, version);
+  assert.equal(result.sourceType, "smart_history");
+});
+
 test("buyer CSC is accepted only when no exact local CSC row exists", () => {
   const buyerVersion = "S9380BUY2/S9380CSC2/S9380MODEM2";
   const genericVersion = "S9380GEN9/S9380CSC9/S9380MODEM9";
