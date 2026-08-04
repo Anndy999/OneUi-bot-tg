@@ -5,18 +5,66 @@ const FUS_BASE = "https://neofussvr.sslcs.cdngc.net";
 const NONCE_PATH = "/NF_SmartDownloadGenerateNonce.do";
 const HISTORY_PATH = "/SmartHistory.do";
 const BINARY_INFORM_PATH = "/NF_SmartDownloadBinaryInform.do";
+const BINARY_INIT_PATH = "/NF_SmartDownloadBinaryInitForMass.do";
 const FUS_USER_AGENT = "SMART 2.0";
 const MODERN_NONCE_KEY = "vicopx7dqu06emacgpnpy8j8zwhduwlh";
+const MODERN_AUTH_KEY = "9u7qab84rpc16gvk";
+
+function base64ToBytes(value) {
+  const binary = atob(String(value || ""));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function bytesToBase64(value) {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function unpadPkcs7(value) {
+  if (!value.length) return value;
+  const padding = value[value.length - 1];
+  if (padding < 1 || padding > 16 || padding > value.length) return value;
+  for (let index = value.length - padding; index < value.length; index += 1) {
+    if (value[index] !== padding) return value;
+  }
+  return value.slice(0, value.length - padding);
+}
+
+function padPkcs7(value) {
+  const padding = 16 - (value.length % 16 || 16) || 16;
+  const padded = new Uint8Array(value.length + padding);
+  padded.set(value);
+  padded.fill(padding, value.length);
+  return padded;
+}
 
 async function decryptModernNonce(value) {
   try {
-    const encoded = String(value || "").slice(0, 16).padEnd(16, "0");
-    const binary = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
-    if (binary.length !== 16 || !globalThis.crypto?.subtle) return "";
+    const binary = base64ToBytes(value);
+    if (!binary.length || binary.length % 16 !== 0 || !globalThis.crypto?.subtle) return "";
     const key = new TextEncoder().encode(MODERN_NONCE_KEY);
     const cryptoKey = await globalThis.crypto.subtle.importKey("raw", key, "AES-CBC", false, ["decrypt"]);
     const plain = await globalThis.crypto.subtle.decrypt({ name: "AES-CBC", iv: key.slice(0, 16) }, cryptoKey, binary);
-    return new TextDecoder().decode(plain);
+    return new TextDecoder().decode(unpadPkcs7(new Uint8Array(plain)));
+  } catch {
+    return "";
+  }
+}
+
+async function makeModernFusSignature(nonce) {
+  const value = String(nonce || "");
+  if (value.length < 16 || !globalThis.crypto?.subtle) return "";
+  try {
+    const keyPrefix = Array.from({ length: 16 }, (_, index) => MODERN_NONCE_KEY[value.charCodeAt(index) % 16]).join("");
+    const key = new TextEncoder().encode(`${keyPrefix}${MODERN_AUTH_KEY}`);
+    const cryptoKey = await globalThis.crypto.subtle.importKey("raw", key, "AES-CBC", false, ["encrypt"]);
+    const encrypted = await globalThis.crypto.subtle.encrypt(
+      { name: "AES-CBC", iv: key.slice(0, 16) },
+      cryptoKey,
+      padPkcs7(new TextEncoder().encode(value))
+    );
+    return bytesToBase64(new Uint8Array(encrypted));
   } catch {
     return "";
   }
@@ -319,6 +367,28 @@ function binaryInformBody(model, csc, version, nonce) {
   ].join("\n");
 }
 
+function binaryInitBody(fileName, version, csc, modelType, nonce) {
+  const checkInput = String(fileName || "").slice(-25, -9);
+  return [
+    "<FUSMsg>",
+    "  <FUSHdr>",
+    `    ${textNode("ProtoVer", "1")}`,
+    `    ${textNode("SessionID", "0")}`,
+    `    ${textNode("MsgID", "1")}`,
+    "  </FUSHdr>",
+    "  <FUSBody>",
+    "    <Put>",
+    `      ${dataNode("BINARY_NAME", fileName)}`,
+    `      ${dataNode("BINARY_SW_VERSION", version)}`,
+    `      ${dataNode("DEVICE_LOCAL_CODE", csc)}`,
+    `      ${dataNode("DEVICE_MODEL_TYPE", modelType)}`,
+    `      ${dataNode("LOGIC_CHECK", logicCheck(checkInput, nonce))}`,
+    "    </Put>",
+    "  </FUSBody>",
+    "</FUSMsg>"
+  ].join("\n");
+}
+
 function fourPartFirmwareVersion(value) {
   const normalized = normalizeFirmwareVersion(value);
   const parts = normalized.split("/").map((part) => part.trim()).filter(Boolean);
@@ -487,13 +557,14 @@ export async function makeSignatureHash(nonce, signature) {
   return md5(`${a}:FUS:${b}`);
 }
 
-async function authHeader(lane, signature = "", options = {}) {
+async function authHeader(lane, signature = "") {
   const sig = String(signature || "").trim();
   const serverNonce = lane.session?.serverNonce || lane.session?.nonce || "";
   if (sig) {
-    return `FUS nonce="${serverNonce}", signature="${await makeSignatureHash(serverNonce, sig)}", nc="00000001", type="auth", realm="interface"`;
+    const logicNonce = lane.session?.nonce || serverNonce;
+    return `FUS nonce="${serverNonce}", signature="${await makeSignatureHash(logicNonce, sig)}", nc="00000001", type="auth", realm="interface"`;
   }
-  return `FUS nonce="${options.includeNonce === false ? "" : serverNonce}", signature="${lane.session?.auth || ""}", nc="", type="", realm=""`;
+  return `FUS nonce="${serverNonce}", signature="${lane.session?.auth || ""}", nc="", type="", realm=""`;
 }
 
 function isAuthFailure(response, body) {
@@ -526,9 +597,10 @@ async function postFus(path, data, authorization, lane, options = {}) {
     if (cookie) lane.session.cookie = cookie;
     if (nonce) {
       const decrypted = await decryptModernNonce(nonce);
+      const logicalNonce = decrypted || nonce;
       lane.session.serverNonce = nonce;
-      lane.session.nonce = decrypted || nonce;
-      lane.session.auth = lane.session.nonce;
+      lane.session.nonce = logicalNonce;
+      lane.session.auth = await makeModernFusSignature(logicalNonce);
       lane.session.createdAt = Date.now();
     }
   }
@@ -550,7 +622,7 @@ export async function generateNonce(env, options = {}) {
     serverNonce: nonce,
     nonce: decrypted,
     cookie,
-    auth: decrypted,
+    auth: await makeModernFusSignature(decrypted),
     createdAt: Date.now()
   };
   return lane.session;
@@ -586,7 +658,7 @@ async function ensureNonceWithOptions(env, lane, options = {}) {
 
 async function makeFusRequestUnlocked(env, lane, requestPath, data, signature, retry, options) {
   await ensureNonceWithOptions(env, lane, options);
-  const authorization = await authHeader(lane, signature, options);
+  const authorization = await authHeader(lane, signature);
   const requestStartedAt = Date.now();
   const requestData = typeof options.bodyFactory === "function"
     ? await options.bodyFactory(lane.session)
@@ -654,7 +726,7 @@ export async function makeFusRequest(env, requestPath, data, signature, retry = 
 export async function querySmartHistory(env, model, csc, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const body = smartHistoryBody(normalizedModel, normalizedCsc);
-  const xml = await makeFusRequest(env, HISTORY_PATH, body, normalizedModel, true, {
+  const xml = await makeFusRequest(env, HISTORY_PATH, body, "", true, {
     ...options,
     model: normalizedModel,
     csc: normalizedCsc
@@ -683,7 +755,6 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
     role: "admin",
     model: normalizedModel,
     csc: normalizedCsc,
-    includeNonce: false,
     bodyFactory: (session) => binaryInformBody(
       normalizedModel,
       normalizedCsc,
@@ -703,6 +774,23 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
   const modelPath = tagValue(xml, "MODEL_PATH");
   const byteSize = Number(tagValue(xml, "BINARY_BYTE_SIZE") || 0);
   if (!fileName || !modelPath) throw new Error("Samsung FUS did not return a firmware bundle");
+  const modelType = tagValue(xml, "DEVICE_MODEL_TYPE");
+  if (!modelType) throw new Error("Samsung FUS did not return the firmware model type");
+  const initXml = await makeFusRequest(env, BINARY_INIT_PATH, "", "", true, {
+    ...options,
+    role: "admin",
+    model: normalizedModel,
+    csc: normalizedCsc,
+    bodyFactory: (session) => binaryInitBody(fileName, fusVersion, normalizedCsc, modelType, session?.nonce || ""),
+    timing
+  });
+  const initStatus = tagValue(initXml, "Status");
+  if (initStatus && initStatus !== "200" && initStatus !== "S00") {
+    const error = new Error(`Samsung FUS binary init returned ${initStatus}`);
+    error.code = "FUS_BINARY_INIT_FAILED";
+    error.status = Number(initStatus) || 0;
+    throw error;
+  }
   const lane = getLane("admin");
   const serverNonce = lane.session?.serverNonce || "";
   const auth = lane.session?.auth || "";
@@ -713,7 +801,8 @@ export async function resolveOfficialFirmwareDownload(env, model, csc, version, 
     sourceUrl,
     sourceHeaders: {
       authorization: `FUS nonce="${serverNonce}", signature="${auth}", nc="", type="", realm=""`,
-      "user-agent": FUS_USER_AGENT
+      "user-agent": FUS_USER_AGENT,
+      ...(lane.session?.cookie ? { cookie: lane.session.cookie } : {})
     },
     fileName,
     size: Number.isFinite(byteSize) ? byteSize : 0,

@@ -50,10 +50,21 @@ export function createFirmwareDownload(env, payload, requestedBy) {
   });
 }
 
+export function previewFirmwareDownload(env, payload) {
+  return downloadApiRequest(env, "/api/v1/downloads/preview", {
+    method: "POST",
+    body: payload
+  });
+}
+
 export function getFirmwareDownload(env, id) {
   return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}`);
 }
 
 export function cancelFirmwareDownload(env, id) {
   return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}`, { method: "DELETE" });
+}
+
+export function deleteFirmwareDownload(env, id) {
+  return downloadApiRequest(env, `/api/v1/downloads/${encodeURIComponent(String(id || ""))}/delete`, { method: "POST" });
 }

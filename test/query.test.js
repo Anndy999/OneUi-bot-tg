@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareVersion } from "../src/fus.js";
+import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareDownload, resolveOfficialFirmwareVersion } from "../src/fus.js";
 import { rankOfficialCscOptions } from "../src/csc-suggestions.js";
 import {
   clearFirmwareMemoryCaches,
@@ -226,6 +226,36 @@ function nonceResponse() {
     }
   });
 }
+
+test("Samsung FUS download resolution signs BinaryInform and completes BinaryInit", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const value = String(url);
+    calls.push({ url: value, headers: init.headers || {}, body: String(init.body || "") });
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("BinaryInform")) {
+      assert.match(String(init.headers?.authorization || ""), /^FUS nonce="0123456789abcdef0123456789abcdef", signature=".+"/);
+      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status><BINARY_NAME>SM-S9480_CHC_TEST.zip</BINARY_NAME><MODEL_PATH>path/firmware.zip</MODEL_PATH><BINARY_BYTE_SIZE>5</BINARY_BYTE_SIZE><DEVICE_MODEL_TYPE>SM-S9480</DEVICE_MODEL_TYPE></Results></FUSBody></FUSMsg>", { status: 200 });
+    }
+    if (value.includes("BinaryInit")) {
+      assert.match(String(init.headers?.authorization || ""), /^FUS nonce="0123456789abcdef0123456789abcdef", signature=".+"/);
+      assert.match(String(init.body || ""), /BINARY_NAME/);
+      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status></Results></FUSBody></FUSMsg>", { status: 200 });
+    }
+    throw new Error(`Unexpected FUS request: ${value}`);
+  };
+  const result = await resolveOfficialFirmwareDownload(
+    env,
+    "SM-S9480",
+    "CHC",
+    "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1"
+  );
+  assert.equal(result.fileName, "SM-S9480_CHC_TEST.zip");
+  assert.equal(result.size, 5);
+  assert.equal(calls.filter((entry) => entry.url.includes("BinaryInform")).length, 1);
+  assert.equal(calls.filter((entry) => entry.url.includes("BinaryInit")).length, 1);
+  assert.equal(result.sourceHeaders.cookie, "JSESSIONID=test-session");
+});
 
 const env = {
   HISTORY_REQUEST_TIMEOUT_MS: "1000",
@@ -2939,7 +2969,7 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
 
-test("administrator can start a VPS firmware download from a command", async () => {
+test("administrator receives a Samsung download preview before a VPS task is created", async () => {
   const kv = memoryKv();
   const env = {
     FIRMWARE_KV: kv,
@@ -2954,18 +2984,28 @@ test("administrator can start a VPS firmware download from a command", async () 
     const value = String(url);
     const body = init.body ? JSON.parse(String(init.body)) : {};
     payloads.push({ url: value, body, headers: init.headers || {} });
-    if (value.includes("download.local:8788")) {
+    if (value.endsWith("/api/v1/downloads/preview")) {
       assert.equal(init.headers["x-download-api-key"], "local-test-key");
       return new Response(JSON.stringify({
         ok: true,
-        download: {
-          id: "job-1",
-          state: "queued",
+        preview: {
           model: "SM-S9380",
           csc: "CHC",
-          version: "S9380XXU1/S9380CHC/S9380MODEM"
+          version: "S9380XXU1/S9380CHC/S9380MODEM",
+          originalName: "SM-S9380_CHC_TEST.zip",
+          totalBytes: 123456
         }
       }), { status: 202, headers: { "content-type": "application/json" } });
+    }
+    if (value.endsWith("/api/v1/downloads")) {
+      return new Response(JSON.stringify({ ok: true, download: {
+        id: "job-1", state: "queued", model: "SM-S9380", csc: "CHC", version: "S9380XXU1/S9380CHC/S9380MODEM", percent: 0
+      } }), { status: 202, headers: { "content-type": "application/json" } });
+    }
+    if (value.endsWith("/api/v1/downloads/job-1")) {
+      return new Response(JSON.stringify({ ok: true, download: {
+        id: "job-1", state: "queued", model: "SM-S9380", csc: "CHC", version: "S9380XXU1/S9380CHC/S9380MODEM", percent: 0
+      } }), { status: 200, headers: { "content-type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: true, result: { message_id: payloads.length } }), {
       status: 200,
@@ -2983,14 +3023,25 @@ test("administrator can start a VPS firmware download from a command", async () 
   }), env, { waitUntil(promise) { waits.push(promise); } });
   assert.equal(response.status, 200);
   for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
-  const request = payloads.find((entry) => entry.url.endsWith("/api/v1/downloads"));
+  const request = payloads.find((entry) => entry.url.endsWith("/api/v1/downloads/preview"));
   assert.ok(request);
   assert.deepEqual(request.body, {
     model: "SM-S9380",
     csc: "CHC",
     version: "S9380XXU1/S9380CHC/S9380MODEM"
   });
-  assert.ok(payloads.some((entry) => entry.body.text?.includes("下载任务已创建")));
+  assert.equal(payloads.some((entry) => entry.url.endsWith("/api/v1/downloads")), false);
+  assert.ok(payloads.some((entry) => entry.body.text?.includes("固件下载预览")));
+  await worker.fetch(new Request("https://worker.example/telegram", {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-Telegram-Bot-Api-Secret-Token": env.WEBHOOK_SECRET },
+    body: JSON.stringify({
+      update_id: 700003,
+      callback_query: { id: "confirm-1", from: { id: 991 }, data: "admin:dl:confirm", message: { message_id: 2, chat: { id: 991 } } }
+    })
+  }), env, { waitUntil(promise) { waits.push(promise); } });
+  for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
+  assert.ok(payloads.some((entry) => entry.url.endsWith("/api/v1/downloads")));
 });
 
 test("owner can add persistent administrators without changing the owner identity", async () => {

@@ -119,7 +119,12 @@ function jsonSafe(value) {
 
 function publicJob(job) {
   const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, filePath: _filePath, ...safe } = job;
-  return { ...safe, percent: safe.totalBytes ? Math.min(100, Math.floor((safe.bytes / safe.totalBytes) * 100)) : null };
+  const percent = safe.totalBytes ? Math.min(100, Math.floor((safe.bytes / safe.totalBytes) * 100)) : null;
+  const speedBytesPerSecond = Math.max(0, Number(safe.speedBytesPerSecond || 0));
+  const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
+    ? Math.max(0, Math.ceil((safe.totalBytes - Number(safe.bytes || 0)) / speedBytesPerSecond))
+    : null;
+  return { ...safe, percent, speedBytesPerSecond, etaSeconds };
 }
 
 function sourceUrlHash(sourceUrl) {
@@ -258,6 +263,30 @@ export class FirmwareDownloadService {
     }
   }
 
+  async preview(payload = {}) {
+    if (!this.ready) throw new Error("download service is not ready");
+    if (!(payload.model && payload.csc && payload.version)) {
+      throw new Error("model, csc, and version are required for a Samsung download preview");
+    }
+    const free = await this.freeBytes();
+    if (free < this.config.minFreeBytes) throw new Error("insufficient free disk space for a new download");
+    const resolved = await this.resolveImpl(this.fusEnv, payload.model, payload.csc, payload.version, { role: "admin" });
+    const size = Math.max(0, Number(resolved.size || 0));
+    if (size > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
+    if (size && free - size < this.config.minFreeBytes) {
+      throw new Error("download would breach the configured free disk reserve");
+    }
+    return {
+      model: String(resolved.model || payload.model).toUpperCase(),
+      csc: String(resolved.csc || payload.csc).toUpperCase(),
+      version: String(resolved.version || payload.version),
+      originalName: safeName(resolved.fileName, "firmware.bin"),
+      totalBytes: size,
+      source: String(resolved.source || "Samsung FUS"),
+      freeBytes: free
+    };
+  }
+
   async createDownload(payload = {}, requestedBy = "admin") {
     if (!this.ready) throw new Error("download service is not ready");
     const hasSourceUrl = Boolean(String(payload.sourceUrl || "").trim());
@@ -291,6 +320,7 @@ export class FirmwareDownloadService {
       requestedBy: String(requestedBy || "admin").slice(0, 80),
       bytes: 0,
       totalBytes: 0,
+      speedBytesPerSecond: 0,
       createdAt: new Date(this.now()).toISOString(),
       updatedAt: new Date(this.now()).toISOString()
     };
@@ -346,6 +376,23 @@ export class FirmwareDownloadService {
     return true;
   }
 
+  async remove(id) {
+    const job = this.jobs.get(String(id));
+    if (!job) return false;
+    if (["queued", "downloading"].includes(job.state)) {
+      throw new Error("terminate the active download before deleting it");
+    }
+    if (this.queue) {
+      const queued = await this.queue.getJob(job.id);
+      await queued?.remove().catch(() => {});
+    }
+    await rm(join(this.config.dir, `${job.id}.part`), { force: true });
+    if (job.fileName) await rm(join(this.config.dir, safeName(job.fileName)), { force: true });
+    this.jobs.delete(job.id);
+    await this.persist();
+    return true;
+  }
+
   async runJob(queueJob) {
     const job = this.jobs.get(String(queueJob.data?.id));
     if (!job || job.state === "cancelled" || job.state === "completed") return;
@@ -354,6 +401,7 @@ export class FirmwareDownloadService {
     this.controllers.set(job.id, controller);
     try {
       job.state = "downloading";
+      job.downloadStartedAt = new Date(this.now()).toISOString();
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
       let resolved = null;
@@ -390,6 +438,9 @@ export class FirmwareDownloadService {
             writer.once("error", rejectWrite);
           });
           job.bytes = received;
+          const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
+          const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
+          job.speedBytesPerSecond = Math.max(0, Math.floor(received / elapsedSeconds));
           if (this.now() - lastPersist > 1000) {
             lastPersist = this.now();
             job.updatedAt = new Date(this.now()).toISOString();
@@ -407,6 +458,7 @@ export class FirmwareDownloadService {
       await rename(partPath, finalPath);
       job.bytes = received;
       job.totalBytes = advertised || received;
+      job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
       job.state = "completed";
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
@@ -489,6 +541,15 @@ export function buildDownloadApp({ app = Fastify({ logger: false }), service, ve
     if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
     return { ok: true, downloads: service.list() };
   });
+  app.post("/api/v1/downloads/preview", async (request, reply) => {
+    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
+    try {
+      return { ok: true, preview: await service.preview(request.body || {}) };
+    } catch (error) {
+      reply.code(400);
+      return { ok: false, error: String(error?.message || error).slice(0, 240) };
+    }
+  });
   app.post("/api/v1/downloads", async (request, reply) => {
     if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
     try {
@@ -512,6 +573,17 @@ export function buildDownloadApp({ app = Fastify({ logger: false }), service, ve
     if (!cancelled) { reply.code(404); return { ok: false, error: "Download not found or already finished" }; }
     return { ok: true, cancelled: true };
   });
+  app.post("/api/v1/downloads/:id/delete", async (request, reply) => {
+    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
+    try {
+      const deleted = await service.remove(request.params.id);
+      if (!deleted) { reply.code(404); return { ok: false, error: "Download not found" }; }
+      return { ok: true, deleted: true };
+    } catch (error) {
+      reply.code(400);
+      return { ok: false, error: String(error?.message || error).slice(0, 240) };
+    }
+  });
   app.get("/files/:id", async (request, reply) => {
     if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
     try {
@@ -534,7 +606,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.16.1") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

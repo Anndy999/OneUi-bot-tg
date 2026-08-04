@@ -96,6 +96,48 @@ test("download API rejects non-official and non-HTTPS URLs", async () => {
   }
 });
 
+test("download preview verifies Samsung metadata without queuing a job, and terminal jobs can be removed", async () => {
+  const dir = await tempDir();
+  try {
+    let resolves = 0;
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => {
+        resolves += 1;
+        return {
+          sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip",
+          sourceHeaders: { authorization: "FUS test" },
+          fileName: "SM-S9380_CHC_TEST.zip",
+          size: 5
+        };
+      },
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": "5" }),
+        body: (async function* body() { yield Buffer.from("hello"); })()
+      })
+    }).init({ startQueue: false });
+
+    const preview = await service.preview({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" });
+    assert.equal(preview.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(preview.totalBytes, 5);
+    assert.equal(service.list().length, 0);
+    assert.equal(Object.hasOwn(preview, "sourceHeaders"), false);
+
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    assert.equal(service.get(job.id).state, "completed");
+    assert.ok(resolves >= 2);
+    assert.equal(await service.remove(job.id), true);
+    assert.equal(service.get(job.id), null);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("download service resolves a Samsung FUS job inside the VPS worker", async () => {
   const dir = await tempDir();
   try {

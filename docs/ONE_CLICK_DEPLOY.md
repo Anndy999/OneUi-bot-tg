@@ -127,17 +127,22 @@ The API accepts only official Samsung/FUS hosts, allows the Samsung FUS cloud
 HTTP endpoint only for the exact official host, allows one active download,
 preserves a configured free-space reserve, and cleans stale
 partial/completed files. The Telegram admin menu resolves the exact Samsung
-firmware version and starts the download without asking an administrator to
-copy a temporary FUS URL. Public download links remain a separate later step.
+firmware first and shows its version, filename, and size. The administrator
+must explicitly confirm before the VPS starts the download; no temporary FUS
+URL is copied into Telegram. Public download links remain a separate later step.
 
 Current administrator API surface:
 
 - `GET /health` — local health and free-space status, no API key;
+- `POST /api/v1/downloads/preview` — verify an official Samsung firmware and
+  return safe metadata only; it never queues a download;
 - `POST /api/v1/downloads` — create a download with
   `X-Download-Api-Key` and `model`, `csc`, `version` JSON fields. A direct
   `sourceUrl` remains supported for verified official sources;
 - `GET /api/v1/downloads` or `/api/v1/downloads/<id>` — list/status;
 - `DELETE /api/v1/downloads/<id>` — cancel a queued or active download;
+- `POST /api/v1/downloads/<id>/delete` — delete a finished task and its saved
+  file after an administrator-side confirmation;
 - `GET /files/<id>` — retrieve a completed file, still protected by the same
   administrator key.
 
