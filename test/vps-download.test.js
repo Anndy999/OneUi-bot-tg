@@ -57,6 +57,8 @@ test("VPS FUS resolver uses the Bifrost-compatible authentication flow without e
   assert.equal(result.fileName, "SM-S9480_TEST.zip.enc4");
   assert.equal(result.decryption.mode, "enc4");
   assert.equal(result.crc32, "0");
+  assert.match(result.sourceUrl, /file=path\/SM-S9480_TEST\.zip\.enc4$/);
+  assert.doesNotMatch(result.sourceUrl, /%2F/i);
   assert.equal(calls.filter((call) => call.url.includes("BinaryInform")).length, 1);
   assert.equal(calls.filter((call) => call.url.includes("BinaryInit")).length, 1);
   assert.equal(Object.hasOwn(result, "sourceHeaders"), true);

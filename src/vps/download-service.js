@@ -717,7 +717,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.2") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.3") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };

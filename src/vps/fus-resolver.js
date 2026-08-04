@@ -188,6 +188,14 @@ function decryption(fileName, version, model, csc, logicValue) {
   return { mode: "enc4", keySeed };
 }
 
+function officialDownloadPath(modelPath, fileName) {
+  // FUS expects this as a slash-separated path. Encoding the whole value turns
+  // slashes into %2F, which Samsung's download endpoint responds to with 404.
+  const path = `${String(modelPath || "")}${String(fileName || "")}`;
+  if (!/^[A-Za-z0-9._/-]+$/.test(path)) throw new Error("Samsung FUS returned an invalid firmware path");
+  return path;
+}
+
 export async function resolveVpsOfficialFirmwareDownload(env, model, csc, version, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const fusVersion = await resolveOfficialFirmwareVersion(env, normalizedModel, normalizedCsc, version, options);
@@ -201,11 +209,12 @@ export async function resolveVpsOfficialFirmwareDownload(env, model, csc, versio
   const modelType = tagValue(inform, "DEVICE_MODEL_TYPE");
   const resolvedVersion = tagValue(inform, "BINARY_SW_VERSION") || tagValue(inform, "LATEST_FW_VERSION") || fusVersion;
   if (!fileName || !modelPath || !modelType) throw new Error("Samsung FUS did not return a firmware bundle");
+  const downloadPath = officialDownloadPath(modelPath, fileName);
   const init = await request(session, BINARY_INIT_PATH, binaryInitBody(fileName, fusVersion, normalizedCsc, modelType, session.nonce), fetchImpl, options.signal);
   const initStatus = tagValue(init, "Status");
   if (initStatus && initStatus !== "200" && initStatus !== "S00") throw new Error(`Samsung FUS binary init returned ${initStatus}`);
   return {
-    sourceUrl: `http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=${encodeURIComponent(`${modelPath}${fileName}`)}`,
+    sourceUrl: `http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=${downloadPath}`,
     sourceHeaders: { authorization: authorization(session), "user-agent": FUS_USER_AGENT, ...(session.cookie ? { cookie: session.cookie } : {}) },
     fileName,
     size: Number(tagValue(inform, "BINARY_BYTE_SIZE") || 0),
