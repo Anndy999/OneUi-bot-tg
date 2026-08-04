@@ -748,6 +748,13 @@ export async function querySmartHistory(env, model, csc, options = {}) {
     model: normalizedModel,
     csc: normalizedCsc
   });
+  const status = tagValue(xml, "Status");
+  if (status && status !== "200" && status !== "S00") {
+    const error = new Error(`SmartHistory returned ${status}`);
+    error.code = "FUS_SMART_HISTORY_STATUS";
+    error.status = status;
+    throw error;
+  }
   const parseStartedAt = Date.now();
   const parsed = parseSmartHistory(xml, normalizedModel, normalizedCsc);
   if (options.timing && typeof options.timing === "object") {
@@ -964,7 +971,11 @@ export function parseSmartHistory(xml, model, csc) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const rows = parseSmartHistoryRows(xml, normalizedModel, normalizedCsc);
 
-  if (!rows.length) throw new Error("SmartHistory has no usable firmware history");
+  if (!rows.length) {
+    const error = new Error("SmartHistory has no usable firmware history");
+    error.code = "FUS_SMART_HISTORY_EMPTY";
+    throw error;
+  }
 
   // Never allow a higher sequence from another CSC to masquerade as the
   // requested region. Prefer exact local CSC, then buyer CSC, then generic rows.

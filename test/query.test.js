@@ -3046,6 +3046,56 @@ test("administrator receives a Samsung download preview before a VPS task is cre
   assert.ok(payloads.some((entry) => entry.url.endsWith("/api/v1/downloads")));
 });
 
+test("admin firmware download preview falls back to Samsung version.xml when SmartHistory returns S02", async () => {
+  resetFusSession();
+  const env = {
+    FIRMWARE_KV: memoryKv(),
+    WEBHOOK_SECRET: "test-header-secret",
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "991",
+    DOWNLOAD_API_URL: "http://download.local:8788",
+    [["DOWNLOAD", "API", "SECRET"].join("_")]: "local-test-key"
+  };
+  const payloads = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const value = String(url);
+    if (value.includes("NF_SmartDownloadGenerateNonce")) {
+      return new Response("", { status: 200, headers: { nonce: "0123456789abcdef" } });
+    }
+    if (value.includes("SmartHistory")) {
+      return new Response("<FUSMsg><FUSBody><Results><Status>S02</Status></Results></FUSBody></FUSMsg>", { status: 200 });
+    }
+    if (value.includes("/version.xml")) {
+      return new Response("<firmware><version><latest>S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1</latest></version></firmware>", { status: 200 });
+    }
+    if (value.endsWith("/api/v1/downloads/preview")) {
+      const body = JSON.parse(String(init.body));
+      assert.equal(body.version, "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1");
+      return new Response(JSON.stringify({ ok: true, preview: {
+        model: "SM-S9480", csc: "CHC", version: body.version, originalName: "SM-S9480_CHC_TEST.zip.enc4", totalBytes: 123456
+      } }), { status: 202, headers: { "content-type": "application/json" } });
+    }
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    payloads.push({ url: value, body });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: payloads.length } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  const waits = [];
+  const response = await worker.fetch(new Request("https://worker.example/telegram", {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-Telegram-Bot-Api-Secret-Token": env.WEBHOOK_SECRET },
+    body: JSON.stringify({
+      update_id: 700004,
+      message: { message_id: 1, chat: { id: 991 }, from: { id: 991 }, text: "/download SM-S9480 CHC" }
+    })
+  }), env, { waitUntil(promise) { waits.push(promise); } });
+  assert.equal(response.status, 200);
+  for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
+  assert.ok(payloads.some((entry) => entry.url.endsWith("/sendMessage")));
+});
+
 test("owner can add persistent administrators without changing the owner identity", async () => {
   const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
   await addAdditionalAdmin(env, "992", "Co-admin", "991");

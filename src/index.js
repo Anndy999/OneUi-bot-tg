@@ -25,7 +25,7 @@ import {
   setRolloutChainSettings,
   setRolloutChainStage
 } from "./rollout-chain.js";
-import { querySmartHistory } from "./fus.js";
+import { querySmartHistory, resolveOfficialFirmwareVersion } from "./fus.js";
 import {
   cancelFirmwareDownload,
   createFirmwareDownload,
@@ -170,7 +170,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.17.1";
+const APP_VERSION = "2.17.2";
 
 export default {
   async fetch(request, env, ctx) {
@@ -1617,6 +1617,21 @@ function parseAdminDownloadInput(text) {
   return { model: parsed.model, csc: parsed.csc, version };
 }
 
+function canFallbackToOfficialVersionMetadata(error) {
+  return ["FUS_SMART_HISTORY_EMPTY", "FUS_SMART_HISTORY_STATUS"].includes(String(error?.code || ""));
+}
+
+async function resolveAdminDownloadVersion(env, request) {
+  if (request.version) return request.version;
+  try {
+    const history = await querySmartHistory(env, request.model, request.csc, { role: "admin" });
+    return history.latest;
+  } catch (error) {
+    if (!canFallbackToOfficialVersionMetadata(error)) throw error;
+    return resolveOfficialFirmwareVersion(env, request.model, request.csc, "", { role: "admin" });
+  }
+}
+
 async function legacyStartAdminFirmwareDownload(env, chatId, request, options = {}) {
   const lang = await getUserLanguage(env, chatId);
   const messageId = options.messageId || null;
@@ -1627,11 +1642,7 @@ async function legacyStartAdminFirmwareDownload(env, chatId, request, options = 
     ? safeEditOrSend(env, chatId, messageId, progress)
     : sendTelegramMessage(env, chatId, progress));
   try {
-    let version = request.version;
-    if (!version) {
-      const result = await querySmartHistory(env, request.model, request.csc, { role: "admin" });
-      version = result.latest;
-    }
+    const version = await resolveAdminDownloadVersion(env, request);
     const created = await createFirmwareDownload(env, {
       model: request.model,
       csc: request.csc,
@@ -1739,11 +1750,7 @@ async function prepareAdminFirmwareDownload(env, chatId, request, options = {}) 
     : `正在验证三星官方固件…\n\n${request.model} ${request.csc}`;
   await (messageId ? safeEditOrSend(env, chatId, messageId, checking) : sendTelegramMessage(env, chatId, checking));
   try {
-    let version = request.version;
-    if (!version) {
-      const history = await querySmartHistory(env, request.model, request.csc, { role: "admin" });
-      version = history.latest;
-    }
+    const version = await resolveAdminDownloadVersion(env, request);
     const response = await previewFirmwareDownload(env, { model: request.model, csc: request.csc, version });
     if (!response.ok || !response.preview) throw new Error(response.error || "Samsung did not return a downloadable firmware");
     const preview = response.preview;

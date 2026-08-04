@@ -5,6 +5,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveVpsOfficialFirmwareDownload } from "../src/vps/fus-resolver.js";
 import {
   FirmwareDownloadService,
   buildDownloadApp,
@@ -31,6 +32,34 @@ test("production download server refuses to start without Redis", async () => {
     () => startDownloadServer({ env: { DOWNLOAD_API_SECRET: "test-download-secret" } }),
     /REDIS_URL is required/
   );
+});
+
+test("VPS FUS resolver uses the Bifrost-compatible authentication flow without exposing it", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const value = String(url);
+    calls.push({ url: value, headers: init.headers || {}, body: String(init.body || "") });
+    if (value.includes("GenerateNonce")) {
+      return new Response("", { status: 200, headers: { nonce: "0123456789abcdef", "set-cookie": "JSESSIONID=test-session; Path=/; Secure" } });
+    }
+    if (value.includes("BinaryInform")) {
+      assert.match(String(init.headers.authorization || ""), /^FUS nonce="0123456789abcdef", signature="[0-9a-f]+"/);
+      assert.match(String(init.body), /BINARY_SW_VERSION/);
+      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status><BINARY_SW_VERSION>S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1</BINARY_SW_VERSION></Results><Put><BINARY_NAME>SM-S9480_TEST.zip.enc4</BINARY_NAME><MODEL_PATH>path/</MODEL_PATH><BINARY_BYTE_SIZE>32</BINARY_BYTE_SIZE><BINARY_CRC>0</BINARY_CRC><DEVICE_MODEL_TYPE>SM-S9480</DEVICE_MODEL_TYPE><LOGIC_VALUE_FACTORY>0123456789abcdef0123456789abcdef</LOGIC_VALUE_FACTORY></Put></FUSBody></FUSMsg>", { status: 200 });
+    }
+    if (value.includes("BinaryInit")) {
+      assert.match(String(init.body), /BINARY_NAME/);
+      return new Response("<FUSMsg><FUSBody><Results><Status>200</Status></Results></FUSBody></FUSMsg>", { status: 200 });
+    }
+    throw new Error(`Unexpected FUS request: ${value}`);
+  };
+  const result = await resolveVpsOfficialFirmwareDownload({}, "SM-S9480", "CHC", "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1", { fetchImpl });
+  assert.equal(result.fileName, "SM-S9480_TEST.zip.enc4");
+  assert.equal(result.decryption.mode, "enc4");
+  assert.equal(result.crc32, "0");
+  assert.equal(calls.filter((call) => call.url.includes("BinaryInform")).length, 1);
+  assert.equal(calls.filter((call) => call.url.includes("BinaryInit")).length, 1);
+  assert.equal(Object.hasOwn(result, "sourceHeaders"), true);
 });
 
 test("download API requires an admin key and serves only completed files", async () => {
@@ -91,6 +120,34 @@ test("download API rejects non-official and non-HTTPS URLs", async () => {
     }).init({ startQueue: false });
     await assert.rejects(() => service.create({ sourceUrl: "http://example.com/file.bin" }), /HTTPS/);
     await assert.rejects(() => service.create({ sourceUrl: "https://example.com/file.bin" }), /official Samsung allowlist/);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download service rejects a Samsung file whose advertised CRC32 does not match", async () => {
+  const dir = await tempDir();
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => ({
+        sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip",
+        fileName: "SM-S9380_CHC_TEST.zip",
+        size: 5,
+        crc32: "0"
+      }),
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": "5" }),
+        body: (async function* body() { yield Buffer.from("hello"); })()
+      })
+    }).init({ startQueue: false });
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await assert.rejects(() => service.runJob({ data: { id: job.id } }), /CRC verification failed/);
+    assert.equal(service.get(job.id).state, "failed");
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

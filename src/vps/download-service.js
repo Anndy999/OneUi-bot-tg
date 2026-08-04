@@ -8,11 +8,16 @@ import Fastify from "fastify";
 import { Queue, Worker } from "bullmq";
 import Redis from "ioredis";
 import { constantTimeSecretEquals } from "./config.js";
-import { resolveOfficialFirmwareDownload } from "../fus.js";
+import { resolveVpsOfficialFirmwareDownload } from "./fus-resolver.js";
 
 const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
 const JOB_STATES = new Set(["queued", "downloading", "decrypting", "completed", "failed", "cancelled"]);
+const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+  return value >>> 0;
+});
 
 function text(value, fallback = "") {
   const result = String(value ?? fallback).trim();
@@ -118,7 +123,7 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, filePath: _filePath, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const progressBytes = decrypting ? Number(safe.decryptBytes || 0) : Number(safe.bytes || 0);
   const percent = safe.state === "completed" ? 100 : safe.totalBytes
@@ -157,6 +162,18 @@ async function writeChunk(writer, chunk) {
   });
 }
 
+function updateCrc32(current, chunk) {
+  let crc = current >>> 0;
+  for (const byte of chunk) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return crc >>> 0;
+}
+
+function expectedCrc32(value) {
+  const text = String(value || "").trim();
+  if (!/^-?\d+$/.test(text)) return null;
+  return Number(text) >>> 0;
+}
+
 function connectionOptions(redisUrl) {
   const url = new URL(redisUrl);
   const options = {
@@ -173,7 +190,7 @@ function connectionOptions(redisUrl) {
 }
 
 export class FirmwareDownloadService {
-  constructor({ config = createDownloadConfig(), logger = console, fetchImpl = fetch, lookupImpl = lookup, resolveImpl = resolveOfficialFirmwareDownload, now = () => Date.now(), fusEnv = process.env } = {}) {
+  constructor({ config = createDownloadConfig(), logger = console, fetchImpl = fetch, lookupImpl = lookup, resolveImpl = resolveVpsOfficialFirmwareDownload, now = () => Date.now(), fusEnv = process.env } = {}) {
     this.config = config;
     this.logger = logger;
     this.fetchImpl = fetchImpl;
@@ -479,6 +496,7 @@ export class FirmwareDownloadService {
         job.sourceHeaders = resolved.sourceHeaders || null;
         job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
         job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
+        job.expectedCrc32 = expectedCrc32(resolved.crc32);
         job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
         job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
         if (resolved.version) job.version = resolved.version;
@@ -492,6 +510,7 @@ export class FirmwareDownloadService {
       job.totalBytes = advertised;
       const writer = await import("node:fs").then(({ createWriteStream }) => createWriteStream(partPath, { flags: "w", mode: 0o640 }));
       let received = 0;
+      let crc32 = 0xffffffff;
       let lastPersist = 0;
       try {
         if (!response.body) throw new Error("official source returned an empty body");
@@ -502,6 +521,7 @@ export class FirmwareDownloadService {
             throw new Error("download stopped to preserve the configured free disk space");
           }
           await writeChunk(writer, chunk);
+          crc32 = updateCrc32(crc32, chunk);
           job.bytes = received;
           const startedAt = Date.parse(job.downloadStartedAt || job.createdAt || "") || this.now();
           const elapsedSeconds = Math.max(1, (this.now() - startedAt) / 1000);
@@ -523,6 +543,10 @@ export class FirmwareDownloadService {
       job.bytes = received;
       job.totalBytes = advertised || received;
       job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
+      if (job.expectedCrc32 !== null && job.expectedCrc32 !== undefined) {
+        const actualCrc32 = (~crc32) >>> 0;
+        if (actualCrc32 !== job.expectedCrc32) throw new Error("Samsung firmware CRC verification failed");
+      }
       if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
       if (isDecryptingFirmware(job)) {
         if ((await this.freeBytes()) - received < this.config.minFreeBytes) {
@@ -693,7 +717,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.1") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.17.2") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   const close = async () => { await app.close().catch(() => {}); await service.close(); };
