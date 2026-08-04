@@ -5,6 +5,8 @@ APP_VERSION=2.18.0
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
+# Keep the internal task index outside public file-list directories.
+DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 DOWNLOAD_API_SECRET=REPLACE_WITH_A_RANDOM_SECRET
 # Keep only official Samsung/FUS hosts. Add a host only after verification.
 DOWNLOAD_ALLOWED_HOSTS=samsung.com,samsungmobile.com,ospserver.net,cdngc.net

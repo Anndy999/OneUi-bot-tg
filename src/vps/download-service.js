@@ -44,10 +44,12 @@ export function createDownloadConfig(env = process.env) {
     .split(",")
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
+  const dir = resolve(text(env.DOWNLOAD_DIR, "./data/firmware"));
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
-    dir: resolve(text(env.DOWNLOAD_DIR, "./data/firmware")),
+    dir,
+    indexDir: resolve(text(env.DOWNLOAD_INDEX_DIR, dir)),
     apiSecret: text(env.DOWNLOAD_API_SECRET),
     redisUrl: text(env.REDIS_URL),
     queuePrefix: text(env.DOWNLOAD_QUEUE_PREFIX, "oneui-download"),
@@ -328,6 +330,7 @@ export class FirmwareDownloadService {
 
   async init({ startQueue = Boolean(this.config.redisUrl) } = {}) {
     await mkdir(this.config.dir, { recursive: true, mode: 0o750 });
+    await mkdir(this.config.indexDir, { recursive: true, mode: 0o750 });
     await this.loadIndex();
     await this.cleanupFiles();
     if (startQueue) {
@@ -357,7 +360,7 @@ export class FirmwareDownloadService {
     return this;
   }
 
-  get indexPath() { return join(this.config.dir, "index.json"); }
+  get indexPath() { return join(this.config.indexDir, "index.json"); }
 
   async loadIndex() {
     try {

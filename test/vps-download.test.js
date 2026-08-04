@@ -23,11 +23,34 @@ test("download configuration defaults to an isolated local API", () => {
   const config = createDownloadConfig({});
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 8788);
+  assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 16);
   assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 16);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
+});
+
+test("download index can stay outside the public firmware directory", async () => {
+  const dir = await tempDir();
+  const indexDir = await tempDir();
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({
+        DOWNLOAD_DIR: dir,
+        DOWNLOAD_INDEX_DIR: indexDir,
+        DOWNLOAD_MIN_FREE_BYTES: "0"
+      })
+    }).init({ startQueue: false });
+    service.jobs.set("index-test", { id: "index-test", state: "queued" });
+    await service.persist();
+    assert.equal(JSON.parse(await readFile(join(indexDir, "index.json"), "utf8"))["index-test"].state, "queued");
+    await assert.rejects(readFile(join(dir, "index.json"), "utf8"), /ENOENT/);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(indexDir, { recursive: true, force: true });
+  }
 });
 
 test("download speed uses a phase-local rolling window", () => {

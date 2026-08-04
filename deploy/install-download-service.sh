@@ -7,6 +7,7 @@ UNIT_SOURCE="${PROJECT_DIR}/deploy/${SERVICE}"
 UNIT_TARGET="/etc/systemd/system/${SERVICE}"
 ENV_FILE="/etc/oneui-bot/oneui-download.env"
 DOWNLOAD_DIR="${PROJECT_DIR}/data/firmware"
+DOWNLOAD_INDEX_DIR="${PROJECT_DIR}/data/download-state"
 
 log() { printf '[oneui-download-install] %s\n' "$*"; }
 die() { printf '[oneui-download-install] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -22,6 +23,7 @@ if [[ -e "${UNIT_TARGET}" ]] && ! cmp -s "${UNIT_SOURCE}" "${UNIT_TARGET}"; then
 fi
 
 install -d -o oneui -g oneui -m 0750 "${DOWNLOAD_DIR}"
+install -d -o oneui -g oneui -m 0750 "${DOWNLOAD_INDEX_DIR}"
 install -m 0644 -o root -g root "${UNIT_SOURCE}" "${UNIT_TARGET}"
 systemctl daemon-reload
 systemctl enable --now "${SERVICE}"
