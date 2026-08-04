@@ -1,28 +1,28 @@
-name: Test and deploy Cloudflare Worker
+name: VPS CI
 
 on:
   push:
     branches:
       - main
       - master
+  pull_request:
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 concurrency:
-  group: oneui-firmware-worker-production
+  group: oneui-vps-ci-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  test-and-deploy:
-    name: Test and deploy
+  test:
+    name: Test and security check
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID || vars.CLOUDFLARE_KV_NAMESPACE_ID }}
 
     steps:
       - name: Check out source
@@ -37,92 +37,11 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
-      - name: Scan repository for committed credentials
-        run: npm run security-check
-
       - name: Run tests
         run: npm test
 
-      - name: Validate deployment secrets
-        shell: bash
-        run: |
-          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_KV_NAMESPACE_ID; do
-            if [ -z "${!name}" ]; then
-              echo "::error title=Missing GitHub Actions configuration::$name is not configured"
-              exit 1
-            fi
-          done
-          if ! [[ "$CLOUDFLARE_KV_NAMESPACE_ID" =~ ^[0-9a-fA-F]{32}$ ]]; then
-            echo "::error title=Invalid KV namespace ID::CLOUDFLARE_KV_NAMESPACE_ID must be 32 hexadecimal characters"
-            exit 1
-          fi
+      - name: Scan repository for committed credentials
+        run: npm run security-check
 
-      - name: Build private Wrangler config
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          source = Path("wrangler.toml").read_text()
-          placeholder = "00000000000000000000000000000000"
-          namespace_id = os.environ["CLOUDFLARE_KV_NAMESPACE_ID"].strip()
-          if placeholder not in source:
-              raise SystemExit("KV placeholder not found in wrangler.toml")
-          Path("wrangler.deploy.toml").write_text(source.replace(placeholder, namespace_id))
-          PY
-
-      - name: Ensure notification queues exist
-        shell: bash
-        run: |
-          token="${CLOUDFLARE_API_TOKEN#Bearer }"
-          token="$(printf '%s' "$token" | tr -d '\r\n[:space:]')"
-          ensure_queue() {
-            local queue_name="$1"
-            local output
-            if output=$(CLOUDFLARE_API_TOKEN="$token" npx wrangler queues create "$queue_name" 2>&1); then
-              printf '%s\n' "$output"
-              return 0
-            fi
-            if printf '%s' "$output" | grep -Eqi 'already exists|already taken|code[=: ]+(10003|11009)'; then
-              echo "Queue $queue_name already exists."
-              return 0
-            fi
-            printf '%s\n' "$output"
-            echo "::error title=Queue provisioning failed::Ensure the Cloudflare API token has Queues Edit permission."
-            return 1
-          }
-          ensure_queue oneui-firmware-notifications
-          ensure_queue oneui-firmware-notifications-dlq
-
-      - name: Deploy Worker
-        shell: bash
-        run: |
-          token="${CLOUDFLARE_API_TOKEN#Bearer }"
-          token="$(printf '%s' "$token" | tr -d '\r\n[:space:]')"
-          CLOUDFLARE_API_TOKEN="$token" npx wrangler deploy --config wrangler.deploy.toml --keep-vars
-
-      - name: Verify deployed Worker version
-        if: ${{ vars.WORKER_URL != '' }}
-        shell: bash
-        env:
-          WORKER_URL: ${{ vars.WORKER_URL }}
-        run: |
-          expected_version="$(node -e 'const fs = require("node:fs"); const source = fs.readFileSync("src/index.js", "utf8"); const match = source.match(/const APP_VERSION = "([^"]+)";/); if (!match) process.exit(1); process.stdout.write(match[1]);')"
-          base_url="${WORKER_URL%/}"
-          for attempt in 1 2 3 4 5 6 7 8; do
-            body="$(curl --fail-with-body --silent --show-error --max-time 20 "${base_url}/health?deploy_check=${GITHUB_SHA}-${attempt}" || true)"
-            actual_version="$(printf '%s' "$body" | node -e 'let input = ""; process.stdin.on("data", (chunk) => { input += chunk; }); process.stdin.on("end", () => { try { process.stdout.write(String(JSON.parse(input).version || "")); } catch {} });')"
-            if [ "$actual_version" = "$expected_version" ]; then
-              echo "Worker health check passed for version $expected_version."
-              exit 0
-            fi
-            echo "Worker version is not visible yet (attempt $attempt/8)."
-            sleep 5
-          done
-          echo "::error title=Deployment verification failed::The deployed Worker did not report version $expected_version from /health."
-          exit 1
-
-      - name: Remove private deploy config
-        if: always()
-        run: rm -f wrangler.deploy.toml
-
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
