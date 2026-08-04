@@ -683,8 +683,8 @@ test("firmware cards label an inferred build month without inventing a day", () 
   };
   assert.equal(firmwareBuildDateDisplay(result, "zh").text, "2026-06（月份由版本号推算）");
   assert.equal(firmwareBuildDateDisplay(result, "en").text, "2026-06 (month inferred from firmware version)");
-  assert.match(formatFirmwareResult(result, { lang: "zh" }), /构建日期：2026-06（月份由版本号推算）/);
-  assert.match(formatFirmwareResult(result, { lang: "en" }), /Build date: 2026-06 \(month inferred from firmware version\)/);
+  assert.match(formatFirmwareResult(result, { lang: "zh" }), /构建：2026-06（月份由版本号推算）/);
+  assert.match(formatFirmwareResult(result, { lang: "en" }), /Build: 2026-06 \(month inferred from firmware version\)/);
 });
 
 test("official SmartHistory build date remains authoritative over version inference", () => {
@@ -1010,7 +1010,7 @@ test("compact firmware and update cards keep only the canonical full version", (
     android: "B(Android 16)", buildDate: "2026-07-13"
   };
   const queryCard = formatFirmwareResult(parsed, { lang: "zh", elapsedMs: 321 });
-  assert.match(queryCard, /最新正式版本/);
+  assert.match(queryCard, /最新版本/);
   assert.match(queryCard, /S9480NEW\/S9480CSC\/S9480MODEM/);
   assert.doesNotMatch(queryCard, /S9480MODEM\/S9480NEW/);
   assert.doesNotMatch(queryCard, /PDA：|CSC 版本：|MODEM：|版本解析：/);
@@ -1026,13 +1026,13 @@ test("compact firmware and update cards keep only the canonical full version", (
     true,
     { reminderMinutes: 7 }
   );
-  assert.match(updateCard, /Samsung firmware updated/);
-  assert.match(updateCard, /SM-S9480 \/ TGY/);
+  assert.match(updateCard, /New firmware version found!/);
+  assert.match(updateCard, /SM-S9480 · TGY/);
   assert.match(updateCard, /Old version/);
   assert.match(updateCard, /New version/);
   assert.match(updateCard, /S9480OLD\/OLD\/OLD/);
   assert.match(updateCard, /S9480NEW\/S9480CSC\/S9480MODEM/);
-  assert.doesNotMatch(updateCard, /S26 Ultra Hong Kong|Hong Kong|Android:|Build date:|reminder|monitoring plan/i);
+  assert.doesNotMatch(updateCard, /S26 Ultra Hong Kong|Hong Kong|Android:|Build date:|Samsung SmartHistory|Samsung FOTA|reminder|monitoring plan/i);
   return;
 
   const adminCard = formatMonitorNotification(
@@ -2964,7 +2964,7 @@ test("plain firmware input still replies when Workers KV has exhausted its daily
 
 test("slow firmware input shows a delayed placeholder and then edits it with the result", async () => {
   const result = await dispatchFirmwareQueryUpdate({ input: "9480 tgy", historyDelayMs: 350 });
-  const placeholder = result.telegram.find((entry) => entry.body.text?.includes("正在查询 Samsung SmartHistory"));
+  const placeholder = result.telegram.find((entry) => entry.body.text?.includes("正在查询最新固件"));
   const firmwareResult = result.telegram.find((entry) => (
     entry.url.includes("editMessageText") && entry.body.text?.includes("SM-S9480 · TGY")
   ));
@@ -3645,7 +3645,7 @@ test("English admin schedule and realtime refresh stay fully localized", async (
       message: { message_id: 5, chat: { id: 995 } }
     }
   }, payloads);
-  const progress = payloads.find((entry) => entry.body.text?.includes("Querying Samsung SmartHistory in realtime"));
+  const progress = payloads.find((entry) => entry.body.text?.includes("Checking latest firmware"));
   assert.ok(progress);
   assert.equal(progress.body.text.includes("正在实时查询"), false);
 });

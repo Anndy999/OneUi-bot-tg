@@ -1134,25 +1134,25 @@ function cscSuggestionText(model, requestedCsc, rankedOptions, lang = "zh", opti
 
   if (lang === "en") {
     return [
-      `No exact official SmartHistory record was found for ${model} / ${requestedCsc}.`,
+      `No exact official firmware record was found for ${model} / ${requestedCsc}.`,
       "",
       expanded
         ? `Official CSC options that still return usable update history (${total} total):`
         : total > 1 ? "The two most likely official CSC options are:" : "A confirmed official CSC option is:",
       ...lines,
       "",
-      "Only CSCs returned by Samsung SmartHistory are shown. Tap one below to query it directly."
+      "Only CSCs with an available official firmware record are shown. Tap one below to query it directly."
     ].join("\n");
   }
   return [
-    `未找到 ${model} / ${requestedCsc} 的精确官方 SmartHistory 记录。`,
+    `未找到 ${model} / ${requestedCsc} 的精确官方固件记录。`,
     "",
     expanded
       ? `三星官方仍可查询更新记录的 CSC（共 ${total} 个）：`
       : total > 1 ? "最可能的两个官方有效 CSC：" : "检测到一个已确认的官方有效 CSC：",
     ...lines,
     "",
-    "这里只显示三星 SmartHistory 实际返回且仍有可用固件记录的 CSC，可直接点击查询。"
+    "这里只显示三星官方仍有可用固件记录的 CSC，可直接点击查询。"
   ].join("\n");
 }
 
@@ -2051,8 +2051,8 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     }
     if (!(await enforceInteractiveQueryLimits(env, chatId, identity, model, lang, messageId))) return;
     await safeEditOrSend(env, chatId, messageId, lang === "en"
-      ? `Querying Samsung SmartHistory...\nModel: ${model}\nCSC: ${csc}`
-      : `正在查询 Samsung SmartHistory...\n型号：${model}\n地区：${csc}`);
+      ? `Checking latest firmware...\nModel: ${model}\nCSC: ${csc}`
+      : `正在查询最新固件...\n型号：${model}\n地区：${csc}`);
     runBackground(ctx, handleManualQuery(env, chatId, `${model} ${csc}`, {
       identity,
       ctx,
@@ -2085,8 +2085,8 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       chatId,
       messageId,
       lang === "en"
-        ? `⏳ Querying Samsung SmartHistory…\n\nModel: ${model}\nCSC: ${csc}`
-        : `⏳ 正在查询 Samsung SmartHistory…\n\n机型：${model}\n地区：${csc}`
+        ? `⏳ Checking latest firmware…\n\nModel: ${model}\nCSC: ${csc}`
+        : `⏳ 正在查询最新固件…\n\n机型：${model}\n地区：${csc}`
     );
     runBackground(ctx, handleManualQuery(env, chatId, `${model} ${csc}`, {
       identity,
@@ -2141,8 +2141,8 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const lang = await getUserLanguage(env, chatId);
     if (!await enforceInteractiveQueryLimits(env, chatId, identity, model, lang, messageId)) return;
     const progressText = lang === "en"
-      ? `⏳ Querying Samsung SmartHistory in realtime…\n\nModel: ${model}\nCSC: ${csc}`
-      : `⏳ 正在实时查询 Samsung SmartHistory…\n\n机型：${model}\n地区：${csc}`;
+      ? `⏳ Checking latest firmware…\n\nModel: ${model}\nCSC: ${csc}`
+      : `⏳ 正在查询最新固件…\n\n机型：${model}\n地区：${csc}`;
     await safeEditOrSend(
       env,
       chatId,
@@ -4090,8 +4090,8 @@ async function handleManualQuery(env, chatId, text, options = {}) {
       if (liveCompleted) return;
       placeholderStarted = true;
       await deliver(lang === "en"
-        ? `⏳ Querying Samsung SmartHistory…\n\nModel: ${query.model}\nCSC: ${query.csc}`
-        : `⏳ 正在查询 Samsung SmartHistory…\n\n机型：${query.model}\n地区：${query.csc}`);
+        ? `⏳ Checking latest firmware…\n\nModel: ${query.model}\nCSC: ${query.csc}`
+        : `⏳ 正在查询最新固件…\n\n机型：${query.model}\n地区：${query.csc}`);
     }).catch((error) => {
       console.log(`Telegram query placeholder failed: ${error.message}`);
     })

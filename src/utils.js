@@ -404,62 +404,42 @@ export function firmwareBuildDateDisplay(result, lang = "zh") {
 
 export function formatFirmwareResult(result, options = {}) {
   const lang = options.lang || "zh";
-  const elapsedMs = Number(options.elapsedMs);
-  const country = result.country || countryForCsc(result.csc);
   const buildDate = firmwareBuildDateDisplay(result, lang).text;
-  const cachedTime = options.cachedAt || "";
-  const cacheAgeSeconds = cachedTime
-    ? Math.max(0, Math.floor((Date.now() - new Date(cachedTime).getTime()) / 1000))
-    : null;
-  const cacheLabel = cacheAgeSeconds === null
-    ? (lang === "en" ? "Live" : "实时")
-    : (lang === "en" ? `Cached ${cacheAgeSeconds}s ago` : `缓存 ${cacheAgeSeconds} 秒前`);
   const latest = normalizeFirmwareVersion(result.latest) || String(result.latest || "").trim();
+  const android = displayAndroidVersion(result.android, lang);
+  const hasAndroid = android && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(android);
+  const hasBuildDate = buildDate && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(buildDate);
 
   if (lang === "en") {
     const lines = [
-      "📱 Samsung Firmware Query",
+      "📱 Samsung firmware",
       "",
-      `${result.model} · ${result.csc}${country ? ` (${country})` : ""}`,
+      `${result.model} · ${result.csc}`,
       "",
-      "Latest official version",
+      "Latest version",
       latest,
-      "",
-      `Android: ${displayAndroidVersion(result.android, "en")}`,
-      `Build date: ${buildDate}`
+      ...(hasAndroid ? ["", `Android: ${android}`] : []),
+      ...(hasBuildDate ? ["", `Build: ${buildDate}`] : [])
     ];
-    if (Number.isFinite(elapsedMs)) lines.push("", `⏱ Query latency: ${elapsedMs} ms`);
-    if (result.sourceType === "version_xml") {
-      lines.push("", "⚠️ Showing the latest official Samsung version.xml metadata.");
-    } else if (result.fallbackUsed || options.fallbackReason || result.degraded) {
-      lines.push("", "⚠️ Samsung is temporarily unavailable. This is the last exact CSC SmartHistory record and may not include a newly released build.");
+    if (result.degraded && result.sourceType !== "version_xml") {
+      lines.push("", "⚠️ Showing the last available version. Please refresh later.");
     }
-    lines.push(result.sourceType === "version_xml"
-      ? "📡 Samsung FOTA version.xml · official metadata"
-      : `📡 Samsung SmartHistory · ${cacheLabel}`);
     return lines.join("\n");
   }
 
   const lines = [
-    "📱 三星固件查询",
+    "📱 三星固件",
     "",
-    `${result.model} · ${result.csc}${country ? `（${country}）` : ""}`,
+    `${result.model} · ${result.csc}`,
     "",
-    "最新正式版本",
+    "最新版本",
     latest,
-    "",
-    `Android：${displayAndroidVersion(result.android, "zh")}`,
-    `构建日期：${buildDate}`
+    ...(hasAndroid ? ["", `Android：${android}`] : []),
+    ...(hasBuildDate ? ["", `构建：${buildDate}`] : [])
   ];
-  if (Number.isFinite(elapsedMs)) lines.push("", `⏱ 查询耗时：${elapsedMs} ms`);
-  if (result.sourceType === "version_xml") {
-    lines.push("", "⚠️ 当前使用三星官方 version.xml 元数据，SmartHistory 暂无可用记录。");
-  } else if (result.fallbackUsed || options.fallbackReason || result.degraded) {
-    lines.push("", "⚠️ 三星服务器暂时无法连接，当前返回最后一次精确 CSC 的 SmartHistory 记录，可能尚未包含刚发布的新版本。");
+  if (result.degraded && result.sourceType !== "version_xml") {
+    lines.push("", "⚠️ 当前显示最近一次可用版本，请稍后刷新。");
   }
-  lines.push(result.sourceType === "version_xml"
-    ? "📡 Samsung FOTA version.xml · 官方元数据"
-    : `📡 Samsung SmartHistory · ${cacheLabel}`);
   return lines.join("\n");
 }
 
@@ -534,6 +514,12 @@ function friendlyQueryFailureReason(reason, lang = "zh") {
   const raw = String(reason || "").trim();
   const lower = raw.toLowerCase();
 
+  if (lower.includes("smarthistory") || lower.includes("smart history") || lower.includes("no usable firmware history")) {
+    return lang === "en"
+      ? "The latest firmware is temporarily unavailable. Please try again later or try another CSC."
+      : "暂时无法获取该设备的最新固件，请稍后重试或尝试其他 CSC。";
+  }
+
   if (lower.includes("latest") || raw.includes("latest 字段为空")) {
     return lang === "en"
       ? "Samsung returned a device record, but the latest firmware field is empty. This usually means the model or CSC is not publicly available yet."
@@ -583,13 +569,10 @@ export function formatUpdateNotificationCard(item, oldLatest, parsed, now = new 
   // or build date is included here.
   const previousVersion = normalizeFirmwareVersion(oldLatest) || String(oldLatest || "").trim() || "N/A";
   const currentVersion = normalizeFirmwareVersion(parsed.latest) || String(parsed.latest || "").trim() || "N/A";
-  const source = parsed.source === "Samsung FOTA version.xml"
-    ? "Samsung FOTA version.xml"
-    : "Samsung SmartHistory";
-  const deviceLine = `${item.model} / ${item.csc}`;
+  const deviceLine = `${item.model} · ${item.csc}`;
   if (lang === "en") {
     return [
-      "\u{1F680} Samsung firmware updated",
+      "\u{1F680} New firmware version found!",
       "",
       deviceLine,
       "",
@@ -597,15 +580,11 @@ export function formatUpdateNotificationCard(item, oldLatest, parsed, now = new 
       previousVersion,
       "",
       "New version",
-      currentVersion,
-      "",
-      `Detected at: ${formatBeijingTime(now, "en")}`,
-      "",
-      `\u{1F4C4} ${source}`
+      currentVersion
     ].join("\n");
   }
   return [
-    "\u{1F680} \u53d1\u73b0\u4e09\u661f\u6b63\u5f0f\u56fa\u4ef6\u66f4\u65b0",
+    "\u{1F680} \u53d1\u73b0\u65b0\u7248\u672c\uff01",
     "",
     deviceLine,
     "",
@@ -613,11 +592,7 @@ export function formatUpdateNotificationCard(item, oldLatest, parsed, now = new 
     previousVersion,
     "",
     "\u65b0\u7248\u672c",
-    currentVersion,
-    "",
-    `\u53d1\u73b0\u65f6\u95f4\uff1a${formatBeijingTime(now, "zh")}`,
-    "",
-    `\u{1F4C4} ${source}`
+    currentVersion
   ].join("\n");
   }
 
