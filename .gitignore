@@ -20,3 +20,4 @@ migration-data/
 
 # VPS firmware files and their local index never belong in Git.
 /data/firmware/
+/data/download-state/
