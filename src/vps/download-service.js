@@ -286,7 +286,9 @@ function withBodyIdleDeadline(promise, timeoutMs, signal) {
     };
     const onAbort = () => finish(reject, signal.reason || new Error("download cancelled by administrator"));
     const timer = setTimeout(() => finish(reject, new Error(`official source body stalled for ${delay} ms`)), delay);
-    timer.unref?.();
+    // Keep this deadline referenced. If an upstream body promise is the last
+    // pending work, unref() lets Node exit before the timeout can reject it.
+    // That cancels downloads/tests instead of reporting a controlled failure.
     signal?.addEventListener("abort", onAbort, { once: true });
     Promise.resolve(promise).then(
       (value) => finish(resolve, value),
