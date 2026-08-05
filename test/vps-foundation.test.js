@@ -42,6 +42,15 @@ test("MemoryCache single-flight shares one factory and expires values", async ()
   assert.equal(await cache.get("firmware:target"), null);
 });
 
+test("MemoryCache bounds fallback entries", async () => {
+  const cache = new MemoryCache({ maxEntries: 10 });
+  for (let index = 0; index < 25; index += 1) await cache.set(`key:${index}`, index);
+  assert.equal(cache.entries.size, 10);
+  assert.equal(await cache.get("key:0"), null);
+  assert.equal(await cache.get("key:24"), 24);
+  await cache.close();
+});
+
 test("MemoryLockService enforces token ownership and expiry", async () => {
   let now = 0;
   const locks = new MemoryLockService({ now: () => now });
@@ -149,6 +158,18 @@ test("VPS background waits are isolated between concurrent Telegram jobs", async
 
   releaseOther();
   await context.waitForBackground();
+  await context.close();
+});
+
+test("VPS background failures are observed immediately and do not escape shutdown", async () => {
+  const errors = [];
+  const context = createVpsRuntimeContext({
+    logger: { error(message) { errors.push(message); }, warn() {} }
+  });
+  context.waitUntil(Promise.reject(new Error("background fixture failed")));
+  await context.waitForBackground();
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /background fixture failed/);
   await context.close();
 });
 

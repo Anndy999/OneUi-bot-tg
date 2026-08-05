@@ -25,7 +25,8 @@ const { app } = buildVpsApp({
     storage: () => runtime.health(),
     cache: async () => ({ ok: (await runtime.redis.ping()) === "PONG" }),
     queues: () => workers?.queueStatus?.() || { ok: false, state: "starting" },
-    telegramPolling: () => workers?.pollingStatus?.() || { ok: false, state: "starting" }
+    telegramPolling: () => workers?.pollingStatus?.() || { ok: false, state: "starting" },
+    scheduler: () => workers?.schedulerStatus?.() || { ok: false, state: "starting" }
   }
 });
 workers = startVpsWorkers({ runtime, origin, logger });

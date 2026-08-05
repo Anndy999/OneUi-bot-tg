@@ -27,7 +27,12 @@ export function createVpsRuntimeContext({
     logger,
     now,
     waitUntil(promise) {
-      const task = Promise.resolve(promise).finally(() => background.delete(task));
+      let task;
+      task = Promise.resolve(promise)
+        .catch((error) => {
+          logger?.error?.(`VPS background task failed: ${error?.message || error}`);
+        })
+        .finally(() => background.delete(task));
       background.add(task);
       return task;
     },
@@ -39,8 +44,14 @@ export function createVpsRuntimeContext({
       await Promise.allSettled(pending);
     },
     async close() {
-      await Promise.all(Object.values(queues).map((queue) => queue.close?.() || undefined));
-      await cache.close?.();
+      await Promise.allSettled([...background]);
+      const results = await Promise.allSettled([
+        ...Object.values(queues).map((queue) => Promise.resolve().then(() => queue.close?.())),
+        Promise.resolve().then(() => cache.close?.())
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected") logger?.warn?.(`VPS runtime shutdown warning: ${result.reason?.message || result.reason}`);
+      }
     }
   };
 }

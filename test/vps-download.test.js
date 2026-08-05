@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
 import { createCipheriv, createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveVpsOfficialFirmwareDownload } from "../src/vps/fus-resolver.js";
@@ -25,6 +25,8 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 16);
+  assert.equal(config.bodyIdleTimeoutMs, 120_000);
+  assert.equal(config.jobStaleMs, 5 * 60_000);
   assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 16);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
@@ -82,6 +84,124 @@ test("download response-header deadline does not abort an active body stream", a
   controller.abort();
   await new Promise((resolveWait) => setTimeout(resolveWait, 0));
   assert.equal(requestSignal.aborted, true);
+});
+
+test("download redirects release the previous response body", async () => {
+  let requests = 0;
+  let cancelled = 0;
+  const service = new FirmwareDownloadService({
+    config: createDownloadConfig({}),
+    lookupImpl: async () => [{ address: "93.184.216.34" }],
+    fetchImpl: async () => {
+      requests += 1;
+      if (requests === 1) {
+        return new Response(new ReadableStream({ cancel() { cancelled += 1; } }), {
+          status: 302,
+          headers: { location: "https://fota-cloud-dn.ospserver.net/firmware/final.bin" }
+        });
+      }
+      return new Response("firmware", { status: 200 });
+    }
+  });
+  const response = await service.fetchOfficial("https://fota-cloud-dn.ospserver.net/firmware/start.bin", new AbortController().signal);
+  assert.equal(response.status, 200);
+  assert.equal(requests, 2);
+  assert.equal(cancelled, 1);
+});
+
+test("download health ignores an ordinary queue backlog but detects a stalled active transfer", async () => {
+  const dir = await tempDir();
+  let now = Date.now();
+  try {
+    const config = createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" });
+    config.jobStaleMs = 1000;
+    const service = await new FirmwareDownloadService({ config, now: () => now }).init({ startQueue: false });
+    service.jobs.set("queued", { id: "queued", state: "queued", updatedAt: new Date(now - 60_000).toISOString() });
+    assert.equal((await service.health()).ok, true);
+    assert.equal((await service.health()).queued, 1);
+    service.jobs.set("active", { id: "active", state: "downloading", updatedAt: new Date(now).toISOString() });
+    now += 2000;
+    const health = await service.health();
+    assert.equal(health.ok, false);
+    assert.equal(health.active.stalled, true);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download fails instead of hanging when an official body stops producing data", async () => {
+  const dir = await tempDir();
+  try {
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "1"
+    });
+    config.bodyIdleTimeoutMs = 20;
+    const service = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": "5" }),
+        body: {
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise(() => {}),
+              async return() { return { done: true }; }
+            };
+          }
+        }
+      })
+    }).init({ startQueue: false });
+    const job = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/stalled.bin" }, "owner");
+    const startedAt = Date.now();
+    await assert.rejects(() => service.runJob({ data: { id: job.id } }), /body stalled/);
+    assert.ok(Date.now() - startedAt < 1000);
+    assert.equal(service.get(job.id).state, "failed");
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download restart reuses a fully transferred and verified part", async () => {
+  const dir = await tempDir();
+  try {
+    const config = createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" });
+    const first = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }]
+    }).init({ startQueue: false });
+    const created = await first.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/resume.zip" }, "owner");
+    const internal = first.jobs.get(created.id);
+    internal.bytes = 5;
+    internal.totalBytes = 5;
+    internal.downloadComplete = true;
+    internal.downloadVerified = true;
+    await writeFile(join(dir, `${created.id}.part`), "hello");
+    await first.persist();
+    await first.close();
+
+    let networkCalls = 0;
+    const second = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async () => {
+        networkCalls += 1;
+        throw new Error("network should not be used");
+      }
+    }).init({ startQueue: false });
+    await second.runJob({ data: { id: created.id } });
+    assert.equal(networkCalls, 0);
+    assert.equal(second.get(created.id).state, "completed");
+    assert.equal(await readFile(join(dir, created.fileName), "utf8"), "hello");
+    await second.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("parallel Range download assembles the file and verifies the completed output", async () => {

@@ -45,6 +45,7 @@ export function createDownloadConfig(env = process.env) {
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
   const dir = resolve(text(env.DOWNLOAD_DIR, "./data/firmware"));
+  const bodyIdleTimeoutMs = integer(env.DOWNLOAD_BODY_IDLE_TIMEOUT_MS || 120_000, 120_000, 5_000, 15 * 60_000);
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -58,6 +59,9 @@ export function createDownloadConfig(env = process.env) {
     completedTtlMs: integer(env.DOWNLOAD_COMPLETED_TTL_MS || 7 * 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 0, 365 * 24 * 60 * 60 * 1000),
     partTtlMs: integer(env.DOWNLOAD_PART_TTL_MS || 6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 60_000, 30 * 24 * 60 * 60 * 1000),
     responseHeaderTimeoutMs: integer(env.DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS || env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
+    bodyIdleTimeoutMs,
+    jobStaleMs: integer(env.DOWNLOAD_JOB_STALE_MS || Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), 60_000, 60 * 60_000),
+    apiRequestTimeoutMs: integer(env.DOWNLOAD_API_REQUEST_TIMEOUT_MS || 30_000, 30_000, 5_000, 5 * 60_000),
     // Samsung's CDN is commonly rate-limited per TCP connection. Keep this
     // bounded, but let a VPS use more than the original eight connections.
     parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 16, 16, 1, 16),
@@ -135,13 +139,20 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
   const decrypting = safe.state === "decrypting";
-  const progressBytes = decrypting ? Number(safe.decryptBytes || 0) : Number(safe.bytes || 0);
+  const verifying = safe.state === "verifying";
+  const progressBytes = decrypting
+    ? Number(safe.decryptBytes || 0)
+    : verifying
+      ? Number(safe.verifyBytes || 0)
+      : Number(safe.bytes || 0);
   const percent = safe.state === "completed" ? 100 : safe.totalBytes
     ? (decrypting
-      ? Math.min(99, 85 + Math.floor((progressBytes / safe.totalBytes) * 15))
-      : Math.min(100, Math.floor((progressBytes / safe.totalBytes) * 85)))
+      ? Math.min(99, 90 + Math.floor((progressBytes / safe.totalBytes) * 10))
+      : verifying
+        ? Math.min(90, 85 + Math.floor((progressBytes / safe.totalBytes) * 5))
+        : Math.min(85, Math.floor((progressBytes / safe.totalBytes) * 85)))
     : null;
   const speedBytesPerSecond = Math.max(0, Number(safe.speedBytesPerSecond || 0));
   const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
@@ -261,6 +272,73 @@ function waitWithAbort(milliseconds, signal) {
   });
 }
 
+function withBodyIdleDeadline(promise, timeoutMs, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason || new Error("download cancelled by administrator"));
+  const delay = Math.max(1, Number(timeoutMs) || 120_000);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject, signal.reason || new Error("download cancelled by administrator"));
+    const timer = setTimeout(() => finish(reject, new Error(`official source body stalled for ${delay} ms`)), delay);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error)
+    );
+  });
+}
+
+async function* responseBodyChunks(body, timeoutMs, signal) {
+  if (!body) throw new Error("official source returned an empty body");
+  const reader = typeof body.getReader === "function" ? body.getReader() : null;
+  const iterator = !reader && typeof body[Symbol.asyncIterator] === "function"
+    ? body[Symbol.asyncIterator]()
+    : null;
+  if (!reader && !iterator) throw new Error("official source returned an unreadable body");
+  let completed = false;
+  try {
+    while (true) {
+      const result = await withBodyIdleDeadline(reader ? reader.read() : iterator.next(), timeoutMs, signal);
+      if (result.done) {
+        completed = true;
+        return;
+      }
+      yield result.value;
+    }
+  } finally {
+    if (!completed) {
+      await cancelBodyReader(reader, iterator);
+    }
+  }
+}
+
+async function cancelBodyReader(reader, iterator = null) {
+  try {
+    const cancellation = reader?.cancel?.() ?? iterator?.return?.();
+    if (cancellation) await withBodyIdleDeadline(cancellation, 5_000);
+  } catch {
+    // Body cancellation is best effort. Never let a broken upstream stream
+    // keep shutdown, retry or redirect handling stuck indefinitely.
+  }
+}
+
+async function cancelResponseBody(body) {
+  if (!body) return;
+  const reader = typeof body.getReader === "function" ? body.getReader() : null;
+  if (reader) return cancelBodyReader(reader);
+  try {
+    const cancellation = body.cancel?.();
+    if (cancellation) await withBodyIdleDeadline(cancellation, 5_000);
+  } catch {}
+}
+
 function contentRange(value) {
   const match = String(value || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
   if (!match) return null;
@@ -271,12 +349,15 @@ function contentRange(value) {
   return { start, end, total };
 }
 
-async function fileCrc32(filePath, signal) {
+async function fileCrc32(filePath, signal, onProgress = null) {
   const reader = createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
   let crc = 0xffffffff;
+  let processed = 0;
   for await (const chunk of reader) {
     if (signal.aborted) throw signal.reason || new Error("download cancelled by administrator");
     crc = updateCrc32(crc, chunk);
+    processed += chunk.length;
+    if (onProgress) await onProgress(processed);
   }
   return (~crc) >>> 0;
 }
@@ -326,6 +407,7 @@ export class FirmwareDownloadService {
     this.createInFlight = false;
     this.persistPromise = Promise.resolve();
     this.ready = false;
+    this.closing = false;
   }
 
   async init({ startQueue = Boolean(this.config.redisUrl) } = {}) {
@@ -397,6 +479,18 @@ export class FirmwareDownloadService {
     const entries = await readdir(this.config.dir, { withFileTypes: true });
     const partCutoff = this.now() - this.config.partTtlMs;
     const completedCutoff = this.now() - this.config.completedTtlMs;
+    const terminalCutoff = this.now() - (this.config.completedTtlMs || 7 * 24 * 60 * 60 * 1000);
+    for (const job of [...this.jobs.values()]) {
+      const updatedAt = Date.parse(job.updatedAt || job.createdAt || "");
+      if (["failed", "cancelled"].includes(job.state) && Number.isFinite(updatedAt) && updatedAt < terminalCutoff) {
+        this.jobs.delete(job.id);
+        continue;
+      }
+      if (job.state === "completed") {
+        const exists = await stat(join(this.config.dir, job.fileName)).catch(() => null);
+        if (!exists) this.jobs.delete(job.id);
+      }
+    }
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       const filePath = join(this.config.dir, entry.name);
@@ -414,6 +508,13 @@ export class FirmwareDownloadService {
         this.jobs.delete(job.id);
       }
     }
+    const indexEntries = await readdir(this.config.indexDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of indexEntries) {
+      if (!entry.isFile() || !entry.name.startsWith("index.json.tmp-")) continue;
+      const temporaryPath = join(this.config.indexDir, entry.name);
+      const info = await stat(temporaryPath).catch(() => null);
+      if (info?.mtimeMs < partCutoff) await rm(temporaryPath, { force: true });
+    }
     await this.persist();
   }
 
@@ -424,7 +525,23 @@ export class FirmwareDownloadService {
 
   async health() {
     const free = await this.freeBytes();
-    return { ok: free >= this.config.minFreeBytes, freeBytes: free, minFreeBytes: this.config.minFreeBytes, jobs: this.jobs.size };
+    const active = [...this.jobs.values()].find((job) => ["downloading", "verifying", "decrypting"].includes(job.state));
+    const queued = [...this.jobs.values()].filter((job) => job.state === "queued").length;
+    const activeUpdatedAt = active ? Date.parse(active.updatedAt || active.createdAt || "") : 0;
+    const stalled = Boolean(active && (!Number.isFinite(activeUpdatedAt) || this.now() - activeUpdatedAt > this.config.jobStaleMs));
+    const redisReady = !this.redis || this.redis.status === "ready";
+    const workerRunning = !this.worker || typeof this.worker.isRunning !== "function" || this.worker.isRunning();
+    return {
+      ok: this.ready && free >= this.config.minFreeBytes && redisReady && workerRunning && !stalled,
+      ready: this.ready,
+      freeBytes: free,
+      minFreeBytes: this.config.minFreeBytes,
+      jobs: this.jobs.size,
+      queued,
+      redis: this.redis?.status || "disabled",
+      workerRunning,
+      active: active ? { id: active.id, state: active.state, updatedAt: active.updatedAt, stalled } : null
+    };
   }
 
   async create(payload = {}, requestedBy = "admin") {
@@ -648,7 +765,7 @@ export class FirmwareDownloadService {
       "accept-encoding": "identity"
     });
     const probeRange = contentRange(probe.headers.get("content-range"));
-    await probe.body?.cancel?.().catch(() => {});
+    await cancelResponseBody(probe.body);
     if (probe.status !== 206 || !probeRange || probeRange.start !== 0 || probeRange.end !== 0) return false;
     const total = probeRange.total;
     if (!Number.isSafeInteger(total) || total < this.config.parallelMinBytes) return false;
@@ -751,7 +868,11 @@ export class FirmwareDownloadService {
             let position = start;
             while (true) {
               if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
-              const { done, value } = await reader.read();
+              const { done, value } = await withBodyIdleDeadline(
+                reader.read(),
+                this.config.bodyIdleTimeoutMs,
+                segmentSignal
+              );
               if (done) break;
               const remaining = segment.end + 1 - position;
               if (value.byteLength > remaining) throw new Error("Samsung official source returned an oversized segment");
@@ -773,7 +894,7 @@ export class FirmwareDownloadService {
             await waitWithAbort(250 * attempts, segmentSignal);
             continue;
           } finally {
-            await reader?.cancel?.().catch(() => {});
+            await cancelBodyReader(reader);
             if (writer && !writerEnded) writer.destroy();
           }
         }
@@ -789,7 +910,6 @@ export class FirmwareDownloadService {
       job.bytes = total;
       job.totalBytes = total;
       job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
-      delete job.parallel;
       await persistProgress(true);
       return true;
     } catch (error) {
@@ -810,89 +930,128 @@ export class FirmwareDownloadService {
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
     try {
-      job.state = "downloading";
       const downloadStartedAt = this.now();
+      const existingPart = await stat(partPath).catch(() => null);
+      let transferComplete = Boolean(
+        job.downloadComplete === true &&
+        Number(job.totalBytes || 0) > 0 &&
+        existingPart?.size === Number(job.totalBytes) &&
+        job.fileName
+      );
+      if (job.downloadComplete && !transferComplete) {
+        delete job.downloadComplete;
+        delete job.downloadVerified;
+        delete job.parallel;
+        job.bytes = 0;
+      }
+
+      job.state = transferComplete && !job.downloadVerified ? "verifying" : "downloading";
       job.downloadStartedAt = new Date(downloadStartedAt).toISOString();
       job.downloadStartBytes = Number(job.bytes || 0);
-      resetSpeedTracking(job, "download", 0, downloadStartedAt);
+      resetSpeedTracking(job, "download", job.downloadStartBytes, downloadStartedAt);
       job.updatedAt = new Date(downloadStartedAt).toISOString();
       await this.persist();
-      let resolved = null;
-      if (job.downloadMode === "fus" || !job.sourceUrl) {
-        resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
-        job.sourceUrl = resolved.sourceUrl;
-        job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
-        job.sourceHost = new URL(job.sourceUrl).hostname;
-        job.sourceHeaders = resolved.sourceHeaders || null;
-        job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
-        job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
-        job.expectedCrc32 = expectedCrc32(resolved.crc32);
-        job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
-        job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
-        if (resolved.version) job.version = resolved.version;
-        await this.persist();
-      }
-      const finalPath = join(this.config.dir, job.fileName);
-      const parallelCompleted = await this.downloadParallel(partPath, job, controller);
-      let crc32 = null;
-      if (parallelCompleted) {
-        job.state = "verifying";
-        job.speedBytesPerSecond = 0;
+      let actualCrc32 = null;
+      if (!transferComplete) {
+        let resolved = null;
+        if (job.downloadMode === "fus" || !job.sourceUrl) {
+          resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
+          job.sourceUrl = resolved.sourceUrl;
+          job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
+          job.sourceHost = new URL(job.sourceUrl).hostname;
+          job.sourceHeaders = resolved.sourceHeaders || null;
+          job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
+          job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
+          job.expectedCrc32 = expectedCrc32(resolved.crc32);
+          job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
+          job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
+          if (resolved.version) job.version = resolved.version;
+          await this.persist();
+        }
+        const parallelCompleted = await this.downloadParallel(partPath, job, controller);
+        if (!parallelCompleted) {
+          const response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
+          if (!response.ok) {
+            await cancelResponseBody(response.body);
+            throw new Error(`official source returned HTTP ${response.status}`);
+          }
+          const advertised = Number(response.headers.get("content-length") || 0);
+          if (advertised > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
+          job.totalBytes = advertised;
+          const writer = createWriteStream(partPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
+          let received = 0;
+          let crc32 = 0xffffffff;
+          let lastFreeCheckBytes = 0;
+          let lastPersist = 0;
+          try {
+            for await (const chunk of responseBodyChunks(response.body, this.config.bodyIdleTimeoutMs, controller.signal)) {
+              received += chunk.length;
+              if (received > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
+              const knownTotal = advertised || received;
+              if (received - lastFreeCheckBytes >= FREE_SPACE_CHECK_INTERVAL_BYTES || lastFreeCheckBytes === 0) {
+                const remainingOutput = isDecryptingFirmware(job) ? knownTotal : 0;
+                if ((await this.freeBytes()) - Math.max(0, knownTotal - received) - remainingOutput < this.config.minFreeBytes) {
+                  throw new Error("download stopped to preserve the configured free disk space");
+                }
+                lastFreeCheckBytes = received;
+              }
+              await writeChunk(writer, chunk);
+              crc32 = updateCrc32(crc32, chunk);
+              job.bytes = received;
+              const now = this.now();
+              updateRollingSpeed(job, "download", received, now);
+              if (now - lastPersist > 1000) {
+                lastPersist = now;
+                job.updatedAt = new Date(now).toISOString();
+                await this.persist();
+              }
+            }
+            await finishWriteStream(writer);
+          } catch (error) {
+            writer.destroy();
+            throw error;
+          }
+          job.bytes = received;
+          job.totalBytes = advertised || received;
+          actualCrc32 = (~crc32) >>> 0;
+        }
+        transferComplete = true;
+        job.downloadComplete = true;
+        job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
         job.updatedAt = new Date(this.now()).toISOString();
         await this.persist();
-        crc32 = await fileCrc32(partPath, controller.signal);
-      } else {
-        const response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
-        if (!response.ok) throw new Error(`official source returned HTTP ${response.status}`);
-        const advertised = Number(response.headers.get("content-length") || 0);
-        if (advertised > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
-        job.totalBytes = advertised;
-        const writer = await import("node:fs").then(({ createWriteStream }) => createWriteStream(partPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES }));
-        let received = 0;
-        crc32 = 0xffffffff;
-        let lastFreeCheckBytes = 0;
-        let lastPersist = 0;
-        try {
-          if (!response.body) throw new Error("official source returned an empty body");
-          for await (const chunk of response.body) {
-            received += chunk.length;
-            if (received > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
-            const knownTotal = advertised || received;
-            if (received - lastFreeCheckBytes >= FREE_SPACE_CHECK_INTERVAL_BYTES || lastFreeCheckBytes === 0) {
-              const remainingOutput = isDecryptingFirmware(job) ? knownTotal : 0;
-              if ((await this.freeBytes()) - Math.max(0, knownTotal - received) - remainingOutput < this.config.minFreeBytes) {
-                throw new Error("download stopped to preserve the configured free disk space");
+      }
+
+      if (!job.downloadVerified) {
+        job.state = "verifying";
+        job.speedBytesPerSecond = 0;
+        job.verifyBytes = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
+        if (job.expectedCrc32 !== null && job.expectedCrc32 !== undefined) {
+          let lastVerifyPersist = 0;
+          if (actualCrc32 === null) {
+            actualCrc32 = await fileCrc32(partPath, controller.signal, async (processed) => {
+              job.verifyBytes = processed;
+              const now = this.now();
+              if (now - lastVerifyPersist > 1000) {
+                lastVerifyPersist = now;
+                job.updatedAt = new Date(now).toISOString();
+                await this.persist();
               }
-              lastFreeCheckBytes = received;
-            }
-            await writeChunk(writer, chunk);
-            crc32 = updateCrc32(crc32, chunk);
-            job.bytes = received;
-            const now = this.now();
-            updateRollingSpeed(job, "download", received, now);
-            if (now - lastPersist > 1000) {
-              lastPersist = now;
-              job.updatedAt = new Date(now).toISOString();
-              await this.persist();
-            }
+            });
           }
-          await new Promise((resolveWrite, rejectWrite) => {
-            writer.end(() => resolveWrite());
-            writer.once("error", rejectWrite);
-          });
-        } catch (error) {
-          writer.destroy();
-          throw error;
+          if (actualCrc32 !== job.expectedCrc32) throw new Error("Samsung firmware CRC verification failed");
         }
-        job.bytes = received;
-        job.totalBytes = advertised || received;
+        job.downloadVerified = true;
+        delete job.parallel;
+        delete job.verifyBytes;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
       }
-      job.speedBytesPerSecond = Math.max(0, Number(job.speedBytesPerSecond || 0));
-      if (job.expectedCrc32 !== null && job.expectedCrc32 !== undefined) {
-        const actualCrc32 = parallelCompleted ? crc32 : (~crc32) >>> 0;
-        if (actualCrc32 !== job.expectedCrc32) throw new Error("Samsung firmware CRC verification failed");
-      }
+
       if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+      const finalPath = join(this.config.dir, job.fileName);
       if (isDecryptingFirmware(job)) {
         if ((await this.freeBytes()) - Number(job.bytes || 0) < this.config.minFreeBytes) {
           throw new Error("download completed but decrypting it would breach the configured free disk reserve");
@@ -916,9 +1075,20 @@ export class FirmwareDownloadService {
         throw controller.signal.reason || new Error("download cancelled by administrator");
       }
       job.state = "completed";
+      delete job.downloadComplete;
+      delete job.downloadVerified;
+      delete job.parallel;
+      delete job.verifyBytes;
       job.updatedAt = new Date(this.now()).toISOString();
       await this.persist();
     } catch (error) {
+      if (this.closing) {
+        job.state = "queued";
+        job.speedBytesPerSecond = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+        await this.persist();
+        return;
+      }
       if (job.state === "paused") {
         job.speedBytesPerSecond = 0;
         job.updatedAt = new Date(this.now()).toISOString();
@@ -928,6 +1098,9 @@ export class FirmwareDownloadService {
       await rm(partPath, { force: true });
       await rm(join(this.config.dir, `${job.id}.decrypt.part`), { force: true });
       delete job.parallel;
+      delete job.downloadComplete;
+      delete job.downloadVerified;
+      delete job.verifyBytes;
       if (job.state !== "cancelled") {
         job.state = "failed";
         job.error = String(error?.message || error || "download failed").slice(0, 240);
@@ -959,7 +1132,11 @@ export class FirmwareDownloadService {
       }
       if (![301, 302, 303, 307, 308].includes(response.status)) return response;
       const location = response.headers.get("location");
-      if (!location) throw new Error("official source returned a redirect without Location");
+      if (!location) {
+        await cancelResponseBody(response.body);
+        throw new Error("official source returned a redirect without Location");
+      }
+      await cancelResponseBody(response.body);
       current = assertOfficialUrl(new URL(location, current), this.config.allowedHosts);
     }
     throw new Error("too many redirects from official source");
@@ -976,7 +1153,20 @@ export class FirmwareDownloadService {
   }
 
   async close() {
+    if (this.closing) return;
+    this.closing = true;
+    this.ready = false;
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    for (const [id, controller] of this.controllers) {
+      const job = this.jobs.get(id);
+      if (job && ["downloading", "verifying", "decrypting"].includes(job.state)) {
+        job.state = "queued";
+        job.speedBytesPerSecond = 0;
+        job.updatedAt = new Date(this.now()).toISOString();
+      }
+      controller.abort(new Error("download service is shutting down"));
+    }
+    await this.persist().catch(() => {});
     await this.worker?.close().catch(() => {});
     await this.queue?.close().catch(() => {});
     this.redis?.disconnect();
@@ -996,8 +1186,13 @@ function requireDownloadKey(request, reply, secret) {
   return true;
 }
 
-export function buildDownloadApp({ app = Fastify({ logger: false }), service, version = "1.0.0" } = {}) {
+export function buildDownloadApp({ app = null, service, version = "1.0.0" } = {}) {
   if (!service) throw new TypeError("buildDownloadApp requires a FirmwareDownloadService");
+  app ||= Fastify({
+    logger: false,
+    requestTimeout: service.config.apiRequestTimeoutMs,
+    bodyLimit: 64 * 1024
+  });
   app.get("/", async () => ({ ok: true, service: "oneui-firmware-download", version }));
   app.get("/health", async (_request, reply) => {
     try {

@@ -16,6 +16,12 @@ DOWNLOAD_COMPLETED_TTL_MS=604800000
 DOWNLOAD_PART_TTL_MS=21600000
 # Maximum wait for Samsung response headers. An active download is not cut off.
 DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS=60000
+# Fail and retry a connection that stops delivering body data after headers.
+DOWNLOAD_BODY_IDLE_TIMEOUT_MS=120000
+# Mark an active task unhealthy if no progress heartbeat is persisted.
+DOWNLOAD_JOB_STALE_MS=300000
+# Bound local download API request handling.
+DOWNLOAD_API_REQUEST_TIMEOUT_MS=30000
 DOWNLOAD_PARALLEL_SEGMENTS=16
 # Valid range: 1-16. Use 12 or 8 only if Samsung begins throttling this VPS.
 # Stagger parallel connection setup to avoid Samsung source throttling.

@@ -32,6 +32,7 @@ export function startTelegramPolling({
   let controller = null;
   let offset = null;
   const startedAt = Date.now();
+  let lastActivityAt = startedAt;
   let lastSuccessAt = 0;
   let lastFailureAt = 0;
   let lastError = "";
@@ -70,6 +71,7 @@ export function startTelegramPolling({
         throw new Error(`Telegram getUpdates rejected (${code})`);
       }
       lastSuccessAt = Date.now();
+      lastActivityAt = lastSuccessAt;
       lastError = "";
       fatalFailure = false;
       return Array.isArray(data.result) ? data.result : [];
@@ -94,6 +96,7 @@ export function startTelegramPolling({
         }
         const updates = await fetchUpdates();
         retryMs = 1000;
+        let nextOffset = offset;
         for (const update of updates) {
           if (stopped) return;
           const id = updateId(update);
@@ -108,8 +111,16 @@ export function startTelegramPolling({
             update,
             createdAt: new Date().toISOString()
           });
-          offset = id + 1;
-          await storage.put(OFFSET_KEY, String(offset));
+          nextOffset = Math.max(Number(nextOffset || 0), id + 1);
+          lastActivityAt = Date.now();
+        }
+        // One durable offset write per Telegram batch substantially reduces
+        // PostgreSQL pressure during bursts. Queue job IDs make a full-batch
+        // retry safe if this final write fails.
+        if (nextOffset !== offset) {
+          await storage.put(OFFSET_KEY, String(nextOffset));
+          offset = nextOffset;
+          lastActivityAt = Date.now();
         }
       } catch (error) {
         // AbortError is normally produced by the request timeout above. It is
@@ -133,7 +144,6 @@ export function startTelegramPolling({
   return {
     status() {
       const now = Date.now();
-      const lastActivityAt = Math.max(startedAt, lastSuccessAt);
       const ok = !stopped && !fatalFailure && now - lastActivityAt <= staleAfterMs;
       return {
         ok,

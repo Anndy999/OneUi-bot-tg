@@ -8,8 +8,9 @@ function ttlMs(value, fallback = 30000) {
 }
 
 export class MemoryCache {
-  constructor({ now = () => Date.now() } = {}) {
+  constructor({ now = () => Date.now(), maxEntries = 1000 } = {}) {
     this.now = now;
+    this.maxEntries = Math.max(10, Math.min(10000, Math.floor(Number(maxEntries) || 1000)));
     this.entries = new Map();
     this.flights = new Map();
   }
@@ -24,7 +25,10 @@ export class MemoryCache {
   }
 
   async set(key, value, options = {}) {
-    this.entries.set(String(key), { value: clone(value), expiresAt: this.now() + ttlMs(options.ttlMs) });
+    const name = String(key);
+    this.entries.delete(name);
+    this.entries.set(name, { value: clone(value), expiresAt: this.now() + ttlMs(options.ttlMs) });
+    while (this.entries.size > this.maxEntries) this.entries.delete(this.entries.keys().next().value);
     return value;
   }
 
@@ -48,7 +52,10 @@ export class MemoryCache {
     return { value: await promise, cacheHit: false, shared: false };
   }
 
-  async close() {}
+  async close() {
+    this.entries.clear();
+    this.flights.clear();
+  }
 }
 
 export class RedisCache {
@@ -92,6 +99,7 @@ export class RedisCache {
   }
 
   async close() {
+    this.flights.clear();
     if (typeof this.client.quit === "function") await this.client.quit();
   }
 }

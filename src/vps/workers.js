@@ -96,7 +96,13 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     {
       connection: workerConnection,
       prefix: runtime.config.queuePrefix,
-      concurrency: name === "telegram-update" ? 2 : name === "notification-delivery" ? 4 : 2
+      concurrency: name === "telegram-update"
+        ? runtime.config.telegramWorkerConcurrency
+        : name === "notification-delivery"
+          ? runtime.config.notificationWorkerConcurrency
+          : name === "monitor-check"
+            ? runtime.config.monitorWorkerConcurrency
+            : 1
     }
   ));
   for (const worker of workers) {
@@ -104,17 +110,32 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
   }
 
   let ticking = false;
-  const tick = async () => {
-    if (ticking) return;
+  let scheduleStartedAt = 0;
+  let scheduleLastSuccessAt = 0;
+  let scheduleLastFailureAt = 0;
+  let scheduleLastError = "";
+  let tickPromise = null;
+  const tick = () => {
+    if (tickPromise) return tickPromise;
     ticking = true;
-    try {
-      await runtime.runAlarms();
-      await runScheduledTasks(runtime.env);
-    } catch (error) {
-      logger.error?.(`VPS scheduled task failed: ${error.message}`);
-    } finally {
-      ticking = false;
-    }
+    scheduleStartedAt = Date.now();
+    tickPromise = (async () => {
+      try {
+        await runtime.runAlarms();
+        await runScheduledTasks(runtime.env);
+        scheduleLastSuccessAt = Date.now();
+        scheduleLastError = "";
+      } catch (error) {
+        scheduleLastFailureAt = Date.now();
+        scheduleLastError = String(error?.message || error || "scheduled task failed").slice(0, 240);
+        logger.error?.(`VPS scheduled task failed: ${error.message}`);
+      } finally {
+        ticking = false;
+        scheduleStartedAt = 0;
+        tickPromise = null;
+      }
+    })();
+    return tickPromise;
   };
   const timer = setInterval(tick, runtime.config.scheduleIntervalMs);
   timer.unref?.();
@@ -131,20 +152,28 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
 
   let restartRequested = false;
   let forcedExitTimer = null;
-  const watchdogTimer = setInterval(() => {
-    const status = telegramPolling?.status?.();
-    if (!status || status.ok || status.fatalFailure || restartRequested) return;
-    const lastActivityAt = Number(status.lastActivityAt || status.startedAt || 0);
-    const staleAfterMs = Math.max(90_000, Number(status.staleAfterMs || 180_000));
-    if (!lastActivityAt || Date.now() - lastActivityAt <= staleAfterMs) return;
-
+  const requestRestart = (reason) => {
+    if (restartRequested) return;
     restartRequested = true;
-    logger.error?.("Telegram polling is stale; asking systemd to restart the VPS bot");
-    // The service already uses Restart=on-failure. Mark this controlled
-    // restart as a failure so a clean SIGTERM does not hide the fault.
+    logger.error?.(`${reason}; asking systemd to restart the VPS bot`);
     process.exitCode = 1;
     forcedExitTimer = setTimeout(() => process.exit(1), 15_000);
+    forcedExitTimer.unref?.();
     process.kill(process.pid, "SIGTERM");
+  };
+  const watchdogTimer = setInterval(() => {
+    const status = telegramPolling?.status?.();
+    if (status && !status.ok && !status.fatalFailure) {
+      const lastActivityAt = Number(status.lastActivityAt || status.startedAt || 0);
+      const staleAfterMs = Math.max(90_000, Number(status.staleAfterMs || 180_000));
+      if (lastActivityAt && Date.now() - lastActivityAt > staleAfterMs) {
+        requestRestart("Telegram polling is stale");
+        return;
+      }
+    }
+    if (ticking && scheduleStartedAt && Date.now() - scheduleStartedAt > runtime.config.scheduleStaleMs) {
+      requestRestart("VPS scheduled task loop is stale");
+    }
   }, 30_000);
   watchdogTimer.unref?.();
 
@@ -152,6 +181,21 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     workers,
     pollingStatus() {
       return telegramPolling?.status?.() || { ok: true, state: "disabled" };
+    },
+    schedulerStatus() {
+      const now = Date.now();
+      const stale = Boolean(ticking && scheduleStartedAt && now - scheduleStartedAt > runtime.config.scheduleStaleMs);
+      const failed = scheduleLastFailureAt > scheduleLastSuccessAt;
+      return {
+        ok: !stale && !failed,
+        state: stale ? "stale" : ticking ? "running" : failed ? "retrying" : scheduleLastSuccessAt ? "healthy" : "starting",
+        running: ticking,
+        startedAt: scheduleStartedAt || undefined,
+        lastSuccessAt: scheduleLastSuccessAt || undefined,
+        lastFailureAt: scheduleLastFailureAt || undefined,
+        lastError: scheduleLastError || undefined,
+        staleAfterMs: runtime.config.scheduleStaleMs
+      };
     },
     queueStatus() {
       const workerStates = workers.map((worker) => ({
@@ -168,10 +212,16 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     async close() {
       clearInterval(timer);
       clearInterval(watchdogTimer);
-      if (forcedExitTimer) clearTimeout(forcedExitTimer);
-      await telegramPolling?.close();
-      await Promise.all(workers.map((worker) => worker.close()));
+      if (forcedExitTimer && !restartRequested) clearTimeout(forcedExitTimer);
+      await tickPromise?.catch(() => {});
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => telegramPolling?.close()),
+        ...workers.map((worker) => Promise.resolve().then(() => worker.close()))
+      ]);
       connection.disconnect();
+      for (const result of results) {
+        if (result.status === "rejected") logger.warn?.(`VPS worker shutdown warning: ${result.reason?.message || result.reason}`);
+      }
     }
   };
 }

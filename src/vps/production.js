@@ -115,12 +115,14 @@ export async function createVpsProductionRuntime({ env = process.env, logger = c
     pool,
     namespace: "monitor-scheduler",
     logger: log,
+    maxInstances: 100,
     createInstance: (ctx) => new MonitorScheduler(ctx, workerEnv)
   });
   const coordinatorNamespace = new PersistentNamespace({
     pool,
     namespace: "firmware-query-coordinator",
     logger: log,
+    maxInstances: config.coordinatorInstanceLimit,
     createInstance: (ctx) => new FirmwareQueryCoordinator(ctx, workerEnv)
   });
 

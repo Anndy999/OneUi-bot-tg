@@ -58,12 +58,43 @@ const stateMemoryCache = new Map();
 const fallbackQueryRates = new Map();
 const fallbackDailyModelQuotas = new Map();
 const fallbackQueryDemand = new Map();
+const FALLBACK_STATE_MAX_ENTRIES = 5000;
+let fallbackMaintenanceOps = 0;
+
+function trimOldest(map, maximum = FALLBACK_STATE_MAX_ENTRIES) {
+  while (map.size > maximum) map.delete(map.keys().next().value);
+}
+
+function maintainFallbackState(now = Date.now(), activeDateKey = "") {
+  fallbackMaintenanceOps += 1;
+  const oversized = fallbackQueryRates.size > FALLBACK_STATE_MAX_ENTRIES ||
+    fallbackDailyModelQuotas.size > FALLBACK_STATE_MAX_ENTRIES ||
+    fallbackQueryDemand.size > FALLBACK_STATE_MAX_ENTRIES;
+  if (!oversized && fallbackMaintenanceOps % 128 !== 0) return;
+
+  for (const [key, value] of fallbackQueryRates) {
+    if (now - Number(value || 0) > 60 * 60 * 1000) fallbackQueryRates.delete(key);
+  }
+  if (activeDateKey) {
+    const prefix = `${String(activeDateKey)}:`;
+    for (const key of fallbackDailyModelQuotas.keys()) {
+      if (!key.startsWith(prefix)) fallbackDailyModelQuotas.delete(key);
+    }
+  }
+  for (const [key, value] of fallbackQueryDemand) {
+    if (now - Number(value?.windowStartedAt || 0) >= 24 * 60 * 60 * 1000) fallbackQueryDemand.delete(key);
+  }
+  trimOldest(fallbackQueryRates);
+  trimOldest(fallbackDailyModelQuotas);
+  trimOldest(fallbackQueryDemand);
+}
 
 export function resetStateMemoryCache() {
   stateMemoryCache.clear();
   fallbackQueryRates.clear();
   fallbackDailyModelQuotas.clear();
   fallbackQueryDemand.clear();
+  fallbackMaintenanceOps = 0;
 }
 
 function memoryGet(key) {
@@ -913,6 +944,7 @@ export async function recordFirmwareQueryDemand(env, model, csc, queriedAt = new
       updatedAt: new Date(Number(durable.updatedAt || date.getTime())).toISOString()
     };
   }
+  maintainFallbackState(date.getTime());
   const key = monitorDemandKey(target.model, target.csc);
   const current = fallbackQueryDemand.get(key) || null;
   const windowStart = Number(current?.windowStartedAt || 0);
@@ -934,6 +966,7 @@ export async function getFirmwareQueryDemand(env, model, csc, now = new Date()) 
   const target = validateModelCsc(model, csc);
   const nowMs = new Date(now).getTime();
   const durable = await getSchedulerQueryDemand(env, target.model, target.csc, nowMs);
+  if (!durable?.ok) maintainFallbackState(nowMs);
   const value = durable?.ok ? durable : fallbackQueryDemand.get(monitorDemandKey(target.model, target.csc));
   const windowStart = Number(value?.windowStartedAt || 0);
   if (!windowStart || nowMs - windowStart >= 24 * 60 * 60 * 1000) {
@@ -1170,6 +1203,7 @@ export async function tryStartQueryRateLimit(env, chatId) {
   const now = Date.now();
   const durable = await claimSchedulerQueryRateLimit(env, chatId, seconds, now);
   if (durable?.ok) return durable.allowed !== false;
+  maintainFallbackState(now);
   const key = queryRateLimitKey(chatId);
   const existing = Number(fallbackQueryRates.get(key) || 0);
   if (existing && now - existing < seconds * 1000) return false;
@@ -1182,6 +1216,7 @@ export async function tryClaimAllowedUserDailyModelQuery(env, chatId, model, dat
   const now = Date.now();
   const durable = await claimSchedulerDailyModelQuery(env, chatId, model, dateKey, limit, now);
   if (durable?.ok) return durable;
+  maintainFallbackState(now, dateKey);
   const key = `${dateKey}:${String(chatId)}:${String(model).toUpperCase()}`;
   const current = Number(fallbackDailyModelQuotas.get(key) || 0);
   if (current >= limit) return { ok: true, allowed: false, count: current, limit, remaining: 0, fallback: true };
