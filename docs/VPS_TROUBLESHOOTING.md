@@ -60,9 +60,11 @@ sudo systemctl restart oneui-download.service
 sudo systemctl status oneui-download.service --no-pager -l
 ```
 
-Use `DOWNLOAD_PARALLEL_SEGMENTS=16` while the Samsung source remains stable;
-return to `12` or `8` if the source begins rejecting or slowing Range requests.
-Do not use unbounded connection counts.
+Use `DOWNLOAD_PARALLEL_SEGMENTS=24` for the bounded high-throughput profile.
+The downloader assigns 256 MiB Range work blocks to those lanes dynamically,
+so a slow final Samsung connection does not hold the entire file open. If the
+official source starts rejecting or slowing Range requests, return to `16`,
+then `12`. The hard cap is `32`; do not use unbounded connection counts.
 
 ## Service will not start
 

@@ -16,6 +16,7 @@ const FREE_SPACE_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
 const IO_BUFFER_BYTES = 4 * 1024 * 1024;
 const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
+const MAX_PARALLEL_RANGE_COUNT = 512;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   let value = index;
@@ -62,11 +63,16 @@ export function createDownloadConfig(env = process.env) {
     bodyIdleTimeoutMs,
     jobStaleMs: integer(env.DOWNLOAD_JOB_STALE_MS || Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), 60_000, 60 * 60_000),
     apiRequestTimeoutMs: integer(env.DOWNLOAD_API_REQUEST_TIMEOUT_MS || 30_000, 30_000, 5_000, 5 * 60_000),
-    // Samsung's CDN is commonly rate-limited per TCP connection. Keep this
-    // bounded, but let a VPS use more than the original eight connections.
-    parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 16, 16, 1, 16),
+    // Samsung's CDN can limit each TCP connection independently.  These are
+    // worker lanes, not an unbounded number of requests: a lane receives the
+    // next unfinished byte range only after it completes its current range.
+    parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 24, 24, 1, 32),
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
+    parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
+      1024 * 1024 * 1024,
+      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
+    )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
@@ -139,7 +145,7 @@ function jsonSafe(value) {
 }
 
 function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: _parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const verifying = safe.state === "verifying";
   const progressBytes = decrypting
@@ -158,7 +164,13 @@ function publicJob(job) {
   const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
     ? Math.max(0, Math.ceil((safe.totalBytes - progressBytes) / speedBytesPerSecond))
     : null;
-  return { ...safe, percent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds };
+  const transfer = parallel && typeof parallel === "object" ? {
+    lanes: Math.max(0, Number(parallel.lanes || 0)),
+    activeLanes: Math.max(0, Number(parallel.activeLanes || 0)),
+    completedRanges: Math.max(0, Number(parallel.completedRanges || 0)),
+    totalRanges: Array.isArray(parallel.segments) ? parallel.segments.length : 0
+  } : null;
+  return { ...safe, percent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
 }
 
 function resetSpeedTracking(job, phase, bytesAtStart, timestamp) {
@@ -773,7 +785,13 @@ export class FirmwareDownloadService {
     if (!Number.isSafeInteger(total) || total < this.config.parallelMinBytes) return false;
     if (total > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
     job.totalBytes = total;
-    const requestedSegmentCount = Math.min(this.config.parallelSegments, Math.max(2, Math.ceil(total / this.config.parallelMinBytes)));
+    // Split the file into bounded work ranges.  The lanes below claim these
+    // ranges dynamically, so a slow Samsung connection cannot leave the final
+    // large static segment as the only remaining work.
+    const requestedSegmentCount = Math.min(
+      MAX_PARALLEL_RANGE_COUNT,
+      Math.max(2, Math.ceil(total / this.config.parallelChunkBytes))
+    );
     const savedSegments = Array.isArray(job.parallel?.segments) ? job.parallel.segments : null;
     const savedFile = await stat(partPath).catch(() => null);
     const canResume = Boolean(
@@ -808,6 +826,10 @@ export class FirmwareDownloadService {
       await this.persist();
     }
     const segments = job.parallel.segments;
+    const laneCount = Math.min(this.config.parallelSegments, segments.length);
+    job.parallel.lanes = laneCount;
+    job.parallel.activeLanes = 0;
+    job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
     const segmentController = new AbortController();
     const segmentSignal = AbortSignal.any
       ? AbortSignal.any([controller.signal, segmentController.signal])
@@ -816,6 +838,7 @@ export class FirmwareDownloadService {
     let lastFreeCheckBytes = 0;
     let lastPersist = 0;
     let freeCheckInFlight = null;
+    let activeLanes = 0;
     const checkFreeSpace = async (force = false) => {
       const downloaded = received();
       if (!force && downloaded - lastFreeCheckBytes < FREE_SPACE_CHECK_INTERVAL_BYTES) return;
@@ -832,6 +855,8 @@ export class FirmwareDownloadService {
     };
     const persistProgress = async (force = false) => {
       job.bytes = received();
+      job.parallel.activeLanes = activeLanes;
+      job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
       const startedBytes = Number(job.downloadStartBytes || 0);
       const now = this.now();
       updateRollingSpeed(job, "download", Math.max(0, job.bytes - startedBytes), now);
@@ -842,8 +867,20 @@ export class FirmwareDownloadService {
     };
     try {
       await checkFreeSpace(true);
-      const segmentTasks = segments.map(async (segment, index) => {
-        await waitWithAbort(index * this.config.parallelStaggerMs, segmentSignal);
+      let nextSegmentIndex = 0;
+      const claimedSegments = new Set();
+      const claimNextSegment = () => {
+        for (let offset = 0; offset < segments.length; offset += 1) {
+          const index = (nextSegmentIndex + offset) % segments.length;
+          const segment = segments[index];
+          if (claimedSegments.has(index) || Number(segment.bytes || 0) >= segment.end - segment.start + 1) continue;
+          claimedSegments.add(index);
+          nextSegmentIndex = (index + 1) % segments.length;
+          return { segment, index };
+        }
+        return null;
+      };
+      const downloadSegment = async (segment) => {
         let attempts = 0;
         while (segment.bytes < segment.end - segment.start + 1) {
           if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
@@ -898,6 +935,20 @@ export class FirmwareDownloadService {
           } finally {
             await cancelBodyReader(reader);
             if (writer && !writerEnded) writer.destroy();
+          }
+        }
+      };
+      const segmentTasks = Array.from({ length: laneCount }, async (_, lane) => {
+        await waitWithAbort(lane * this.config.parallelStaggerMs, segmentSignal);
+        while (true) {
+          const claimed = claimNextSegment();
+          if (!claimed) return;
+          activeLanes += 1;
+          try {
+            await downloadSegment(claimed.segment);
+          } finally {
+            activeLanes -= 1;
+            claimedSegments.delete(claimed.index);
           }
         }
       });

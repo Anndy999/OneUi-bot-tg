@@ -22,10 +22,14 @@ DOWNLOAD_BODY_IDLE_TIMEOUT_MS=120000
 DOWNLOAD_JOB_STALE_MS=300000
 # Bound local download API request handling.
 DOWNLOAD_API_REQUEST_TIMEOUT_MS=30000
-DOWNLOAD_PARALLEL_SEGMENTS=16
-# Valid range: 1-16. Use 12 or 8 only if Samsung begins throttling this VPS.
+DOWNLOAD_PARALLEL_SEGMENTS=24
+# Valid range: 1-32. 24 is the safe high-throughput profile for one VPS task.
+# Return to 16 (then 12) if Samsung begins rejecting or slowing Range requests.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
+# A lane claims another completed work range automatically. This prevents one
+# slow final connection from holding the whole firmware task open.
+DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
 # Files smaller than this use one connection; failed range probes fall back automatically.
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.

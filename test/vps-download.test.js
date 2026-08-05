@@ -24,10 +24,11 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
-  assert.equal(config.parallelSegments, 16);
+  assert.equal(config.parallelSegments, 24);
+  assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
-  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 16);
+  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 32);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
@@ -241,6 +242,63 @@ test("parallel Range download assembles the file and verifies the completed outp
     assert.equal(completed.bytes, fixture.length);
     assert.ok(rangeHeaders.includes("bytes=0-0"));
     assert.equal(rangeHeaders.filter((value) => value !== "bytes=0-0").length, 2);
+    assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel Range lanes claim later work ranges without exceeding the configured connection count", async () => {
+  const dir = await tempDir();
+  try {
+    const fixture = Buffer.alloc(32 * 1024 * 1024, 0x61);
+    let activeRanges = 0;
+    let maximumActiveRanges = 0;
+    let dataRangeCalls = 0;
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "3",
+      DOWNLOAD_PARALLEL_STAGGER_MS: "0",
+      DOWNLOAD_PARALLEL_MIN_BYTES: "1",
+      DOWNLOAD_PARALLEL_CHUNK_BYTES: String(8 * 1024 * 1024)
+    });
+    const service = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async (_url, init = {}) => {
+        const rangeValue = String(init.headers?.range || init.headers?.Range || "");
+        const match = rangeValue.match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        const headers = {
+          "content-range": `bytes ${start}-${end}/${fixture.length}`,
+          "content-length": String(end - start + 1)
+        };
+        if (start === 0 && end === 0) return new Response(fixture.subarray(0, 1), { status: 206, headers });
+        dataRangeCalls += 1;
+        activeRanges += 1;
+        maximumActiveRanges = Math.max(maximumActiveRanges, activeRanges);
+        const body = new ReadableStream({
+          start(controller) {
+            setTimeout(() => {
+              controller.enqueue(fixture.subarray(start, end + 1));
+              controller.close();
+              activeRanges -= 1;
+            }, 10);
+          }
+        });
+        return new Response(body, { status: 206, headers });
+      }
+    }).init({ startQueue: false });
+    const job = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/lanes.zip" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(maximumActiveRanges, 3);
+    assert.equal(dataRangeCalls, Math.ceil(fixture.length / (8 * 1024 * 1024)));
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
     await service.close();
   } finally {

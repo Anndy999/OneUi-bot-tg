@@ -882,6 +882,11 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
   if (active) {
     lines.push(`${lang === "en" ? "Progress" : "进度"}: ${downloadProgressBar(job.percent)}`);
     if (job.totalBytes) lines.push(`${formatBytes(job.bytes)} / ${formatBytes(job.totalBytes)}`);
+    if (job.state === "downloading" && job.transfer?.lanes) {
+      const transferLabel = lang === "en" ? "Connections" : "连接";
+      const rangesLabel = lang === "en" ? "Ranges" : "分片";
+      lines.push(`${transferLabel}: ${job.transfer.activeLanes || 0}/${job.transfer.lanes} · ${rangesLabel}: ${job.transfer.completedRanges || 0}/${job.transfer.totalRanges || 0}`);
+    }
     if (job.speedBytesPerSecond) {
       const speedWindowSeconds = Number(job.speedWindowSeconds || 10);
       const speedLabel = lang === "en" ? `Speed (last ${speedWindowSeconds}s)` : `速度（近${speedWindowSeconds}秒）`;
