@@ -143,6 +143,14 @@ function authorization(session) {
   return `FUS nonce="${session.nonce}", signature="${session.auth}", nc="", type="", realm=""`;
 }
 
+// Samsung's cloud binary endpoint uses the auth produced by BinaryInit but
+// expects an empty nonce. This is intentionally different from the XML FUS
+// calls above; reusing their nonce/cookie can make the cloud endpoint return
+// HTTP 401, especially when the request is resumed with Range.
+function cloudAuthorization(session) {
+  return `FUS nonce="", signature="${session.auth}", nc="", type="", realm=""`;
+}
+
 async function request(session, path, body, fetchImpl, signal, retry = true) {
   const response = await fetchImpl(`${FUS_BASE}${path}`, {
     method: "POST",
@@ -215,7 +223,7 @@ export async function resolveVpsOfficialFirmwareDownload(env, model, csc, versio
   if (initStatus && initStatus !== "200" && initStatus !== "S00") throw new Error(`Samsung FUS binary init returned ${initStatus}`);
   return {
     sourceUrl: `http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=${downloadPath}`,
-    sourceHeaders: { authorization: authorization(session), "user-agent": FUS_USER_AGENT, ...(session.cookie ? { cookie: session.cookie } : {}) },
+    sourceHeaders: { authorization: cloudAuthorization(session), "user-agent": FUS_USER_AGENT, "cache-control": "no-cache" },
     fileName,
     size: Number(tagValue(inform, "BINARY_BYTE_SIZE") || 0),
     crc32: tagValue(inform, "BINARY_CRC"),

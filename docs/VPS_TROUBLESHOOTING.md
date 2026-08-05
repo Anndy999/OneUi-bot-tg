@@ -61,10 +61,16 @@ sudo systemctl status oneui-download.service --no-pager -l
 ```
 
 Use `DOWNLOAD_PARALLEL_SEGMENTS=24` for the bounded high-throughput profile.
-The downloader assigns 256 MiB Range work blocks to those lanes dynamically,
+The downloader assigns 128 MiB Range work blocks to those lanes dynamically,
 so a slow final Samsung connection does not hold the entire file open. If the
 official source starts rejecting or slowing Range requests, return to `16`,
 then `12`. The hard cap is `32`; do not use unbounded connection counts.
+
+If a task reports HTTP 401 from the official source, the downloader now uses
+the cloud-download authorization form used by Bifrost and refreshes the FUS
+session once automatically. A repeated 401 means Samsung rejected the new
+session as well; retry the task later and do not copy authorization headers
+into logs or chat.
 
 ## Service will not start
 

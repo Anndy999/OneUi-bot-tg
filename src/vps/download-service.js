@@ -18,6 +18,13 @@ const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
 const MAX_PARALLEL_RANGE_COUNT = 512;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
+
+class OfficialSourceAuthorizationError extends Error {
+  constructor() {
+    super("Samsung official source rejected the FUS download authorization (HTTP 401)");
+    this.name = "OfficialSourceAuthorizationError";
+  }
+}
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
@@ -71,7 +78,7 @@ export function createDownloadConfig(env = process.env) {
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
       1024 * 1024 * 1024,
-      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
+      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 128 * 1024 * 1024)
     )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
@@ -779,6 +786,10 @@ export class FirmwareDownloadService {
       "accept-encoding": "identity"
     });
     const probeRange = contentRange(probe.headers.get("content-range"));
+    if (probe.status === 401) {
+      await cancelResponseBody(probe.body);
+      throw new OfficialSourceAuthorizationError();
+    }
     await cancelResponseBody(probe.body);
     if (probe.status !== 206 || !probeRange || probeRange.start !== 0 || probeRange.end !== 0) return false;
     const total = probeRange.total;
@@ -855,8 +866,10 @@ export class FirmwareDownloadService {
     };
     const persistProgress = async (force = false) => {
       job.bytes = received();
-      job.parallel.activeLanes = activeLanes;
-      job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
+      if (job.parallel) {
+        job.parallel.activeLanes = activeLanes;
+        job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
+      }
       const startedBytes = Number(job.downloadStartBytes || 0);
       const now = this.now();
       updateRollingSpeed(job, "download", Math.max(0, job.bytes - startedBytes), now);
@@ -895,6 +908,10 @@ export class FirmwareDownloadService {
               range: `bytes=${start}-${segment.end}`,
               "accept-encoding": "identity"
             });
+            if (response.status === 401) {
+              await cancelResponseBody(response.body);
+              throw new OfficialSourceAuthorizationError();
+            }
             const range = contentRange(response.headers.get("content-range"));
             if (response.status !== 206 || !range || range.start !== start || range.end !== segment.end || range.total !== total) {
               throw new Error("Samsung official source rejected parallel range download");
@@ -928,6 +945,7 @@ export class FirmwareDownloadService {
             if (position !== segment.end + 1) throw new Error("Samsung official source returned an incomplete segment");
           } catch (error) {
             if (segmentSignal.aborted) throw error;
+            if (error instanceof OfficialSourceAuthorizationError) throw error;
             attempts += 1;
             if (attempts > this.config.parallelRetries) throw error;
             await waitWithAbort(250 * attempts, segmentSignal);
@@ -969,6 +987,11 @@ export class FirmwareDownloadService {
       job.bytes = received();
       await persistProgress(true);
       if (controller.signal.aborted) throw error;
+      if (error instanceof OfficialSourceAuthorizationError) {
+        await rm(partPath, { force: true });
+        delete job.parallel;
+        throw error;
+      }
       this.logger.warn?.(`Parallel firmware download unavailable; falling back to one connection: ${error.message}`);
       await rm(partPath, { force: true });
       delete job.parallel;
@@ -1005,25 +1028,48 @@ export class FirmwareDownloadService {
       job.updatedAt = new Date(downloadStartedAt).toISOString();
       await this.persist();
       let actualCrc32 = null;
+      const resolveFusJob = async () => {
+        const resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
+        job.sourceUrl = resolved.sourceUrl;
+        job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
+        job.sourceHost = new URL(job.sourceUrl).hostname;
+        job.sourceHeaders = resolved.sourceHeaders || null;
+        job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
+        job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
+        job.expectedCrc32 = expectedCrc32(resolved.crc32);
+        job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
+        job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
+        if (resolved.version) job.version = resolved.version;
+        await this.persist();
+      };
       if (!transferComplete) {
-        let resolved = null;
-        if (job.downloadMode === "fus" || !job.sourceUrl) {
-          resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
-          job.sourceUrl = resolved.sourceUrl;
-          job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
-          job.sourceHost = new URL(job.sourceUrl).hostname;
-          job.sourceHeaders = resolved.sourceHeaders || null;
-          job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
-          job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
-          job.expectedCrc32 = expectedCrc32(resolved.crc32);
-          job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
-          job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
-          if (resolved.version) job.version = resolved.version;
-          await this.persist();
+        if (job.downloadMode === "fus" || !job.sourceUrl) await resolveFusJob();
+        let parallelCompleted = false;
+        let authorizationRefreshes = 0;
+        const refreshFusAuthorization = async () => {
+          authorizationRefreshes += 1;
+          this.logger.warn?.("Samsung FUS download authorization expired; refreshing the official download session.");
+          job.bytes = 0;
+          job.downloadStartBytes = 0;
+          resetSpeedTracking(job, "download", 0, this.now());
+          await resolveFusJob();
+        };
+        while (true) {
+          try {
+            parallelCompleted = await this.downloadParallel(partPath, job, controller);
+            break;
+          } catch (error) {
+            if (!(error instanceof OfficialSourceAuthorizationError) || job.downloadMode !== "fus" || authorizationRefreshes >= 1) throw error;
+            await refreshFusAuthorization();
+          }
         }
-        const parallelCompleted = await this.downloadParallel(partPath, job, controller);
         if (!parallelCompleted) {
-          const response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
+          let response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
+          if (response.status === 401 && job.downloadMode === "fus" && authorizationRefreshes < 1) {
+            await cancelResponseBody(response.body);
+            await refreshFusAuthorization();
+            response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
+          }
           if (!response.ok) {
             await cancelResponseBody(response.body);
             throw new Error(`official source returned HTTP ${response.status}`);

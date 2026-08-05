@@ -29,7 +29,7 @@ DOWNLOAD_PARALLEL_SEGMENTS=24
 DOWNLOAD_PARALLEL_STAGGER_MS=100
 # A lane claims another completed work range automatically. This prevents one
 # slow final connection from holding the whole firmware task open.
-DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+DOWNLOAD_PARALLEL_CHUNK_BYTES=134217728
 # Files smaller than this use one connection; failed range probes fall back automatically.
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.

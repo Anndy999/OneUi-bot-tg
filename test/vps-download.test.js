@@ -25,7 +25,7 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 24);
-  assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
+  assert.equal(config.parallelChunkBytes, 128 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
   assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 32);
@@ -413,6 +413,62 @@ test("VPS FUS resolver uses the Bifrost-compatible authentication flow without e
   assert.equal(calls.filter((call) => call.url.includes("BinaryInform")).length, 1);
   assert.equal(calls.filter((call) => call.url.includes("BinaryInit")).length, 1);
   assert.equal(Object.hasOwn(result, "sourceHeaders"), true);
+  assert.match(result.sourceHeaders.authorization, /^FUS nonce="", signature="[0-9a-f]+"/);
+  assert.equal(result.sourceHeaders["cache-control"], "no-cache");
+  assert.equal(Object.hasOwn(result.sourceHeaders, "cookie"), false);
+});
+
+test("FUS download refreshes its session once when the official Range source returns HTTP 401", async () => {
+  const dir = await tempDir();
+  try {
+    const fixture = Buffer.from("FUS authorization refresh fixture", "utf8");
+    let resolveCalls = 0;
+    const rangeAuthorizations = [];
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({
+        DOWNLOAD_DIR: dir,
+        DOWNLOAD_MIN_FREE_BYTES: "0",
+        DOWNLOAD_PARALLEL_MIN_BYTES: "1"
+      }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => {
+        resolveCalls += 1;
+        return {
+          sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/refresh.zip",
+          sourceHeaders: { authorization: `session-${resolveCalls}` },
+          fileName: "SM-S9380_REFRESH.zip",
+          size: fixture.length
+        };
+      },
+      fetchImpl: async (_url, init = {}) => {
+        const authorization = String(init.headers?.authorization || "");
+        rangeAuthorizations.push(authorization);
+        if (authorization !== "session-2") return new Response("unauthorized", { status: 401 });
+        const rangeValue = String(init.headers?.range || init.headers?.Range || "");
+        const match = rangeValue.match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        return new Response(fixture.subarray(start, end + 1), {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${fixture.length}`,
+            "content-length": String(end - start + 1)
+          }
+        });
+      }
+    }).init({ startQueue: false });
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    assert.equal(service.get(job.id).state, "completed");
+    assert.equal(resolveCalls, 2);
+    assert.ok(rangeAuthorizations.includes("session-1"));
+    assert.ok(rangeAuthorizations.includes("session-2"));
+    assert.deepEqual(await readFile(join(dir, service.get(job.id).fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("download API requires an admin key and serves only completed files", async () => {
