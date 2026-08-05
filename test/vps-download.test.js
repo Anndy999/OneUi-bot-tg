@@ -241,7 +241,7 @@ test("download API requires an admin key and serves only completed files", async
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       fetchImpl: async () => ({
         ok: true,
@@ -298,7 +298,7 @@ test("download API rejects non-official and non-HTTPS URLs", async () => {
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }]
     }).init({ startQueue: false });
     await assert.rejects(() => service.create({ sourceUrl: "http://example.com/file.bin" }), /HTTPS/);
@@ -313,7 +313,7 @@ test("download service rejects a Samsung file whose advertised CRC32 does not ma
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       resolveImpl: async () => ({
         sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip",
@@ -342,7 +342,7 @@ test("download preview verifies Samsung metadata without queuing a job, and term
   try {
     let resolves = 0;
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       resolveImpl: async () => {
         resolves += 1;
@@ -388,7 +388,7 @@ test("download service decrypts Samsung enc4 firmware before marking it complete
     cipher.setAutoPadding(false);
     const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       resolveImpl: async () => ({
         sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/test.zip.enc4",

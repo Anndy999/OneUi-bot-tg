@@ -1265,18 +1265,13 @@ function monitorMenuKeyboard(lang = "zh") {
   return {
     inline_keyboard: [
       [
-        { text: en ? "Targets" : "目标", callback_data: "admin:monitors" },
-        { text: en ? "Priority" : "优先级", callback_data: "admin:high" }
-      ],
-      [
-        { text: en ? "Check now" : "立即检查", callback_data: "admin:checknow" },
-        { text: en ? "Schedule" : "调度", callback_data: "admin:schedule-menu" }
+        { text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" },
+        { text: en ? "Check now" : "立即检查", callback_data: "admin:checknow" }
       ],
       [
         { text: en ? "Health" : "健康", callback_data: "admin:monitor-health" },
-        { text: en ? "More" : "更多", callback_data: "admin:monitor-more" }
+        { text: en ? "Settings" : "设置", callback_data: "admin:monitor-more" }
       ],
-      [{ text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" }],
       [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
     ]
   };
@@ -1292,15 +1287,20 @@ function monitorMoreKeyboard(lang = "zh") {
   ] };
 }
 
-function monitorCenterState(item, runtime = {}) {
+function monitorCenterState(item, runtime = {}, pending = null) {
   const enabled = item?.enabled !== false;
   const awaitingResume = !enabled && (
     item?.pauseReason === "awaiting_admin_resume" ||
     item?.adminDecision === "awaiting_resume_confirmation"
   );
   const failureCount = Number(runtime?.failureCount || 0);
+  const hasPendingUpdate = pending?.acked !== true && Boolean(
+    String(pending?.newLatest || pending?.latest || "").trim()
+  );
   const kind = awaitingResume
     ? "awaiting"
+    : hasPendingUpdate
+      ? "updated"
     : !enabled
       ? "paused"
       : failureCount > 0
@@ -1313,10 +1313,11 @@ function monitorCenterLabel(kind, lang = "zh") {
   const en = lang === "en";
   const labels = {
     all: en ? "All targets" : "\u5168\u90e8\u8bbe\u5907",
-    active: en ? "Active" : "\u8fd0\u884c\u4e2d",
+    active: en ? "Normal" : "\u6b63\u5e38",
+    updated: en ? "Updates" : "\u66f4\u65b0",
     paused: en ? "Paused" : "\u5df2\u6682\u505c",
     awaiting: en ? "Awaiting resume" : "\u5f85\u6062\u590d\u786e\u8ba4",
-    failing: en ? "Failing" : "\u8fde\u7eed\u5931\u8d25"
+    failing: en ? "Errors" : "\u5f02\u5e38"
   };
   return labels[kind] || labels.all;
 }
@@ -1327,10 +1328,13 @@ function monitorCenterButtonText(entry, lang = "zh") {
     active: "\u2705",
     paused: "\u23f8\ufe0f",
     awaiting: "\u23f3",
+    updated: "\ud83c\udd95",
     failing: "\u26a0\ufe0f"
   }[state.kind] || "\u2022";
   const detail = state.kind === "failing"
-    ? ` ${lang === "en" ? `Failed ${state.failureCount}` : `\u5931\u8d25 ${state.failureCount} \u6b21`}`
+    ? ` ${lang === "en" ? `Errors ${state.failureCount}` : `\u5f02\u5e38 ${state.failureCount}`}`
+    : state.kind === "updated"
+      ? ` ${monitorCenterLabel("updated", lang)}`
     : ` ${monitorCenterLabel(state.kind, lang)}`;
   return `${prefix} ${item.model} / ${item.csc}${detail}`;
 }
@@ -1346,59 +1350,64 @@ function standardMonitorItems(items) {
 async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
   const en = lang === "en";
   const items = standardMonitorItems(await getMonitorItems(env));
-  const runtimes = await Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc)));
+  const [runtimes, pendingUpdates] = await Promise.all([
+    Promise.all(items.map((item) => getMonitorRuntime(env, item.model, item.csc))),
+    Promise.all(items.map((item) => getPendingUpdate(env, item.model, item.csc)))
+  ]);
   const entries = items.map((item, index) => ({
     item,
     runtime: runtimes[index] || {},
-    state: monitorCenterState(item, runtimes[index] || {})
+    state: monitorCenterState(item, runtimes[index] || {}, pendingUpdates[index])
   }));
-  const kinds = ["active", "paused", "awaiting", "failing"];
-  const counts = Object.fromEntries(kinds.map((kind) => [kind, entries.filter((entry) => entry.state.kind === kind).length]));
-  const selected = kinds.includes(filter) ? filter : "all";
-  const rank = { awaiting: 0, paused: 1, failing: 2, active: 3 };
+  const visibleKind = (kind) => kind === "awaiting" ? "paused" : kind;
+  const kinds = ["active", "updated", "failing", "paused"];
+  const counts = Object.fromEntries(kinds.map((kind) => [
+    kind,
+    entries.filter((entry) => visibleKind(entry.state.kind) === kind).length
+  ]));
+  const selected = filter === "awaiting" ? "paused" : (kinds.includes(filter) ? filter : "all");
+  const rank = { updated: 0, failing: 1, active: 2, paused: 3, awaiting: 3 };
   const displayed = entries
-    .filter((entry) => selected === "all" || entry.state.kind === selected)
+    .filter((entry) => selected === "all" || visibleKind(entry.state.kind) === selected)
     .sort((left, right) => rank[left.state.kind] - rank[right.state.kind]
       || `${left.item.model}:${left.item.csc}`.localeCompare(`${right.item.model}:${right.item.csc}`));
   const rows = [
     [
+      { text: `${monitorCenterLabel("all", lang)} ${items.length}`, callback_data: "admin:monitor-filter:all" },
       { text: `${monitorCenterLabel("active", lang)} ${counts.active}`, callback_data: "admin:monitor-filter:active" },
-      { text: `${monitorCenterLabel("paused", lang)} ${counts.paused}`, callback_data: "admin:monitor-filter:paused" }
+      { text: `${monitorCenterLabel("updated", lang)} ${counts.updated}`, callback_data: "admin:monitor-filter:updated" }
     ],
     [
-      { text: `${monitorCenterLabel("awaiting", lang)} ${counts.awaiting}`, callback_data: "admin:monitor-filter:awaiting" },
-      { text: `${monitorCenterLabel("failing", lang)} ${counts.failing}`, callback_data: "admin:monitor-filter:failing" }
+      { text: `${monitorCenterLabel("failing", lang)} ${counts.failing}`, callback_data: "admin:monitor-filter:failing" },
+      { text: `${monitorCenterLabel("paused", lang)} ${counts.paused}`, callback_data: "admin:monitor-filter:paused" }
     ]
   ];
-    for (const entry of displayed.slice(0, 20)) {
-      rows.push([{ text: monitorCenterButtonText(entry, lang), callback_data: `monitor-item:view:${entry.item.model}:${entry.item.csc}` }]);
-    }
-    if (counts.failing > 0) {
-      rows.push([{
-        text: en ? `Retry ${counts.failing} failing target${counts.failing === 1 ? "" : "s"}` : `\u91cd\u8bd5 ${counts.failing} \u4e2a\u5931\u8d25\u8bbe\u5907`,
-        callback_data: "admin:monitor-retry-failed"
-      }]);
-    }
-    rows.push(
-    [
-      { text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" },
-      { text: en ? "Check now" : "\u7acb\u5373\u68c0\u67e5", callback_data: "admin:checknow" }
-    ],
-    [
-      { text: en ? "Schedule" : "\u8c03\u5ea6", callback_data: "admin:schedule-menu" },
-      { text: en ? "More" : "更多", callback_data: "admin:monitor-more" }
-    ],
-    [{ text: en ? "Home" : "\u8fd4\u56de\u4e3b\u83dc\u5355", callback_data: "menu:home" }]
-  );
+  for (const entry of displayed.slice(0, 20)) {
+    rows.push([{
+      text: monitorCenterButtonText({
+        ...entry,
+        state: { ...entry.state, kind: visibleKind(entry.state.kind) }
+      }, lang),
+      callback_data: `monitor-item:view:${entry.item.model}:${entry.item.csc}`
+    }]);
+  }
+  rows.push([
+    { text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" },
+    { text: en ? `Check errors ${counts.failing}` : `检查异常 ${counts.failing}`, callback_data: "admin:monitor-retry-failed" }
+  ], [
+    { text: en ? "Settings" : "设置", callback_data: "admin:monitor-more" },
+    { text: en ? "Back" : "返回", callback_data: "menu:home" }
+  ]);
   const lines = [
-    en ? "\u{1F4CA} Monitoring center" : "\u{1F4CA} \u76d1\u63a7\u4e2d\u5fc3",
+    `${en ? "\u{1F4CA} Monitoring" : "\u{1F4CA} \u76d1\u63a7"}${selected === "all" ? "" : ` · ${monitorCenterLabel(selected, lang)}`}`,
     "",
-    `${en ? "Current view" : "\u5f53\u524d\u89c6\u56fe"}: ${monitorCenterLabel(selected, lang)}`,
-    `${en ? "Regular monitors" : "\u666e\u901a\u76d1\u63a7"}: ${displayed.length}/${items.length}`
+    en
+      ? `Normal ${counts.active} · Updates ${counts.updated} · Errors ${counts.failing} · Paused ${counts.paused}`
+      : `正常 ${counts.active} · 更新 ${counts.updated} · 异常 ${counts.failing} · 暂停 ${counts.paused}`
   ];
-  if (!items.length) lines.push("", en ? "No monitoring targets yet." : "\u5f53\u524d\u6ca1\u6709\u76d1\u63a7\u8bbe\u5907\u3002");
-  else if (!displayed.length) lines.push("", en ? "No targets match this status." : "\u5f53\u524d\u6ca1\u6709\u7b26\u5408\u6b64\u72b6\u6001\u7684\u8bbe\u5907\u3002");
-  if (displayed.length > 20) lines.push("", en ? "Only the first 20 targets are shown." : "\u4ec5\u663e\u793a\u524d 20 \u4e2a\u8bbe\u5907\u3002");
+  if (!items.length) lines.push("", en ? "No targets." : "暂无设备");
+  else if (!displayed.length) lines.push("", en ? "None." : "暂无");
+  if (displayed.length > 20) lines.push("", en ? "First 20 only." : "仅显示前 20 个");
   return { text: lines.join("\n"), replyMarkup: { inline_keyboard: rows } };
 }
 
@@ -2439,7 +2448,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
       env,
       chatId,
       messageId,
-      lang === "en" ? "More monitoring tools" : "更多监控工具",
+      lang === "en" ? "Monitoring settings" : "监控设置",
       monitorMoreKeyboard(lang)
     );
     return;
@@ -2459,7 +2468,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
 
   if (data.startsWith("admin:monitor-filter:")) {
     const filter = data.slice("admin:monitor-filter:".length);
-    const selected = new Set(["active", "paused", "awaiting", "failing"]);
+    const selected = new Set(["all", "active", "updated", "paused", "awaiting", "failing"]);
     const panel = await formatMonitorCenterPanel(env, lang, selected.has(filter) ? filter : "all");
     await safeEditOrSend(env, chatId, messageId, panel.text, panel.replyMarkup);
     return;
@@ -2808,7 +2817,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   }
 
   if (data === "admin:monitors") {
-    const panel = await formatMonitorPanel(env, lang);
+    const panel = await formatMonitorCenterPanel(env, lang);
     await safeEditOrSend(env, chatId, messageId, panel.text, panel.replyMarkup);
     return;
   }

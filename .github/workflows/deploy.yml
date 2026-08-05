@@ -1,14 +1,9 @@
 name: VPS CI
 
+# VPS deployment and updates are performed explicitly on the VPS.
+# Keep this check available for manual verification without sending an email
+# for every repository push.
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
 concurrency:

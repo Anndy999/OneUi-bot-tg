@@ -3485,6 +3485,13 @@ test("monitoring center exposes status filters and bulk deletion needs a typed f
     { model: "SM-S9380", csc: "CHC", name: "S25 Ultra China", priority: "high" },
     { model: "SM-S938B", csc: "EUX", name: "S25 Ultra EUX", enabled: false, paused: true }
   ]);
+  await putPendingUpdate(env, {
+    model: "SM-S9380",
+    csc: "CHC",
+    previousLatest: "S9380ABC",
+    newLatest: "S9380DEF",
+    acked: false
+  });
   const callback = (updateId, id, data) => dispatchTelegramTestUpdate(env, {
     update_id: updateId,
     callback_query: {
@@ -3498,9 +3505,10 @@ test("monitoring center exposes status filters and bulk deletion needs a typed f
   await callback(700050, "monitor-center", "admin:monitor-menu");
   const center = payloads.find((entry) => entry.body.reply_markup?.inline_keyboard?.flat().some((button) => button.callback_data === "admin:monitor-filter:active"));
   assert.ok(center);
+  assert.match(center.body.text, /更新 1/);
   const callbacks = center.body.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
   assert.ok(callbacks.includes("admin:monitor-filter:paused"));
-  assert.ok(callbacks.includes("admin:monitor-filter:awaiting"));
+  assert.ok(callbacks.includes("admin:monitor-filter:updated"));
   assert.ok(callbacks.includes("admin:monitor-filter:failing"));
 
   await callback(7000501, "monitor-more", "admin:monitor-more");
