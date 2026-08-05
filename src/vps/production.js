@@ -17,6 +17,16 @@ function required(value, name) {
   return result;
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  const delay = Math.max(250, Number(timeoutMs) || 5000);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${delay} ms`)), delay);
+    timer.unref?.();
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
 function safeLogger(logger = console) {
   return {
     info: (...args) => logger.info?.(...args),
@@ -74,13 +84,18 @@ export async function createVpsProductionRuntime({ env = process.env, logger = c
   const pool = new Pool({
     connectionString: config.databaseUrl,
     max: Math.max(2, Math.min(50, Number(env.PG_POOL_MAX || 10))),
-    application_name: "oneui-firmware-worker-vps"
+    application_name: "oneui-firmware-worker-vps",
+    connectionTimeoutMillis: config.pgConnectionTimeoutMs,
+    idleTimeoutMillis: config.pgIdleTimeoutMs,
+    query_timeout: config.pgQueryTimeoutMs,
+    statement_timeout: config.pgStatementTimeoutMs
   });
   const redis = new Redis(config.redisUrl, {
     lazyConnect: true,
     maxRetriesPerRequest: 3,
     enableOfflineQueue: false,
-    retryStrategy: () => null,
+    connectTimeout: config.healthTimeoutMs,
+    retryStrategy: (times) => Math.min(1000 + times * 500, 5000),
     connectionName: "oneui-firmware-worker-vps"
   });
   redis.on("error", (error) => log.warn?.(`VPS Redis connection error: ${error.message}`));
@@ -150,10 +165,12 @@ export async function createVpsProductionRuntime({ env = process.env, logger = c
     coordinatorNamespace,
     async health() {
       if (closed) throw new Error("VPS runtime is closed");
-      await pool.query("SELECT 1 AS ok");
-      const redisStatus = await redis.ping();
+      const [, redisStatus, counts] = await withTimeout(Promise.all([
+        pool.query("SELECT 1 AS ok"),
+        redis.ping(),
+        queues["notification-delivery"].queue.getJobCounts("waiting", "active", "failed")
+      ]), config.healthTimeoutMs, "VPS dependency health check");
       if (redisStatus !== "PONG") throw new Error("Redis ping failed");
-      const counts = await queues["notification-delivery"].queue.getJobCounts("waiting", "active", "failed");
       return { ok: true, postgres: true, redis: true, notificationQueue: counts };
     },
     async runAlarms() {

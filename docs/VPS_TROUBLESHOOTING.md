@@ -150,6 +150,27 @@ sudo systemctl restart oneui-bot.service
 
 Do not restart unrelated VPS services.
 
+## Concurrent queries and timeout protection
+
+Interactive queries share identical in-flight requests, while different users
+can be processed in parallel. Updates from the same chat are serialized so a
+new command cannot overwrite an earlier query or confirmation state. Database
+and health-check operations have bounded timeouts; transient query-message
+delivery failures are placed into the existing notification queue for retry.
+
+The defaults are conservative and require no extra environment values:
+
+- PostgreSQL connection: 5 seconds;
+- PostgreSQL query and statement: 15 seconds;
+- health checks: 5 seconds;
+- VPS HTTP request: 30 seconds.
+
+If the VPS is under unusual load, inspect queue state and memory before raising
+concurrency. Do not remove the timeout protection or use unlimited worker
+concurrency. A Telegram 401/409, invalid credentials, a second poller, or an
+active Webhook remains an external configuration problem and must be resolved
+separately.
+
 ## Update failed
 
 Use the update runbook's validation sequence:

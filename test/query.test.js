@@ -2873,8 +2873,9 @@ async function dispatchTelegramTestUpdate(env, update, payloads) {
   for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
 }
 
-async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvRejectsWrites = false, historyRows = null }) {
+async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvRejectsWrites = false, historyRows = null, telegramUnavailable = false }) {
   const kv = memoryKv();
+  const queuedNotifications = [];
   let kvWrites = 0;
   if (kvRejectsWrites) {
     kv.put = async () => {
@@ -2908,7 +2909,9 @@ async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvReject
     WEBHOOK_SECRET: "test-header-secret",
     TELEGRAM_BOT_TOKEN: "test-token",
     TELEGRAM_CHAT_ID: "997",
-    TELEGRAM_QUERY_PLACEHOLDER_ENABLED: "true"
+    TELEGRAM_QUERY_PLACEHOLDER_ENABLED: "true",
+    NOTIFICATION_QUEUE: { async send(message) { queuedNotifications.push(message); } },
+    NOTIFICATION_QUEUE_ENABLED: "true"
   };
   const telegram = [];
   let historyCalls = 0;
@@ -2917,6 +2920,12 @@ async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvReject
     if (value.includes("api.telegram.org")) {
       const body = init.body ? JSON.parse(String(init.body)) : {};
       telegram.push({ url: value, body });
+      if (telegramUnavailable) {
+        return new Response(JSON.stringify({ ok: false, description: "temporary Telegram outage" }), {
+          status: 503,
+          headers: { "content-type": "application/json" }
+        });
+      }
       return new Response(JSON.stringify({ ok: true, result: { message_id: telegram.length } }), {
         status: 200,
         headers: { "content-type": "application/json" }
@@ -2949,7 +2958,7 @@ async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvReject
     })
   }), workerEnv, { waitUntil(promise) { waits.push(promise); } });
   for (let round = 0; round < 5; round += 1) await Promise.allSettled([...waits, ...coordinatorWaits]);
-  return { response, telegram, historyCalls, kvWrites, workerEnv };
+  return { response, telegram, queuedNotifications, historyCalls, kvWrites, workerEnv };
 }
 
 test("plain firmware input still replies when Workers KV has exhausted its daily writes", async () => {
@@ -2972,6 +2981,12 @@ test("slow firmware input shows a delayed placeholder and then edits it with the
   assert.ok(firmwareResult);
   assert.ok(firmwareResult.url.includes("editMessageText"));
   assert.equal(result.historyCalls, 1);
+});
+
+test("query result is queued for retry when Telegram is temporarily unavailable", async () => {
+  const result = await dispatchFirmwareQueryUpdate({ input: "9480 tgy", telegramUnavailable: true });
+  assert.equal(result.historyCalls, 1);
+  assert.ok(result.queuedNotifications.some((message) => String(message.text).includes("SM-S9480")));
 });
 
 test("incomplete and unrelated plain text receive guidance instead of being ignored", async () => {

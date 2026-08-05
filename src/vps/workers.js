@@ -3,6 +3,7 @@ import Redis from "ioredis";
 import { processTelegramUpdate } from "../index.js";
 import { processMonitorQueueMessage, runScheduledTasks } from "../monitor.js";
 import { processNotificationQueue } from "../notification-queue.js";
+import { chatIdFromUpdate } from "../telegram.js";
 import { createVpsProductionRuntime } from "./production.js";
 import { startTelegramPolling } from "./telegram-polling.js";
 
@@ -35,12 +36,34 @@ async function processNotificationJob(job, runtime) {
   return { ok: true };
 }
 
+const telegramChatTails = new Map();
+
+export async function withTelegramChatOrder(chatId, task) {
+  if (typeof task !== "function") throw new TypeError("Telegram chat task is required");
+  const key = String(chatId || "unknown");
+  const previous = telegramChatTails.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  telegramChatTails.set(key, current);
+  await previous.catch(() => {});
+  try {
+    return await task();
+  } finally {
+    release();
+    if (telegramChatTails.get(key) === current) telegramChatTails.delete(key);
+  }
+}
+
 async function processTelegramJob(job, runtime, origin) {
   const data = job.data || {};
   const update = data.update || data;
-  await processTelegramUpdate(update, runtime.env, origin, runtime.context);
-  await runtime.context.waitForBackground();
-  return { ok: true };
+  const chatId = String(chatIdFromUpdate(update) || `update:${update?.update_id || job.id}`);
+  return withTelegramChatOrder(chatId, async () => {
+    const pendingBefore = runtime.context.pendingBackground?.() || new Set();
+    await processTelegramUpdate(update, runtime.env, origin, runtime.context);
+    await runtime.context.waitForBackground({ exclude: pendingBefore });
+    return { ok: true };
+  });
 }
 
 async function processMonitorJob(job, runtime) {
@@ -107,6 +130,7 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     : null;
 
   let restartRequested = false;
+  let forcedExitTimer = null;
   const watchdogTimer = setInterval(() => {
     const status = telegramPolling?.status?.();
     if (!status || status.ok || status.fatalFailure || restartRequested) return;
@@ -119,6 +143,7 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     // The service already uses Restart=on-failure. Mark this controlled
     // restart as a failure so a clean SIGTERM does not hide the fault.
     process.exitCode = 1;
+    forcedExitTimer = setTimeout(() => process.exit(1), 15_000);
     process.kill(process.pid, "SIGTERM");
   }, 30_000);
   watchdogTimer.unref?.();
@@ -143,6 +168,7 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     async close() {
       clearInterval(timer);
       clearInterval(watchdogTimer);
+      if (forcedExitTimer) clearTimeout(forcedExitTimer);
       await telegramPolling?.close();
       await Promise.all(workers.map((worker) => worker.close()));
       connection.disconnect();

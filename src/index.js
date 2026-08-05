@@ -64,7 +64,8 @@ import {
   getMonitorIntervalSettings,
   setMonitorIntervalSettings
 } from "./monitor-scheduler.js";
-import { processNotificationQueue } from "./notification-queue.js";
+import { enqueueTelegramNotification, processNotificationQueue } from "./notification-queue.js";
+import { randomId } from "./runtime/random-id.js";
 import {
   answerCallbackQuery,
   chatIdFromUpdate,
@@ -482,7 +483,22 @@ export async function processTelegramUpdate(update, env, origin = "", ctx = null
   if (!chatId || !text) return jsonResponse({ ok: true, ignored: true });
 
   const message = update.message || update.edited_message || {};
-  const identity = await getIdentity(env, chatId);
+  let identity;
+  try {
+    identity = await getIdentity(env, chatId);
+  } catch (error) {
+    console.log(`Telegram update state lookup failed: ${error.message}`);
+    const failureText = "服务暂时繁忙，请稍后重试。\n\nThe service is temporarily busy. Please try again shortly.";
+    const sent = await sendTelegramMessage(env, chatId, failureText);
+    if (!sent && env.NOTIFICATION_QUEUE?.send && env.TELEGRAM_BOT_TOKEN && String(env.VPS_SHADOW_MODE || "").toLowerCase() !== "true") {
+      await enqueueTelegramNotification(env, {
+        id: `telegram-error:${randomId()}`,
+        chatId,
+        text: failureText
+      }).catch((queueError) => console.log(`Failed to queue Telegram state error: ${queueError.message}`));
+    }
+    return jsonResponse({ ok: false, degraded: true });
+  }
 
   if (await handlePendingDeleteAllConfirmation(env, chatId, identity, text)) {
     return jsonResponse({ ok: true, deleted: true });
@@ -1744,7 +1760,10 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
   const key = `${chatId}:${messageId}:${id}`;
   if (downloadProgressWatches.has(key)) return;
   let polls = 0;
+  let polling = false;
   const timer = setInterval(async () => {
+    if (polling) return;
+    polling = true;
     polls += 1;
     try {
       const result = await getFirmwareDownload(env, id);
@@ -1759,6 +1778,8 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
       await safeEditOrSend(env, chatId, messageId, `${lang === "en" ? "Firmware download" : "固件下载"}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang));
     } catch {
       // A later refresh or the next poll can recover from transient errors.
+    } finally {
+      polling = false;
     }
   }, 5000);
   timer.unref?.();
@@ -3879,10 +3900,20 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
 
 async function handleManualQuery(env, chatId, text, options = {}) {
   const startedAt = Date.now();
-  const [lang, cacheSettings] = await Promise.all([
+  const [langResult, cacheSettingsResult] = await Promise.allSettled([
     getUserLanguage(env, chatId),
     getCacheSettings(env)
   ]);
+  const lang = langResult.status === "fulfilled" ? langResult.value : "zh";
+  const cacheSettings = cacheSettingsResult.status === "fulfilled"
+    ? cacheSettingsResult.value
+    : { enabled: true, adminRealtimeEnabled: false };
+  if (langResult.status === "rejected") {
+    console.log(`User language lookup failed; using Chinese fallback: ${langResult.reason?.message || langResult.reason}`);
+  }
+  if (cacheSettingsResult.status === "rejected") {
+    console.log(`Cache settings lookup failed; using safe defaults: ${cacheSettingsResult.reason?.message || cacheSettingsResult.reason}`);
+  }
   const recordQueryMetric = (metric) => logQueryMetric(metric, env, options.ctx);
   const refreshInfo = parseRefreshQueryText(text);
   let query;
@@ -3906,13 +3937,36 @@ async function handleManualQuery(env, chatId, text, options = {}) {
   let outputMessageId = options.targetMessageId || null;
   const cacheLookupStartedAt = Date.now();
 
-  const deliver = async (body, markup = keyboard) => {
-    if (outputMessageId) {
-      await safeEditOrSend(env, chatId, outputMessageId, body, markup);
-      return outputMessageId;
+  const queueFailedDelivery = async (body, markup) => {
+    const shadowMode = String(env.VPS_SHADOW_MODE || "").toLowerCase() === "true";
+    const sendDisabled = String(env.TELEGRAM_SEND_ENABLED || "").toLowerCase() === "false";
+    if (shadowMode || sendDisabled || !env.TELEGRAM_BOT_TOKEN || !env.NOTIFICATION_QUEUE?.send) return false;
+    try {
+      const result = await enqueueTelegramNotification(env, {
+        id: `query-reply:${randomId()}`,
+        chatId,
+        text: body,
+        replyMarkup: markup
+      });
+      return Boolean(result?.ok);
+    } catch (error) {
+      console.log(`Failed to queue query reply fallback: ${error.message}`);
+      return false;
     }
-    const sent = await sendTelegramMessageResult(env, chatId, body, markup);
-    if (sent.messageId) outputMessageId = sent.messageId;
+  };
+
+  const deliver = async (body, markup = keyboard, deliveryOptions = {}) => {
+    let delivered = false;
+    if (outputMessageId) {
+      delivered = await safeEditOrSend(env, chatId, outputMessageId, body, markup);
+    } else {
+      const sent = await sendTelegramMessageResult(env, chatId, body, markup);
+      delivered = Boolean(sent.ok);
+      if (sent.messageId) outputMessageId = sent.messageId;
+    }
+    if (!delivered && deliveryOptions.queueOnFailure !== false) {
+      await queueFailedDelivery(body, markup);
+    }
     return outputMessageId;
   };
 

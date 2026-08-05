@@ -9,17 +9,30 @@ function safeError(error) {
   return String(error?.message || error || "request failed").slice(0, 240);
 }
 
-async function runChecks(checks = {}) {
-  const result = {};
-  for (const [name, check] of Object.entries(checks)) {
+function withTimeout(promise, timeoutMs, label) {
+  const delay = Math.max(250, Number(timeoutMs) || 5000);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${delay} ms`)), delay);
+    timer.unref?.();
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+async function runChecks(checks = {}, timeoutMs = 5000) {
+  const entries = await Promise.all(Object.entries(checks).map(async ([name, check]) => {
     try {
-      const value = typeof check === "function" ? await check() : check;
-      result[name] = typeof value === "object" ? value : { ok: value !== false };
+      const value = await withTimeout(
+        typeof check === "function" ? check() : check,
+        timeoutMs,
+        `${name} health check`
+      );
+      return [name, typeof value === "object" ? value : { ok: value !== false }];
     } catch (error) {
-      result[name] = { ok: false, error: safeError(error) };
+      return [name, { ok: false, error: safeError(error) }];
     }
-  }
-  return result;
+  }));
+  return Object.fromEntries(entries);
 }
 
 function requireInternal(request, reply, secret) {
@@ -38,14 +51,15 @@ export function registerVpsRoutes(app, {
   diagnosticsHandler,
   metricsHandler,
   healthChecks = {}
-} = {}) {
+  } = {}) {
   if (!app?.get || !app?.post) throw new TypeError("registerVpsRoutes requires a Fastify-like app");
   const config = context?.config || {};
+  const healthTimeoutMs = Number(config.healthTimeoutMs || 5000);
 
   app.get("/", async () => ({ ok: true, service: "oneui-firmware-vps", version }));
 
   app.get("/health", async (_request, reply) => {
-    const checks = await runChecks(healthChecks);
+    const checks = await runChecks(healthChecks, healthTimeoutMs);
     const ok = Object.values(checks).every((check) => check?.ok !== false);
     reply.code(ok ? 200 : 503);
     return {

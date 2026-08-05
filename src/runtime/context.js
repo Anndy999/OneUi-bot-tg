@@ -31,8 +31,12 @@ export function createVpsRuntimeContext({
       background.add(task);
       return task;
     },
-    async waitForBackground() {
-      await Promise.allSettled([...background]);
+    pendingBackground() {
+      return new Set(background);
+    },
+    async waitForBackground({ exclude = null } = {}) {
+      const pending = [...background].filter((task) => !exclude?.has(task));
+      await Promise.allSettled(pending);
     },
     async close() {
       await Promise.all(Object.values(queues).map((queue) => queue.close?.() || undefined));

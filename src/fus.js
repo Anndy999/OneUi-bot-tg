@@ -141,6 +141,7 @@ function extractCookies(response) {
 const fusLanes = new Map();
 const activeLaneByTarget = new Map();
 const laneAffinity = new Map();
+const MAX_LANE_AFFINITY = 2000;
 
 function monitorLaneCount(env) {
   const value = Number(env?.FUS_MONITOR_LANES || 3);
@@ -196,7 +197,17 @@ function runtimeLaneScore(env, lane) {
     Number(lane.recentErrors || 0) * 500 + sessionPenalty + circuitPenalty;
 }
 
+function pruneLaneAffinity(now = Date.now()) {
+  for (const [key, entry] of laneAffinity) {
+    if (Number(entry?.expiresAt || 0) <= now) laneAffinity.delete(key);
+  }
+  while (laneAffinity.size > MAX_LANE_AFFINITY) {
+    laneAffinity.delete(laneAffinity.keys().next().value);
+  }
+}
+
 function selectRuntimeLane(env, model, csc, options = {}) {
+  pruneLaneAffinity();
   const role = String(options.role || options.priority || (options.monitor ? "monitor" : "interactive")).toLowerCase();
   if (role === "admin") return getLane("admin");
   const targetKey = `${role}:${String(model || "").toUpperCase()}:${String(csc || "").toUpperCase()}`;

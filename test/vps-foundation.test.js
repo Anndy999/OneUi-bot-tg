@@ -134,3 +134,43 @@ test("VPS API protects webhook and internal routes and returns safe health", asy
   await app.close();
   await context.close();
 });
+
+test("VPS background waits are isolated between concurrent Telegram jobs", async () => {
+  const context = createVpsRuntimeContext();
+  let releaseOther;
+  const other = context.waitUntil(new Promise((resolve) => { releaseOther = resolve; }));
+  const before = context.pendingBackground();
+  let ownFinished = false;
+  context.waitUntil(Promise.resolve().then(() => { ownFinished = true; }));
+
+  await context.waitForBackground({ exclude: before });
+  assert.equal(ownFinished, true);
+  assert.equal(other, [...before][0]);
+
+  releaseOther();
+  await context.waitForBackground();
+  await context.close();
+});
+
+test("VPS health checks fail promptly when one dependency check hangs", async () => {
+  const context = createVpsRuntimeContext({
+    config: createVpsConfig({ VPS_HEALTH_TIMEOUT_MS: "1000" })
+  });
+  const { app } = buildVpsApp({
+    app: Fastify(),
+    context,
+    healthChecks: {
+      slow: () => new Promise((resolve) => setTimeout(() => resolve({ ok: true }), 1100)),
+      fast: async () => ({ ok: true })
+    }
+  });
+  await app.ready();
+  const startedAt = Date.now();
+  const response = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(response.statusCode, 503);
+  assert.match(response.json().checks.slow.error, /timed out/);
+  assert.equal(response.json().checks.fast.ok, true);
+  assert.ok(Date.now() - startedAt < 2000);
+  await app.close();
+  await context.close();
+});

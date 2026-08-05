@@ -11,6 +11,12 @@ function text(value, fallback = "") {
 }
 
 export function createVpsConfig(env = process.env) {
+  const bounded = (value, fallback, minimum, maximum) => {
+    const parsed = Number(value ?? fallback);
+    return Number.isFinite(parsed)
+      ? Math.max(minimum, Math.min(maximum, Math.floor(parsed)))
+      : fallback;
+  };
   return {
     nodeEnv: text(env.NODE_ENV, "development"),
     host: text(env.VPS_HOST, "127.0.0.1"),
@@ -27,7 +33,13 @@ export function createVpsConfig(env = process.env) {
     telegramPollingTimeoutSeconds: Math.max(1, Math.min(50, Number(env.TELEGRAM_POLLING_TIMEOUT_SECONDS || 30))),
     monitorNotificationsEnabled: bool(env.MONITOR_NOTIFICATIONS_ENABLED, false),
     queuePrefix: text(env.QUEUE_PREFIX, "oneui"),
-    scheduleIntervalMs: Math.max(15_000, Math.min(10 * 60_000, Number(env.VPS_SCHEDULE_INTERVAL_MS || 60_000)))
+    scheduleIntervalMs: bounded(env.VPS_SCHEDULE_INTERVAL_MS, 60_000, 15_000, 10 * 60_000),
+    requestTimeoutMs: bounded(env.VPS_REQUEST_TIMEOUT_MS, 30_000, 5_000, 5 * 60_000),
+    healthTimeoutMs: bounded(env.VPS_HEALTH_TIMEOUT_MS, 5_000, 1_000, 30_000),
+    pgConnectionTimeoutMs: bounded(env.PG_CONNECTION_TIMEOUT_MS, 5_000, 1_000, 60_000),
+    pgIdleTimeoutMs: bounded(env.PG_IDLE_TIMEOUT_MS, 30_000, 5_000, 10 * 60_000),
+    pgQueryTimeoutMs: bounded(env.PG_QUERY_TIMEOUT_MS, 15_000, 1_000, 5 * 60_000),
+    pgStatementTimeoutMs: bounded(env.PG_STATEMENT_TIMEOUT_MS, 15_000, 1_000, 5 * 60_000)
   };
 }
 

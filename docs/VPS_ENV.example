@@ -10,6 +10,14 @@ TELEGRAM_SEND_ENABLED=false
 MONITOR_NOTIFICATIONS_ENABLED=false
 VPS_SCHEDULE_INTERVAL_MS=60000
 
+# Optional bounded runtime protection; the defaults are safe for most VPSs.
+# VPS_REQUEST_TIMEOUT_MS=30000
+# VPS_HEALTH_TIMEOUT_MS=5000
+# PG_CONNECTION_TIMEOUT_MS=5000
+# PG_IDLE_TIMEOUT_MS=30000
+# PG_QUERY_TIMEOUT_MS=15000
+# PG_STATEMENT_TIMEOUT_MS=15000
+
 # Required in production, injected outside Git.
 WEBHOOK_SECRET=example-webhook-secret
 INTERNAL_API_SECRET=replace-with-a-separate-long-random-value

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createPersistentQueueBinding, validateVpsProductionEnv } from "../src/vps/production.js";
 import { OFFSET_KEY, startTelegramPolling } from "../src/vps/telegram-polling.js";
+import { withTelegramChatOrder } from "../src/vps/workers.js";
 import { randomId } from "../src/runtime/random-id.js";
 
 const webhookSecret = ["webhook", "test", "secret"].join("-");
@@ -133,4 +134,23 @@ test("VPS Telegram polling retries request timeouts instead of stopping", async 
   assert.equal(poller.status().state, "healthy");
   assert.ok(calls >= 2);
   await poller.close();
+});
+
+test("VPS Telegram jobs serialize one chat without blocking another chat", async () => {
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const first = withTelegramChatOrder("same-chat", async () => {
+    events.push("first-start");
+    await firstGate;
+    events.push("first-end");
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const second = withTelegramChatOrder("same-chat", async () => events.push("second"));
+  const other = withTelegramChatOrder("other-chat", async () => events.push("other"));
+  await other;
+  assert.deepEqual(events, ["first-start", "other"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["first-start", "other", "first-end", "second"]);
 });
