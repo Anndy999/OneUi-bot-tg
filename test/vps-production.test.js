@@ -105,3 +105,32 @@ test("VPS Telegram polling marks invalid-token and webhook-conflict responses un
   assert.equal(observedStatus.fatalFailure, true);
   assert.equal(observedStatus.ok, false);
 });
+
+test("VPS Telegram polling retries request timeouts instead of stopping", async () => {
+  let calls = 0;
+  let resolveSecondCall;
+  const secondCall = new Promise((resolve) => { resolveSecondCall = resolve; });
+  const poller = startTelegramPolling({
+    token: "poll-token",
+    storage: { async get() { return null; }, async put() {} },
+    queue: { async send() {} },
+    logger: { error() {}, warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("request timed out");
+        error.name = "AbortError";
+        throw error;
+      }
+      resolveSecondCall();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return { ok: true, async json() { return { ok: true, result: [] }; } };
+    }
+  });
+  await secondCall;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(poller.status().ok, true);
+  assert.equal(poller.status().state, "healthy");
+  assert.ok(calls >= 2);
+  await poller.close();
+});

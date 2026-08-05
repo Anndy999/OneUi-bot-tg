@@ -39,6 +39,7 @@ export function startTelegramPolling({
   let retryTimer = null;
   let retryResolve = null;
   const staleAfterMs = Math.max(90_000, (longPollSeconds + 10) * 3 * 1000);
+  let offsetLoaded = false;
 
   const waitForRetry = (ms) => new Promise((resolve) => {
     retryResolve = resolve;
@@ -79,13 +80,18 @@ export function startTelegramPolling({
   };
 
   const run = async () => {
-    const savedOffset = await storage.get(OFFSET_KEY);
-    const parsedOffset = Number(savedOffset);
-    offset = Number.isSafeInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : null;
     let retryMs = 1000;
 
     while (!stopped) {
       try {
+        // Loading the offset is part of the retry loop. A temporary PostgreSQL
+        // failure must not permanently stop polling before the first request.
+        if (!offsetLoaded) {
+          const savedOffset = await storage.get(OFFSET_KEY);
+          const parsedOffset = Number(savedOffset);
+          offset = Number.isSafeInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : null;
+          offsetLoaded = true;
+        }
         const updates = await fetchUpdates();
         retryMs = 1000;
         for (const update of updates) {
@@ -106,7 +112,10 @@ export function startTelegramPolling({
           await storage.put(OFFSET_KEY, String(offset));
         }
       } catch (error) {
-        if (stopped || error?.name === "AbortError") return;
+        // AbortError is normally produced by the request timeout above. It is
+        // a transient network failure, not a reason to terminate the poller.
+        // The explicit close() path is still handled by the stopped guard.
+        if (stopped) return;
         lastFailureAt = Date.now();
         lastError = safeError(error);
         fatalFailure = /Telegram getUpdates rejected \((?:401|409)\)/.test(lastError);
@@ -130,9 +139,11 @@ export function startTelegramPolling({
         ok,
         state: stopped ? "stopped" : lastSuccessAt ? (lastError ? "retrying" : "healthy") : (lastError ? "retrying" : "starting"),
         startedAt,
+        lastActivityAt,
         lastSuccessAt,
         lastFailureAt,
         fatalFailure,
+        staleAfterMs,
         lastError: lastError || undefined
       };
     },

@@ -113,6 +113,22 @@ Any Telegram-side change requires a separately approved operator action. The
 poller stores its next update offset in PostgreSQL under an internal key and
 uses stable BullMQ job IDs to avoid ordinary duplicate enqueueing.
 
+Transient Telegram/network timeouts and temporary PostgreSQL failures are
+retried with backoff. If the poller remains stale beyond its grace period, the
+application exits with a failure status and the existing `Restart=on-failure`
+systemd policy starts it again. This is visible without exposing secrets:
+
+```bash
+curl -sS http://127.0.0.1:8787/health
+sudo systemctl show oneui-bot.service -p NRestarts -p ExecMainStatus --no-pager
+```
+
+HTTP 401 means the Token is invalid or revoked; HTTP 409 means another process
+is polling the same Bot Token or a Webhook is still active. Automatic restarts
+cannot correct those Telegram-side conflicts. Keep exactly one polling process
+and resolve the Token/Webhook issue through the separately approved Telegram
+operation.
+
 ## Messages are queued but not handled
 
 ```bash

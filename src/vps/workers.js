@@ -106,13 +106,43 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
     })
     : null;
 
+  let restartRequested = false;
+  const watchdogTimer = setInterval(() => {
+    const status = telegramPolling?.status?.();
+    if (!status || status.ok || status.fatalFailure || restartRequested) return;
+    const lastActivityAt = Number(status.lastActivityAt || status.startedAt || 0);
+    const staleAfterMs = Math.max(90_000, Number(status.staleAfterMs || 180_000));
+    if (!lastActivityAt || Date.now() - lastActivityAt <= staleAfterMs) return;
+
+    restartRequested = true;
+    logger.error?.("Telegram polling is stale; asking systemd to restart the VPS bot");
+    // The service already uses Restart=on-failure. Mark this controlled
+    // restart as a failure so a clean SIGTERM does not hide the fault.
+    process.exitCode = 1;
+    process.kill(process.pid, "SIGTERM");
+  }, 30_000);
+  watchdogTimer.unref?.();
+
   return {
     workers,
     pollingStatus() {
       return telegramPolling?.status?.() || { ok: true, state: "disabled" };
     },
+    queueStatus() {
+      const workerStates = workers.map((worker) => ({
+        name: worker.name,
+        running: typeof worker.isRunning === "function" ? worker.isRunning() : true
+      }));
+      const redisReady = workerConnection.status === "ready";
+      return {
+        ok: redisReady && workerStates.every((worker) => worker.running),
+        redis: workerConnection.status,
+        workers: workerStates
+      };
+    },
     async close() {
       clearInterval(timer);
+      clearInterval(watchdogTimer);
       await telegramPolling?.close();
       await Promise.all(workers.map((worker) => worker.close()));
       connection.disconnect();

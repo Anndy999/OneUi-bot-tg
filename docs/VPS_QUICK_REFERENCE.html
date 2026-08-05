@@ -55,6 +55,8 @@ sudo journalctl -u oneui-bot.service -f</pre>
   </div>
   <h2>备份</h2>
   <p>使用 <code>deploy/backup.sh</code>，通过受保护的 secret store 注入 <code>DATABASE_URL</code>。将 PostgreSQL dump 和源代码归档复制到 VPS 外部，并定期验证可读性。数据库迁移不是普通更新的一部分，必须单独审批。</p>
+  <h2>轮询失活自动恢复</h2>
+  <p>临时网络或数据库异常会自动重试；长时间没有成功轮询时，应用会以失败状态退出，由 systemd 自动重启。查看 <code>/health</code> 和 <code>NRestarts</code>。401/409 仍需处理 Token 或重复轮询/Webhook 冲突。</p>
   <p>详细说明：<a href="ONE_CLICK_DEPLOY.md">部署</a> · <a href="ONE_CLICK_UPDATE.md">更新</a> · <a href="VPS_TROUBLESHOOTING.md">故障排查</a></p>
 </main>
 </body>

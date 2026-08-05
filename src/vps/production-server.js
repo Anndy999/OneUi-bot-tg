@@ -24,7 +24,7 @@ const { app } = buildVpsApp({
   healthChecks: {
     storage: () => runtime.health(),
     cache: async () => ({ ok: (await runtime.redis.ping()) === "PONG" }),
-    queues: async () => ({ ok: true }),
+    queues: () => workers?.queueStatus?.() || { ok: false, state: "starting" },
     telegramPolling: () => workers?.pollingStatus?.() || { ok: false, state: "starting" }
   }
 });
