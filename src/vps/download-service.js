@@ -988,8 +988,10 @@ export class FirmwareDownloadService {
       await persistProgress(true);
       if (controller.signal.aborted) throw error;
       if (error instanceof OfficialSourceAuthorizationError) {
-        await rm(partPath, { force: true });
-        delete job.parallel;
+        // A FUS session can expire while other lanes are still transferring a
+        // large firmware. Keep the preallocated part and each lane's durable
+        // byte count so the next authenticated session resumes only what is
+        // missing instead of redownloading the whole file.
         throw error;
       }
       this.logger.warn?.(`Parallel firmware download unavailable; falling back to one connection: ${error.message}`);
@@ -1045,13 +1047,21 @@ export class FirmwareDownloadService {
       if (!transferComplete) {
         if (job.downloadMode === "fus" || !job.sourceUrl) await resolveFusJob();
         let parallelCompleted = false;
-        let authorizationRefreshes = 0;
+        let authorizationRefreshesWithoutProgress = 0;
+        let authorizationRefreshBytes = Number(job.bytes || 0);
         const refreshFusAuthorization = async () => {
-          authorizationRefreshes += 1;
+          const currentBytes = Number(job.bytes || 0);
+          if (currentBytes > authorizationRefreshBytes) {
+            authorizationRefreshBytes = currentBytes;
+            authorizationRefreshesWithoutProgress = 0;
+          } else {
+            authorizationRefreshesWithoutProgress += 1;
+          }
+          if (authorizationRefreshesWithoutProgress >= 2) {
+            throw new Error("Samsung official source repeatedly rejected a refreshed FUS authorization before download progress could continue");
+          }
           this.logger.warn?.("Samsung FUS download authorization expired; refreshing the official download session.");
-          job.bytes = 0;
-          job.downloadStartBytes = 0;
-          resetSpeedTracking(job, "download", 0, this.now());
+          resetSpeedTracking(job, "download", Math.max(0, currentBytes - Number(job.downloadStartBytes || 0)), this.now());
           await resolveFusJob();
         };
         while (true) {
@@ -1059,16 +1069,17 @@ export class FirmwareDownloadService {
             parallelCompleted = await this.downloadParallel(partPath, job, controller);
             break;
           } catch (error) {
-            if (!(error instanceof OfficialSourceAuthorizationError) || job.downloadMode !== "fus" || authorizationRefreshes >= 1) throw error;
+            if (!(error instanceof OfficialSourceAuthorizationError) || job.downloadMode !== "fus") throw error;
             await refreshFusAuthorization();
           }
         }
         if (!parallelCompleted) {
-          let response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
-          if (response.status === 401 && job.downloadMode === "fus" && authorizationRefreshes < 1) {
+          let response;
+          while (true) {
+            response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
+            if (response.status !== 401 || job.downloadMode !== "fus") break;
             await cancelResponseBody(response.body);
             await refreshFusAuthorization();
-            response = await this.fetchOfficial(job.sourceUrl, controller.signal, job.sourceHeaders || {});
           }
           if (!response.ok) {
             await cancelResponseBody(response.body);

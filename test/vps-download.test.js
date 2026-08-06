@@ -418,17 +418,20 @@ test("VPS FUS resolver uses the Bifrost-compatible authentication flow without e
   assert.equal(Object.hasOwn(result.sourceHeaders, "cookie"), false);
 });
 
-test("FUS download refreshes its session once when the official Range source returns HTTP 401", async () => {
+test("FUS download refreshes an expired authorization and resumes unfinished Range segments", async () => {
   const dir = await tempDir();
   try {
-    const fixture = Buffer.from("FUS authorization refresh fixture", "utf8");
+    const fixture = Buffer.from("FUS authorization resume fixture", "utf8");
     let resolveCalls = 0;
     const rangeAuthorizations = [];
     const service = await new FirmwareDownloadService({
       config: createDownloadConfig({
         DOWNLOAD_DIR: dir,
         DOWNLOAD_MIN_FREE_BYTES: "0",
-        DOWNLOAD_PARALLEL_MIN_BYTES: "1"
+        DOWNLOAD_PARALLEL_MIN_BYTES: "1",
+        DOWNLOAD_PARALLEL_SEGMENTS: "2",
+        DOWNLOAD_PARALLEL_CHUNK_BYTES: "8",
+        DOWNLOAD_PARALLEL_STAGGER_MS: "0"
       }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       resolveImpl: async () => {
@@ -442,13 +445,13 @@ test("FUS download refreshes its session once when the official Range source ret
       },
       fetchImpl: async (_url, init = {}) => {
         const authorization = String(init.headers?.authorization || "");
-        rangeAuthorizations.push(authorization);
-        if (authorization !== "session-2") return new Response("unauthorized", { status: 401 });
         const rangeValue = String(init.headers?.range || init.headers?.Range || "");
         const match = rangeValue.match(/^bytes=(\d+)-(\d+)$/);
+        rangeAuthorizations.push(`${authorization}:${rangeValue}`);
         if (!match) return new Response(fixture, { status: 200 });
         const start = Number(match[1]);
         const end = Math.min(fixture.length - 1, Number(match[2]));
+        if (authorization === "session-1" && start > 0) return new Response("unauthorized", { status: 401 });
         return new Response(fixture.subarray(start, end + 1), {
           status: 206,
           headers: {
@@ -462,9 +465,45 @@ test("FUS download refreshes its session once when the official Range source ret
     await service.runJob({ data: { id: job.id } });
     assert.equal(service.get(job.id).state, "completed");
     assert.equal(resolveCalls, 2);
-    assert.ok(rangeAuthorizations.includes("session-1"));
-    assert.ok(rangeAuthorizations.includes("session-2"));
+    assert.ok(rangeAuthorizations.some((value) => value === "session-1:bytes=0-0"));
+    assert.ok(rangeAuthorizations.some((value) => value.startsWith("session-1:bytes=") && !value.endsWith("bytes=0-0")));
+    assert.ok(rangeAuthorizations.some((value) => value.startsWith("session-2:bytes=") && !value.endsWith("bytes=0-0")));
     assert.deepEqual(await readFile(join(dir, service.get(job.id).fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("FUS download stops safely when refreshed authorization makes no transfer progress", async () => {
+  const dir = await tempDir();
+  try {
+    let resolveCalls = 0;
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({
+        DOWNLOAD_DIR: dir,
+        DOWNLOAD_MIN_FREE_BYTES: "0",
+        DOWNLOAD_PARALLEL_MIN_BYTES: "1"
+      }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => {
+        resolveCalls += 1;
+        return {
+          sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/refresh-fail.zip",
+          sourceHeaders: { authorization: `session-${resolveCalls}` },
+          fileName: "SM-S9380_REFRESH_FAIL.zip",
+          size: 32
+        };
+      },
+      fetchImpl: async () => new Response("unauthorized", { status: 401 })
+    }).init({ startQueue: false });
+    const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await assert.rejects(
+      () => service.runJob({ data: { id: job.id } }),
+      /repeatedly rejected a refreshed FUS authorization before download progress/
+    );
+    assert.equal(resolveCalls, 2);
+    assert.equal(service.get(job.id).state, "failed");
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
