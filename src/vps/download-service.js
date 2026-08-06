@@ -20,7 +20,11 @@ const IO_BUFFER_BYTES = 4 * 1024 * 1024;
 const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
 const MAX_PARALLEL_RANGE_COUNT = 512;
-const MAX_PARALLEL_LANE_COUNT = 48;
+// Samsung FUS starts throttling a single client aggressively when it opens a
+// large burst of Range requests. Bifrost uses eight connections per task; keep
+// the same hard ceiling so a stale VPS environment variable cannot silently
+// turn one download back into 16 or 24 competing connections.
+const MAX_PARALLEL_LANE_COUNT = 8;
 // Bifrost's public downloader uses eight connections per download. Starting
 // dozens of Samsung FUS ranges at once can reduce aggregate throughput when
 // the CDN applies per-IP congestion control and also turns local writes into
@@ -933,12 +937,15 @@ export class FirmwareDownloadService {
     if (!Number.isSafeInteger(total) || total < this.config.parallelMinBytes) return false;
     if (total > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
     job.totalBytes = total;
-    // Split the file into bounded work ranges.  The lanes below claim these
-    // ranges dynamically, so a slow Samsung connection cannot leave the final
-    // large static segment as the only remaining work.
+    // Match Bifrost's layout: one long-lived Range request per lane for the
+    // whole transfer. Samsung FUS can sharply throttle a client that keeps
+    // opening fresh 256 MiB requests. Eight equal, persistent ranges avoid
+    // that mid-download collapse while still preserving each range's offset
+    // for a safe resume after a pause or a renewed authorization.
     const requestedSegmentCount = Math.min(
       MAX_PARALLEL_RANGE_COUNT,
-      Math.max(2, Math.ceil(total / this.config.parallelChunkBytes))
+      total,
+      Math.max(2, this.config.parallelMaxSegments)
     );
     const savedSegments = Array.isArray(job.parallel?.segments) ? job.parallel.segments : null;
     const savedFile = await stat(partPath).catch(() => null);

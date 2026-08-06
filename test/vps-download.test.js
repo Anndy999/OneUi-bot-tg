@@ -42,7 +42,13 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.parallelScaleTargetBytesPerSecond, 150 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
-  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 48);
+  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 8);
+  const staleHighConcurrency = createDownloadConfig({
+    DOWNLOAD_PARALLEL_SEGMENTS: "24",
+    DOWNLOAD_PARALLEL_MAX_SEGMENTS: "24"
+  });
+  assert.equal(staleHighConcurrency.parallelSegments, 8);
+  assert.equal(staleHighConcurrency.parallelMaxSegments, 8);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
@@ -274,6 +280,7 @@ test("parallel Range download assembles the file and verifies the completed outp
       DOWNLOAD_DIR: dir,
       DOWNLOAD_MIN_FREE_BYTES: "0",
       DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MAX_SEGMENTS: "2",
       DOWNLOAD_PARALLEL_MIN_BYTES: "1"
     });
     const service = await new FirmwareDownloadService({
@@ -309,7 +316,7 @@ test("parallel Range download assembles the file and verifies the completed outp
   }
 });
 
-test("parallel Range lanes claim later work ranges without exceeding the configured connection count", async () => {
+test("parallel Range uses one long-lived fixed range per configured connection", async () => {
   const dir = await tempDir();
   try {
     const fixture = Buffer.alloc(32 * 1024 * 1024, 0x61);
@@ -320,6 +327,7 @@ test("parallel Range lanes claim later work ranges without exceeding the configu
       DOWNLOAD_DIR: dir,
       DOWNLOAD_MIN_FREE_BYTES: "0",
       DOWNLOAD_PARALLEL_SEGMENTS: "3",
+      DOWNLOAD_PARALLEL_MAX_SEGMENTS: "3",
       DOWNLOAD_PARALLEL_STAGGER_MS: "0",
       DOWNLOAD_PARALLEL_MIN_BYTES: "1",
       DOWNLOAD_PARALLEL_CHUNK_BYTES: String(8 * 1024 * 1024)
@@ -358,7 +366,7 @@ test("parallel Range lanes claim later work ranges without exceeding the configu
     const completed = service.get(job.id);
     assert.equal(completed.state, "completed");
     assert.equal(maximumActiveRanges, 3);
-    assert.equal(dataRangeCalls, Math.ceil(fixture.length / (8 * 1024 * 1024)));
+    assert.equal(dataRangeCalls, 3);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
     await service.close();
   } finally {
@@ -478,6 +486,7 @@ test("parallel download pauses safely and resumes only unfinished ranges", async
       DOWNLOAD_DIR: dir,
       DOWNLOAD_MIN_FREE_BYTES: "0",
       DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MAX_SEGMENTS: "2",
       DOWNLOAD_PARALLEL_STAGGER_MS: "0",
       DOWNLOAD_PARALLEL_MIN_BYTES: "1",
       DOWNLOAD_PARALLEL_RETRIES: "0"
@@ -593,6 +602,7 @@ test("FUS download refreshes an expired authorization and resumes unfinished Ran
         DOWNLOAD_MIN_FREE_BYTES: "0",
         DOWNLOAD_PARALLEL_MIN_BYTES: "1",
         DOWNLOAD_PARALLEL_SEGMENTS: "2",
+        DOWNLOAD_PARALLEL_MAX_SEGMENTS: "2",
         DOWNLOAD_PARALLEL_CHUNK_BYTES: "8",
         DOWNLOAD_PARALLEL_STAGGER_MS: "0"
       }),

@@ -88,13 +88,17 @@ keeps shutdown below the unit's systemd timeout; the next start resumes the
 saved task. Do not use `kill -9` or delete a `*.part` file to work around a
 slow restart.
 
+The service now hard-caps one Samsung firmware task at eight concurrent Range
+connections and uses one long-lived equal range per connection, matching
+Bifrost. Values such as `16` or `24` left in an older environment file are
+safely reduced to eight after the application update.
 If the service is healthy but the expected throughput override is incomplete,
 replace the dedicated systemd drop-in as a whole instead of appending partial
 environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.18.7
+Environment=APP_VERSION=2.18.9
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
 Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
