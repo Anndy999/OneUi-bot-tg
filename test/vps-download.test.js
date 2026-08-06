@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
 import { createCipheriv, createHash } from "node:crypto";
+import { crc32 } from "node:zlib";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,6 +84,23 @@ test("download shutdown persists active work and force-closes the BullMQ worker"
     assert.equal(service.get("active").state, "queued");
     const saved = JSON.parse(await readFile(join(dir, "index.json"), "utf8"));
     assert.equal(saved.active.state, "queued");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("friendly firmware output names include model and CSC without overwriting an existing file", async () => {
+  const dir = await tempDir();
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" })
+    }).init({ startQueue: false });
+    const requested = "SM-S9180_CHC_S9180ZCS8FZG1.zip";
+    const id = "12345678-90ab-cdef-1234-567890abcdef";
+    assert.equal(await service.reserveOutputName(id, requested), requested);
+    await writeFile(join(dir, requested), "already here");
+    assert.equal(await service.reserveOutputName(id, requested), "SM-S9180_CHC_S9180ZCS8FZG1_12345678.zip");
+    await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -803,7 +821,7 @@ test("download preview verifies Samsung metadata without queuing a job, and term
     }).init({ startQueue: false });
 
     const preview = await service.preview({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" });
-    assert.equal(preview.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(preview.originalName, "SM-S9380_CHC_S9380TEST.zip");
     assert.equal(preview.totalBytes, 5);
     assert.equal(service.list().length, 0);
     assert.equal(Object.hasOwn(preview, "sourceHeaders"), false);
@@ -836,6 +854,7 @@ test("download service decrypts Samsung enc4 firmware before marking it complete
         sourceHeaders: { authorization: "FUS temporary-test-value" },
         fileName: "SM-S9380_CHC_TEST.zip.enc4",
         size: encrypted.length,
+        crc32: (crc32(encrypted) >>> 0).toString(16),
         decryption: { mode: "enc4", keySeed }
       }),
       fetchImpl: async () => ({
@@ -853,7 +872,7 @@ test("download service decrypts Samsung enc4 firmware before marking it complete
     await service.runJob({ data: { id: job.id } });
     const completed = service.get(job.id);
     assert.equal(completed.state, "completed");
-    assert.equal(completed.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(completed.originalName, "SM-S9380_CHC_S9380TEST.zip");
     assert.equal(completed.percent, 100);
     assert.equal(Object.hasOwn(completed, "decryption"), false);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), plaintext);
@@ -891,7 +910,7 @@ test("download service resolves a Samsung FUS job inside the VPS worker", async 
     await service.runJob({ data: { id: job.id } });
     const completed = service.get(job.id);
     assert.equal(completed.state, "completed");
-    assert.equal(completed.originalName, "SM-S9380_CHC_TEST.zip");
+    assert.equal(completed.originalName, "SM-S9380_CHC_S9380TEST.zip");
     assert.equal(Object.hasOwn(completed, "sourceHeaders"), false);
     await service.close();
   } finally {

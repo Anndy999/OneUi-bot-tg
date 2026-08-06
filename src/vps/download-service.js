@@ -4,6 +4,9 @@ import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, rea
 import { basename, extname, join, relative, resolve } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import * as zlib from "node:zlib";
 import Fastify from "fastify";
 import { Queue, Worker } from "bullmq";
 import Redis from "ioredis";
@@ -245,6 +248,23 @@ function decryptFileName(fileName) {
   return String(fileName || "firmware.bin").replace(/\.enc(?:2|4)$/i, "") || "firmware.bin";
 }
 
+function firmwareLabel(value, fallback = "unknown") {
+  const label = String(value || fallback).trim().toUpperCase().replace(/[^A-Z0-9._-]+/g, "");
+  return label.slice(0, 96) || fallback;
+}
+
+function firmwareVersionLabel(value) {
+  return firmwareLabel(String(value || "").split(/[\\/\s]+/, 1)[0], "unknown");
+}
+
+function firmwareOutputName(model, csc, version, sourceName) {
+  const extension = extname(decryptFileName(sourceName)).slice(0, 12).toLowerCase() || ".bin";
+  return safeName(
+    `${firmwareLabel(model)}_${firmwareLabel(csc)}_${firmwareVersionLabel(version)}${extension}`,
+    "firmware.bin"
+  );
+}
+
 function isDecryptingFirmware(job) {
   return Boolean(job?.decryption?.keySeed && /\.enc(?:2|4)$/i.test(String(job.encryptedFileName || job.originalName || "")));
 }
@@ -451,7 +471,7 @@ function contentRange(value) {
 
 async function fileCrc32(filePath, signal, onProgress = null) {
   const reader = createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
-  let crc = 0xffffffff;
+  let crc = 0;
   let processed = 0;
   for await (const chunk of reader) {
     if (signal.aborted) throw signal.reason || new Error("download cancelled by administrator");
@@ -459,13 +479,17 @@ async function fileCrc32(filePath, signal, onProgress = null) {
     processed += chunk.length;
     if (onProgress) await onProgress(processed);
   }
-  return (~crc) >>> 0;
+  return crc >>> 0;
 }
 
 function updateCrc32(current, chunk) {
-  let crc = current >>> 0;
+  // Node 22 exposes a native CRC32 implementation. It avoids a per-byte
+  // JavaScript loop across a 10-20 GiB firmware during verification. Keep a
+  // standards-compatible fallback for an older local Node runtime.
+  if (typeof zlib.crc32 === "function") return zlib.crc32(chunk, current) >>> 0;
+  let crc = (Number(current) ^ 0xffffffff) >>> 0;
   for (const byte of chunk) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-  return crc >>> 0;
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function expectedCrc32(value) {
@@ -668,11 +692,14 @@ export class FirmwareDownloadService {
     if (requiredBytes && free - requiredBytes < this.config.minFreeBytes) {
       throw new Error("download would breach the configured free disk reserve");
     }
+    const model = String(resolved.model || payload.model).toUpperCase();
+    const csc = String(resolved.csc || payload.csc).toUpperCase();
+    const version = String(resolved.version || payload.version);
     return {
-      model: String(resolved.model || payload.model).toUpperCase(),
-      csc: String(resolved.csc || payload.csc).toUpperCase(),
-      version: String(resolved.version || payload.version),
-      originalName: safeName(resolved.fileName, "firmware.bin"),
+      model,
+      csc,
+      version,
+      originalName: firmwareOutputName(model, csc, version, resolved.fileName),
       totalBytes: size,
       source: String(resolved.source || "Samsung FUS"),
       freeBytes: free
@@ -695,15 +722,18 @@ export class FirmwareDownloadService {
     const sourceName = sourceUrl
       ? safeName(decodeURIComponent(sourceUrl.pathname.split("/").pop() || "firmware.bin"))
       : "firmware.bin";
-    const extension = extname(sourceName).slice(0, 12) || ".bin";
+    const model = firmwareLabel(payload.model);
+    const csc = firmwareLabel(payload.csc);
+    const version = String(payload.version || "unknown");
+    const outputName = await this.reserveOutputName(id, firmwareOutputName(model, csc, version, sourceName));
     const job = {
       id,
       state: "queued",
-      model: safeName(payload.model, "unknown"),
-      csc: safeName(payload.csc, "unknown"),
-      version: safeName(payload.version, "unknown"),
-      fileName: `${id}${extension}`,
-      originalName: sourceName,
+      model,
+      csc,
+      version,
+      fileName: outputName,
+      originalName: outputName,
       sourceHost: sourceUrl?.hostname || "",
       sourceUrl: sourceUrl?.toString() || "",
       sourceUrlHash: sourceUrl ? sourceUrlHash(sourceUrl) : "",
@@ -726,6 +756,21 @@ export class FirmwareDownloadService {
       throw error;
     }
     return publicJob(job);
+  }
+
+  async reserveOutputName(id, requestedName) {
+    const cleanName = safeName(requestedName, "firmware.bin");
+    const extension = extname(cleanName);
+    const stem = cleanName.slice(0, Math.max(0, cleanName.length - extension.length)) || "firmware";
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const suffix = attempt ? `_${String(id).slice(0, 8)}${attempt > 1 ? `_${attempt}` : ""}` : "";
+      const candidate = safeName(`${stem}${suffix}${extension}`, "firmware.bin");
+      const reservedByAnotherJob = [...this.jobs.values()].some((job) => job.id !== id && job.fileName === candidate);
+      if (reservedByAnotherJob) continue;
+      const exists = await stat(join(this.config.dir, candidate)).then(() => true).catch(() => false);
+      if (!exists) return candidate;
+    }
+    throw new Error("could not reserve a unique firmware output name");
   }
 
   async enqueue(id) {
@@ -822,34 +867,40 @@ export class FirmwareDownloadService {
   }
 
   async decryptFirmwarePart(job, encryptedPath, outputPath, controller) {
-    const { createReadStream, createWriteStream } = await import("node:fs");
     const reader = createReadStream(encryptedPath, { highWaterMark: IO_BUFFER_BYTES });
     const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
     const decipher = createDecipheriv("aes-128-ecb", decryptionKey(job.decryption?.keySeed), null);
     decipher.setAutoPadding(false);
     let processed = 0;
     let lastPersist = 0;
-    try {
-      for await (const chunk of reader) {
-        if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
-        const output = decipher.update(chunk);
-        if (output.length) await writeChunk(writer, output);
+    let persistFailure = null;
+    let persistPending = Promise.resolve();
+    const progress = new Transform({
+      transform: (chunk, _encoding, callback) => {
+        if (controller.signal.aborted) {
+          callback(controller.signal.reason || new Error("download cancelled by administrator"));
+          return;
+        }
         processed += chunk.length;
         job.decryptBytes = processed;
         const now = this.now();
         updateRollingSpeed(job, "decrypt", processed, now);
+        // Progress snapshots should never put the disk+AES pipeline on hold.
+        // The final await below still surfaces a persistence failure safely.
         if (now - lastPersist > 1000) {
           lastPersist = now;
           job.updatedAt = new Date(now).toISOString();
-          await this.persist();
+          persistPending = persistPending.then(() => this.persist()).catch((error) => {
+            persistFailure ||= error;
+          });
         }
+        callback(null, chunk);
       }
-      const final = decipher.final();
-      if (final.length) await writeChunk(writer, final);
-      await new Promise((resolveWrite, rejectWrite) => {
-        writer.end(resolveWrite);
-        writer.once("error", rejectWrite);
-      });
+    });
+    try {
+      await pipeline(reader, decipher, progress, writer, { signal: controller.signal });
+      await persistPending;
+      if (persistFailure) throw persistFailure;
     } catch (error) {
       reader.destroy();
       writer.destroy();
@@ -1202,9 +1253,10 @@ export class FirmwareDownloadService {
         job.encryptedFileName = nextEncryptedFileName;
         job.decryption = nextDecryption;
         if (nextExpectedCrc32 !== null || !refresh) job.expectedCrc32 = nextExpectedCrc32;
-        job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
-        job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
         if (resolved.version) job.version = resolved.version;
+        const outputName = firmwareOutputName(job.model, job.csc, job.version, nextEncryptedFileName);
+        if (!refresh) job.fileName = await this.reserveOutputName(job.id, outputName);
+        job.originalName = job.fileName;
         await this.persist();
       };
       if (!transferComplete) {
@@ -1261,7 +1313,7 @@ export class FirmwareDownloadService {
           job.totalBytes = advertised;
           const writer = createWriteStream(partPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
           let received = 0;
-          let crc32 = 0xffffffff;
+          let crc32 = 0;
           let lastFreeCheckBytes = 0;
           let lastPersist = 0;
           try {
@@ -1294,7 +1346,7 @@ export class FirmwareDownloadService {
           }
           job.bytes = received;
           job.totalBytes = advertised || received;
-          actualCrc32 = (~crc32) >>> 0;
+          actualCrc32 = crc32 >>> 0;
         }
         transferComplete = true;
         job.downloadComplete = true;

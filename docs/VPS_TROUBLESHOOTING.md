@@ -94,7 +94,7 @@ environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.18.4
+Environment=APP_VERSION=2.18.6
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
 Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
@@ -109,6 +109,22 @@ Apply it with `sudo systemctl daemon-reload` followed by a restart of only
 `oneui-download.service`. Check `curl -fsS http://127.0.0.1:8788/health`
 afterward. Never put Redis URLs, API keys, or other protected values in this
 drop-in or in the repository.
+
+## Verification or decryption is slower than the download
+
+The final stages are intentionally separate: CRC verification reads the full
+encrypted file once, then encrypted Samsung packages are decrypted into a new
+file before the original is removed. On Node 22 or newer, the service uses the
+native CRC32 implementation and a native stream pipeline for AES-ECB, so the
+CPU is not held by a JavaScript byte-by-byte checksum loop and progress writes
+do not stall file I/O. Ensure the download unit uses the bundled Node 22 path;
+do not lower integrity checking or delete the encrypted part to make the final
+stage appear faster.
+
+Completed firmware files are named `MODEL_CSC_PDA.zip`, for example
+`SM-S9180_CHC_S9180ZCS8FZG1.zip`, so they are easy to find in OpenList. A
+duplicate name is never overwritten: the downloader adds a short task suffix
+instead. Existing completed files retain their previous names.
 
 ## Service will not start
 
