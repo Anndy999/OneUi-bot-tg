@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
 import { createCipheriv, createHash } from "node:crypto";
-import { crc32 } from "node:zlib";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +17,17 @@ import {
 
 async function tempDir() {
   return mkdtemp(join(tmpdir(), "oneui-download-test-"));
+}
+
+function crc32Hex(value) {
+  let crc = 0xffffffff;
+  for (const byte of value) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return ((crc ^ 0xffffffff) >>> 0).toString(16);
 }
 
 test("download configuration defaults to an isolated local API", () => {
@@ -854,7 +864,7 @@ test("download service decrypts Samsung enc4 firmware before marking it complete
         sourceHeaders: { authorization: "FUS temporary-test-value" },
         fileName: "SM-S9380_CHC_TEST.zip.enc4",
         size: encrypted.length,
-        crc32: (crc32(encrypted) >>> 0).toString(16),
+        crc32: crc32Hex(encrypted),
         decryption: { mode: "enc4", keySeed }
       }),
       fetchImpl: async () => ({

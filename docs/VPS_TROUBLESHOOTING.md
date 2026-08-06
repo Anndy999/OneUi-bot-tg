@@ -94,7 +94,7 @@ environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.18.6
+Environment=APP_VERSION=2.18.7
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
 Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
