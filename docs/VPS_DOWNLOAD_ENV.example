@@ -1,7 +1,7 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.18.1
+APP_VERSION=2.18.2
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
@@ -23,13 +23,24 @@ DOWNLOAD_JOB_STALE_MS=300000
 # Bound local download API request handling.
 DOWNLOAD_API_REQUEST_TIMEOUT_MS=30000
 DOWNLOAD_PARALLEL_SEGMENTS=24
-# Valid range: 1-32. 24 is the safe high-throughput profile for one VPS task.
-# Return to 16 (then 12) if Samsung begins rejecting or slowing Range requests.
+# Initial range: 1-48. Start at 24; the service expands gradually only when the
+# rolling aggregate speed remains under the target. It never starts all lanes at once.
+DOWNLOAD_PARALLEL_MAX_SEGMENTS=48
+# The stability target is 150 MiB/s. This is an expansion threshold, not a
+# promise: Samsung CDN routing and per-IP limits ultimately decide the ceiling.
+DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=157286400
+DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
+DOWNLOAD_PARALLEL_SCALE_STEP=4
+# Return to 16 (then 12) initial lanes and set MAX_SEGMENTS to the same value
+# only if Samsung begins rejecting Range requests.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
 # 256 MiB ranges keep each authorized connection useful for longer and reduce
 # reconnect waves while dynamic lane claiming still prevents a slow final tail.
 DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+# Commit 4 MiB at a time to reduce filesystem overhead without ever marking
+# bytes complete before their positional write succeeds. Valid range: 64 KiB-16 MiB.
+DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 # Files smaller than this use one connection; failed range probes fall back automatically.
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.

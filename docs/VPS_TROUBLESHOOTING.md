@@ -39,9 +39,10 @@ chat. Logs should contain error categories, not Tokens or passwords.
 
 ## Firmware download speed, pause, and resume
 
-Large Samsung files use bounded, staggered HTTP Range connections. The
-download unit defaults to 16 connections and permits at most 16. This can
-improve throughput when Samsung limits one TCP connection, but it cannot
+Large Samsung files start with 24 bounded, staggered HTTP Range connections.
+If the rolling aggregate speed stays below 150 MiB/s, the downloader adds four
+lanes every eight seconds up to 48; it does not open all of them at once. This
+can improve throughput when Samsung limits one TCP connection, but it cannot
 guarantee a speed higher than Samsung's route to the VPS.
 
 Use **暂停** in the administrator download detail view to preserve a
@@ -60,12 +61,13 @@ sudo systemctl restart oneui-download.service
 sudo systemctl status oneui-download.service --no-pager -l
 ```
 
-Use `DOWNLOAD_PARALLEL_SEGMENTS=24` for the bounded high-throughput profile.
-The downloader assigns 256 MiB Range work blocks to those lanes dynamically,
-which reduces reconnection waves while preventing one slow final Samsung
-connection from holding the entire file open. If the
-official source starts rejecting or slowing Range requests, return to `16`,
-then `12`. The hard cap is `32`; do not use unbounded connection counts.
+Use `DOWNLOAD_PARALLEL_SEGMENTS=24` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=48`
+for the bounded high-throughput profile. The downloader assigns 256 MiB Range
+work blocks dynamically, commits 4 MiB positional-write batches, and records
+progress only after a batch reaches disk. This reduces reconnection waves and
+filesystem overhead without allowing an interrupted batch to create a checksum
+hole. If the official source begins rejecting ranges, set both lane values to
+`16`, then `12`. The hard cap is `48`; do not use unbounded connection counts.
 
 If a task reports HTTP 401 from the official source, the downloader refreshes
 one shared FUS session without stopping already-authorized healthy lanes, then

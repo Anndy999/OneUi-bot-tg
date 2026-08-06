@@ -25,10 +25,13 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 24);
+  assert.equal(config.parallelMaxSegments, 48);
   assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
+  assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
+  assert.equal(config.parallelScaleTargetBytesPerSecond, 150 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
-  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 32);
+  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 48);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
@@ -300,6 +303,106 @@ test("parallel Range lanes claim later work ranges without exceeding the configu
     assert.equal(maximumActiveRanges, 3);
     assert.equal(dataRangeCalls, Math.ceil(fixture.length / (8 * 1024 * 1024)));
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel Range download expands lanes only after sustained low aggregate throughput", async () => {
+  const dir = await tempDir();
+  try {
+    const fixture = Buffer.alloc(32 * 1024 * 1024, 0x62);
+    let activeRanges = 0;
+    let maximumActiveRanges = 0;
+    const initialRangeStarts = new Set([0, 8 * 1024 * 1024]);
+    const releaseInitialRanges = [];
+    const releaseTimer = setTimeout(() => {
+      for (const release of releaseInitialRanges) release();
+    }, 2_300);
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MAX_SEGMENTS: "4",
+      DOWNLOAD_PARALLEL_STAGGER_MS: "0",
+      DOWNLOAD_PARALLEL_MIN_BYTES: "1",
+      DOWNLOAD_PARALLEL_CHUNK_BYTES: String(8 * 1024 * 1024),
+      DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES: String(1024 * 1024),
+      DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND: String(1024 * 1024 * 1024),
+      DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS: "1000",
+      DOWNLOAD_PARALLEL_SCALE_STEP: "2"
+    });
+    const service = await new FirmwareDownloadService({
+      config,
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      fetchImpl: async (_url, init = {}) => {
+        const rangeValue = String(init.headers?.range || init.headers?.Range || "");
+        const match = rangeValue.match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        const headers = {
+          "content-range": `bytes ${start}-${end}/${fixture.length}`,
+          "content-length": String(end - start + 1)
+        };
+        if (start === 0 && end === 0) return new Response(fixture.subarray(0, 1), { status: 206, headers });
+        activeRanges += 1;
+        maximumActiveRanges = Math.max(maximumActiveRanges, activeRanges);
+        let closed = false;
+        const closeRange = (controller) => {
+          if (closed) return;
+          closed = true;
+          activeRanges -= 1;
+          controller.close();
+        };
+        const body = new ReadableStream({
+          start(controller) {
+            if (initialRangeStarts.has(start)) {
+              let offset = start;
+              const sendWarmupChunk = () => {
+                const next = Math.min(start + 4 * 1024 * 1024, end + 1, offset + 1024 * 1024);
+                if (next <= offset || closed) return false;
+                controller.enqueue(fixture.subarray(offset, next));
+                offset = next;
+                return offset < start + 4 * 1024 * 1024;
+              };
+              sendWarmupChunk();
+              const warmupTimer = setInterval(() => {
+                if (!sendWarmupChunk()) clearInterval(warmupTimer);
+              }, 400);
+              releaseInitialRanges.push(() => {
+                try {
+                  clearInterval(warmupTimer);
+                  controller.enqueue(fixture.subarray(offset, end + 1));
+                  closeRange(controller);
+                } catch {}
+              });
+              return;
+            }
+            setTimeout(() => {
+              try {
+                controller.enqueue(fixture.subarray(start, end + 1));
+                closeRange(controller);
+              } catch {}
+            }, 200);
+          },
+          cancel() {
+            if (!closed) {
+              closed = true;
+              activeRanges = Math.max(0, activeRanges - 1);
+            }
+          }
+        });
+        return new Response(body, { status: 206, headers });
+      }
+    }).init({ startQueue: false });
+    const job = await service.create({ sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/adaptive-lanes.zip" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    clearTimeout(releaseTimer);
+    assert.equal(service.get(job.id).state, "completed");
+    assert.equal(maximumActiveRanges, 4);
+    assert.deepEqual(await readFile(join(dir, service.get(job.id).fileName)), fixture);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

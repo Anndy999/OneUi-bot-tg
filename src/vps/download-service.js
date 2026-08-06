@@ -17,6 +17,7 @@ const IO_BUFFER_BYTES = 4 * 1024 * 1024;
 const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
 const MAX_PARALLEL_RANGE_COUNT = 512;
+const MAX_PARALLEL_LANE_COUNT = 48;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -54,6 +55,7 @@ export function createDownloadConfig(env = process.env) {
     .filter(Boolean);
   const dir = resolve(text(env.DOWNLOAD_DIR, "./data/firmware"));
   const bodyIdleTimeoutMs = integer(env.DOWNLOAD_BODY_IDLE_TIMEOUT_MS || 120_000, 120_000, 5_000, 15 * 60_000);
+  const parallelSegments = integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 24, 24, 1, MAX_PARALLEL_LANE_COUNT);
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -73,7 +75,17 @@ export function createDownloadConfig(env = process.env) {
     // Samsung's CDN can limit each TCP connection independently.  These are
     // worker lanes, not an unbounded number of requests: a lane receives the
     // next unfinished byte range only after it completes its current range.
-    parallelSegments: integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 24, 24, 1, 32),
+    // Start with a conservative number of persistent Range lanes, then add
+    // small groups only when Samsung's aggregate rate stays below the target.
+    // This avoids turning a temporary authorization refresh into a burst of
+    // new requests while still allowing a rate-limited route to scale up.
+    parallelSegments,
+    parallelMaxSegments: integer(
+      env.DOWNLOAD_PARALLEL_MAX_SEGMENTS || 48,
+      48,
+      parallelSegments,
+      MAX_PARALLEL_LANE_COUNT
+    ),
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
@@ -81,6 +93,16 @@ export function createDownloadConfig(env = process.env) {
       bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
     )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
+    parallelWriteBatchBytes: Math.max(64 * 1024, Math.min(
+      16 * 1024 * 1024,
+      bytes(env.DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES, IO_BUFFER_BYTES)
+    )),
+    parallelScaleTargetBytesPerSecond: Math.max(1 * 1024 * 1024, Math.min(
+      1024 * 1024 * 1024,
+      bytes(env.DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND, 150 * 1024 * 1024)
+    )),
+    parallelScaleIntervalMs: integer(env.DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS || 8_000, 8_000, 1_000, 60_000),
+    parallelScaleStep: integer(env.DOWNLOAD_PARALLEL_SCALE_STEP || 4, 4, 1, 16),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
@@ -256,6 +278,38 @@ async function writeChunkAt(file, chunk, position) {
     if (!bytesWritten) throw new Error("firmware part write made no progress");
     offset += bytesWritten;
   }
+}
+
+async function writeChunksAt(file, chunks, totalBytes, position) {
+  if (!totalBytes) return;
+  let index = 0;
+  let chunkOffset = 0;
+  let remaining = totalBytes;
+  while (remaining > 0) {
+    // writev avoids copying every network chunk through Buffer.concat before
+    // it reaches disk. Cap the vector at a portable size in case a source
+    // emits unusually small chunks.
+    const vectors = chunks.slice(index, index + 1024);
+    if (!vectors.length) throw new Error("firmware part write batch has an invalid length");
+    if (chunkOffset) vectors[0] = vectors[0].subarray(chunkOffset);
+    const { bytesWritten } = await file.writev(vectors, position);
+    if (!bytesWritten) throw new Error("firmware part write made no progress");
+    position += bytesWritten;
+    remaining -= bytesWritten;
+    let consumed = bytesWritten;
+    while (consumed > 0 && index < chunks.length) {
+      const available = chunks[index].byteLength - chunkOffset;
+      if (consumed < available) {
+        chunkOffset += consumed;
+        consumed = 0;
+      } else {
+        consumed -= available;
+        index += 1;
+        chunkOffset = 0;
+      }
+    }
+  }
+  if (index !== chunks.length || chunkOffset) throw new Error("firmware part write batch has an invalid length");
 }
 
 async function finishWriteStream(writer) {
@@ -858,15 +912,19 @@ export class FirmwareDownloadService {
       await this.persist();
     }
     const segments = job.parallel.segments;
-    const laneCount = Math.min(this.config.parallelSegments, segments.length);
-    job.parallel.lanes = laneCount;
+    const maxLaneCount = Math.min(this.config.parallelMaxSegments, segments.length);
+    let enabledLanes = Math.min(this.config.parallelSegments, maxLaneCount);
+    job.parallel.lanes = enabledLanes;
+    job.parallel.maxLanes = maxLaneCount;
     job.parallel.activeLanes = 0;
-    job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
+    let completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
+    job.parallel.completedRanges = completedRanges;
     const segmentController = new AbortController();
     const segmentSignal = AbortSignal.any
       ? AbortSignal.any([controller.signal, segmentController.signal])
       : controller.signal;
-    const received = () => segments.reduce((sum, segment) => sum + Number(segment.bytes || 0), 0);
+    let receivedBytes = segments.reduce((sum, segment) => sum + Number(segment.bytes || 0), 0);
+    const received = () => receivedBytes;
     let lastFreeCheckBytes = 0;
     let lastPersist = 0;
     let freeCheckInFlight = null;
@@ -889,7 +947,8 @@ export class FirmwareDownloadService {
       job.bytes = received();
       if (job.parallel) {
         job.parallel.activeLanes = activeLanes;
-        job.parallel.completedRanges = segments.filter((segment) => Number(segment.bytes || 0) >= segment.end - segment.start + 1).length;
+        job.parallel.completedRanges = completedRanges;
+        job.parallel.lanes = enabledLanes;
       }
       const startedBytes = Number(job.downloadStartBytes || 0);
       const now = this.now();
@@ -899,10 +958,12 @@ export class FirmwareDownloadService {
       job.updatedAt = new Date(now).toISOString();
       await this.persist();
     };
+    let scaleTimer = null;
     try {
       await checkFreeSpace(true);
       let nextSegmentIndex = 0;
       const claimedSegments = new Set();
+      let noMoreSegmentsToClaim = false;
       const claimNextSegment = () => {
         for (let offset = 0; offset < segments.length; offset += 1) {
           const index = (nextSegmentIndex + offset) % segments.length;
@@ -912,8 +973,32 @@ export class FirmwareDownloadService {
           nextSegmentIndex = (index + 1) % segments.length;
           return { segment, index };
         }
+        noMoreSegmentsToClaim = true;
         return null;
       };
+      const waitForLaneActivation = async (lane) => {
+        while (lane >= enabledLanes) {
+          if (noMoreSegmentsToClaim) return false;
+          await waitWithAbort(250, segmentSignal);
+        }
+        return true;
+      };
+      if (enabledLanes < maxLaneCount) {
+        scaleTimer = setInterval(() => {
+          if (noMoreSegmentsToClaim || enabledLanes >= maxLaneCount) return;
+          const currentSpeed = Math.max(0, Number(job.speedBytesPerSecond || 0));
+          if (!currentSpeed || currentSpeed >= this.config.parallelScaleTargetBytesPerSecond) return;
+          const previous = enabledLanes;
+          enabledLanes = Math.min(maxLaneCount, enabledLanes + this.config.parallelScaleStep);
+          if (enabledLanes !== previous) {
+            job.parallel.lanes = enabledLanes;
+            this.logger.info?.(
+              `Samsung firmware throughput ${Math.round(currentSpeed / 1024 / 1024)} MiB/s is below target; increasing Range lanes from ${previous} to ${enabledLanes}.`
+            );
+          }
+        }, this.config.parallelScaleIntervalMs);
+        scaleTimer.unref?.();
+      }
       const downloadSegment = async (segment) => {
         let attempts = 0;
         const file = await open(partPath, "r+");
@@ -923,6 +1008,7 @@ export class FirmwareDownloadService {
             const start = segment.start + segment.bytes;
             let reader;
             let requestBytes = 0;
+            let flushPendingOnAbort = null;
             try {
               const response = await fetchRange(`bytes=${start}-${segment.end}`, segmentSignal);
               const range = contentRange(response.headers.get("content-range"));
@@ -933,6 +1019,25 @@ export class FirmwareDownloadService {
               reader = response.body?.getReader();
               if (!reader) throw new Error("Samsung official source returned an empty segment");
               let position = start;
+              let pendingChunks = [];
+              let pendingBytes = 0;
+              const flushPending = async () => {
+                if (!pendingBytes) return;
+                const committedBytes = pendingBytes;
+                const rangeLength = segment.end - segment.start + 1;
+                const wasComplete = segment.bytes >= rangeLength;
+                await writeChunksAt(file, pendingChunks, committedBytes, position);
+                position += committedBytes;
+                requestBytes += committedBytes;
+                segment.bytes += committedBytes;
+                receivedBytes += committedBytes;
+                if (!wasComplete && segment.bytes >= rangeLength) completedRanges += 1;
+                pendingChunks = [];
+                pendingBytes = 0;
+                await checkFreeSpace();
+                await persistProgress();
+              };
+              flushPendingOnAbort = flushPending;
               while (true) {
                 if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
                 const { done, value } = await withBodyIdleDeadline(
@@ -941,22 +1046,27 @@ export class FirmwareDownloadService {
                   segmentSignal
                 );
                 if (done) break;
-                const remaining = segment.end + 1 - position;
+                const remaining = segment.end + 1 - position - pendingBytes;
                 if (value.byteLength > remaining) throw new Error("Samsung official source returned an oversized segment");
-                // Record durable byte progress only after the positional write
-                // completes. Destroying a buffered WriteStream used to leave a
-                // small unwritten hole while the resume map skipped over it.
-                await writeChunkAt(file, value, position);
-                position += value.byteLength;
-                requestBytes += value.byteLength;
-                segment.bytes += value.byteLength;
-                await checkFreeSpace();
-                await persistProgress();
+                // Commit only full positional write batches. If a request is
+                // interrupted, bytes still in memory are deliberately retried
+                // rather than being marked complete before they reach disk.
+                pendingChunks.push(value);
+                pendingBytes += value.byteLength;
+                if (pendingBytes >= this.config.parallelWriteBatchBytes) await flushPending();
               }
+              await flushPending();
               if (position !== segment.end + 1) throw new Error("Samsung official source returned an incomplete segment");
               attempts = 0;
             } catch (error) {
-              if (segmentSignal.aborted) throw error;
+              if (segmentSignal.aborted) {
+                // A pause/cancel may arrive while a sub-batch is only in RAM.
+                // Finish its positional write when possible so resume starts at
+                // the durable boundary; if the write itself fails, progress is
+                // intentionally left unchanged and the bytes are retried.
+                await flushPendingOnAbort?.().catch(() => {});
+                throw error;
+              }
               // A connection that transferred useful bytes can resume exactly
               // at the committed offset and should not consume the no-progress
               // retry budget for a multi-gigabyte firmware.
@@ -972,8 +1082,9 @@ export class FirmwareDownloadService {
           await file.close();
         }
       };
-      const segmentTasks = Array.from({ length: laneCount }, async (_, lane) => {
-        await waitWithAbort(lane * this.config.parallelStaggerMs, segmentSignal);
+      const segmentTasks = Array.from({ length: maxLaneCount }, async (_, lane) => {
+        await waitWithAbort(Math.min(lane, Math.max(0, enabledLanes - 1)) * this.config.parallelStaggerMs, segmentSignal);
+        if (!await waitForLaneActivation(lane)) return;
         while (true) {
           const claimed = claimNextSegment();
           if (!claimed) return;
@@ -1014,6 +1125,8 @@ export class FirmwareDownloadService {
       await rm(partPath, { force: true });
       delete job.parallel;
       return false;
+    } finally {
+      if (scaleTimer) clearInterval(scaleTimer);
     }
   }
 
