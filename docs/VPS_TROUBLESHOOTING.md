@@ -98,7 +98,7 @@ environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.18.9
+Environment=APP_VERSION=2.19.0
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
 Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
@@ -124,6 +124,13 @@ CPU is not held by a JavaScript byte-by-byte checksum loop and progress writes
 do not stall file I/O. Ensure the download unit uses the bundled Node 22 path;
 do not lower integrity checking or delete the encrypted part to make the final
 stage appear faster.
+
+The Telegram task card refreshes every five seconds on the production VPS.
+During CRC verification it shows `Verified: x / total`, verification speed and
+ETA; during decryption it shows the analogous decryption values. The overall
+progress range is intentionally 85-90% for verification and 90-99% for
+decryption. A fixed number in that range from an old card is not evidence of a
+stalled task—tap Refresh once, then check the shown phase bytes and speed.
 
 Completed firmware files are named `MODEL_CSC_PDA.zip`, for example
 `SM-S9180_CHC_S9180ZCS8FZG1.zip`, so they are easy to find in OpenList. A

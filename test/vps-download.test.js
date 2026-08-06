@@ -128,7 +128,12 @@ test("download speed uses a phase-local rolling window", () => {
   updateRollingSpeed(job, "download", 100, 1000);
   updateRollingSpeed(job, "download", 200, 2000);
   assert.equal(job.speedBytesPerSecond, 100);
-  updateRollingSpeed(job, "decrypt", 0, 3000);
+  updateRollingSpeed(job, "verify", 0, 3000);
+  assert.equal(job.speedBytesPerSecond, 0);
+  updateRollingSpeed(job, "verify", 100, 4000);
+  updateRollingSpeed(job, "verify", 200, 5000);
+  assert.equal(job.speedBytesPerSecond, 100);
+  updateRollingSpeed(job, "decrypt", 0, 6000);
   assert.equal(job.speedBytesPerSecond, 0);
 });
 
@@ -186,6 +191,7 @@ test("download health ignores an ordinary queue backlog but detects a stalled ac
     service.jobs.set("queued", { id: "queued", state: "queued", updatedAt: new Date(now - 60_000).toISOString() });
     assert.equal((await service.health()).ok, true);
     assert.equal((await service.health()).queued, 1);
+    assert.ok(["native", "js-fallback"].includes((await service.health()).crc32Engine));
     service.jobs.set("active", { id: "active", state: "downloading", updatedAt: new Date(now).toISOString() });
     now += 2000;
     const health = await service.health();
@@ -309,6 +315,57 @@ test("parallel Range download assembles the file and verifies the completed outp
     assert.equal(completed.bytes, fixture.length);
     assert.ok(rangeHeaders.includes("bytes=0-0"));
     assert.equal(rangeHeaders.filter((value) => value !== "bytes=0-0").length, 2);
+    assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("parallel CRC verification reads the assembled file with its own live speed phase", async () => {
+  const dir = await tempDir();
+  let now = Date.now();
+  try {
+    const fixture = Buffer.alloc(12 * 1024 * 1024, 0x5a);
+    const config = createDownloadConfig({
+      DOWNLOAD_DIR: dir,
+      DOWNLOAD_MIN_FREE_BYTES: "0",
+      DOWNLOAD_PARALLEL_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MAX_SEGMENTS: "2",
+      DOWNLOAD_PARALLEL_MIN_BYTES: "1"
+    });
+    const service = await new FirmwareDownloadService({
+      config,
+      now: () => (now += 1000),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async () => ({
+        sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/verify.zip",
+        fileName: "SM-S9260_CHC_VERIFY.zip",
+        size: fixture.length,
+        crc32: String(Number.parseInt(crc32Hex(fixture), 16))
+      }),
+      fetchImpl: async (_url, init = {}) => {
+        const range = String(init.headers?.range || init.headers?.Range || "");
+        const match = range.match(/^bytes=(\d+)-(\d+)$/);
+        if (!match) return new Response(fixture, { status: 200 });
+        const start = Number(match[1]);
+        const end = Math.min(fixture.length - 1, Number(match[2]));
+        return new Response(fixture.subarray(start, end + 1), {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${fixture.length}`,
+            "content-length": String(end - start + 1)
+          }
+        });
+      }
+    }).init({ startQueue: false });
+
+    const job = await service.create({ model: "SM-S9260", csc: "CHC", version: "S9260TEST/S9260CHC/S9260MODEM" }, "owner");
+    await service.runJob({ data: { id: job.id } });
+    const completed = service.jobs.get(job.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.speedPhase, "verify");
+    assert.ok(completed.speedBytesPerSecond > 0);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
     await service.close();
   } finally {

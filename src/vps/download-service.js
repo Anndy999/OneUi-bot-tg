@@ -44,6 +44,9 @@ const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
   return value >>> 0;
 });
+// Node 22 provides native CRC32. The fallback remains for compatible older
+// runtimes; /health exposes the active engine for performance diagnosis.
+const CRC32_ENGINE = typeof zlib.crc32 === "function" ? "native" : "js-fallback";
 
 function text(value, fallback = "") {
   const result = String(value ?? fallback).trim();
@@ -481,7 +484,9 @@ async function fileCrc32(filePath, signal, onProgress = null) {
     if (signal.aborted) throw signal.reason || new Error("download cancelled by administrator");
     crc = updateCrc32(crc, chunk);
     processed += chunk.length;
-    if (onProgress) await onProgress(processed);
+    // Keep the file reader moving. Callers that persist a progress snapshot
+    // must queue that work separately instead of pausing every CRC chunk.
+    if (onProgress) onProgress(processed);
   }
   return crc >>> 0;
 }
@@ -490,7 +495,7 @@ function updateCrc32(current, chunk) {
   // Node 22 exposes a native CRC32 implementation. It avoids a per-byte
   // JavaScript loop across a 10-20 GiB firmware during verification. Keep a
   // standards-compatible fallback for an older local Node runtime.
-  if (typeof zlib.crc32 === "function") return zlib.crc32(chunk, current) >>> 0;
+  if (CRC32_ENGINE === "native") return zlib.crc32(chunk, current) >>> 0;
   let crc = (Number(current) ^ 0xffffffff) >>> 0;
   for (const byte of chunk) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
   return (crc ^ 0xffffffff) >>> 0;
@@ -543,6 +548,9 @@ export class FirmwareDownloadService {
     await mkdir(this.config.indexDir, { recursive: true, mode: 0o750 });
     await this.loadIndex();
     await this.cleanupFiles();
+    if (CRC32_ENGINE !== "native") {
+      this.logger.warn?.("Native Node CRC32 is unavailable; firmware verification is using the compatible JavaScript fallback.");
+    }
     if (startQueue) {
       if (!this.config.redisUrl) throw new Error("REDIS_URL is required for download queue");
       const options = connectionOptions(this.config.redisUrl);
@@ -667,6 +675,7 @@ export class FirmwareDownloadService {
       jobs: this.jobs.size,
       queued,
       redis: this.redis?.status || "disabled",
+      crc32Engine: CRC32_ENGINE,
       workerRunning,
       active: active ? { id: active.id, state: active.state, updatedAt: active.updatedAt, stalled } : null
     };
@@ -1364,22 +1373,30 @@ export class FirmwareDownloadService {
 
       if (!job.downloadVerified) {
         job.state = "verifying";
-        job.speedBytesPerSecond = 0;
         job.verifyBytes = 0;
-        job.updatedAt = new Date(this.now()).toISOString();
+        const verifyStartedAt = this.now();
+        resetSpeedTracking(job, "verify", 0, verifyStartedAt);
+        job.updatedAt = new Date(verifyStartedAt).toISOString();
         await this.persist();
         if (job.expectedCrc32 !== null && job.expectedCrc32 !== undefined) {
           let lastVerifyPersist = 0;
+          let verifyPersistFailure = null;
+          let verifyPersistPending = Promise.resolve();
           if (actualCrc32 === null) {
-            actualCrc32 = await fileCrc32(partPath, controller.signal, async (processed) => {
+            actualCrc32 = await fileCrc32(partPath, controller.signal, (processed) => {
               job.verifyBytes = processed;
               const now = this.now();
+              updateRollingSpeed(job, "verify", processed, now);
               if (now - lastVerifyPersist > 1000) {
                 lastVerifyPersist = now;
                 job.updatedAt = new Date(now).toISOString();
-                await this.persist();
+                verifyPersistPending = verifyPersistPending.then(() => this.persist()).catch((error) => {
+                  verifyPersistFailure ||= error;
+                });
               }
             });
+            await verifyPersistPending;
+            if (verifyPersistFailure) throw verifyPersistFailure;
           }
           if (actualCrc32 !== job.expectedCrc32) throw new Error("Samsung firmware CRC verification failed");
         }

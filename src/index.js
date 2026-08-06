@@ -881,7 +881,17 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
   ];
   if (active) {
     lines.push(`${lang === "en" ? "Progress" : "进度"}: ${downloadProgressBar(job.percent)}`);
-    if (job.totalBytes) lines.push(`${formatBytes(job.bytes)} / ${formatBytes(job.totalBytes)}`);
+    const phaseBytes = job.state === "verifying"
+      ? Number(job.verifyBytes || 0)
+      : job.state === "decrypting"
+        ? Number(job.decryptBytes || 0)
+        : Number(job.bytes || 0);
+    const phaseLabel = job.state === "verifying"
+      ? (lang === "en" ? "Verified" : "已校验")
+      : job.state === "decrypting"
+        ? (lang === "en" ? "Decrypted" : "已解密")
+        : "";
+    if (job.totalBytes) lines.push(`${phaseLabel ? `${phaseLabel}: ` : ""}${formatBytes(phaseBytes)} / ${formatBytes(job.totalBytes)}`);
     if (job.state === "downloading" && job.transfer?.lanes) {
       const transferLabel = lang === "en" ? "Connections" : "连接";
       const rangesLabel = lang === "en" ? "Ranges" : "分片";
@@ -889,7 +899,11 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
     }
     if (job.speedBytesPerSecond) {
       const speedWindowSeconds = Number(job.speedWindowSeconds || 10);
-      const speedLabel = lang === "en" ? `Speed (last ${speedWindowSeconds}s)` : `速度（近${speedWindowSeconds}秒）`;
+      const speedLabel = job.state === "verifying"
+        ? (lang === "en" ? `Verification speed (last ${speedWindowSeconds}s)` : `校验速度（近${speedWindowSeconds}秒）`)
+        : job.state === "decrypting"
+          ? (lang === "en" ? `Decryption speed (last ${speedWindowSeconds}s)` : `解密速度（近${speedWindowSeconds}秒）`)
+          : (lang === "en" ? `Speed (last ${speedWindowSeconds}s)` : `速度（近${speedWindowSeconds}秒）`);
       lines.push(`${speedLabel}: ${formatBytes(job.speedBytesPerSecond)}/s · ${lang === "en" ? "ETA" : "剩余"}: ${formatDuration(job.etaSeconds)}`);
     }
   }
@@ -1761,7 +1775,10 @@ async function renderDownloadDetails(env, chatId, messageId, id) {
 }
 
 function startDownloadProgressWatch(env, chatId, messageId, id) {
-  if (!env.VPS_SHADOW_MODE) return;
+  // A long-polling VPS is the environment that can keep this bounded timer
+  // alive. Shadow mode must remain side-effect free, but production needs the
+  // card to refresh while transfer, verification and decryption are running.
+  if (String(env.VPS_SHADOW_MODE || "").toLowerCase() === "true") return;
   const key = `${chatId}:${messageId}:${id}`;
   if (downloadProgressWatches.has(key)) return;
   let polls = 0;
