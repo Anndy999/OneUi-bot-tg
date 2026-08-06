@@ -413,7 +413,7 @@ test("VPS FUS resolver uses the Bifrost-compatible authentication flow without e
   assert.equal(calls.filter((call) => call.url.includes("BinaryInform")).length, 1);
   assert.equal(calls.filter((call) => call.url.includes("BinaryInit")).length, 1);
   assert.equal(Object.hasOwn(result, "sourceHeaders"), true);
-  assert.match(result.sourceHeaders.authorization, /^FUS nonce="", signature="[0-9a-f]+"/);
+  assert.match(result.sourceHeaders.authorization, /^FUS nonce="0123456789abcdef", signature="[0-9a-f]+"/);
   assert.equal(result.sourceHeaders["cache-control"], "no-cache");
   assert.equal(Object.hasOwn(result.sourceHeaders, "cookie"), false);
 });

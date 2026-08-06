@@ -143,12 +143,11 @@ function authorization(session) {
   return `FUS nonce="${session.nonce}", signature="${session.auth}", nc="", type="", realm=""`;
 }
 
-// Samsung's cloud binary endpoint uses the auth produced by BinaryInit but
-// expects an empty nonce. This is intentionally different from the XML FUS
-// calls above; reusing their nonce/cookie can make the cloud endpoint return
-// HTTP 401, especially when the request is resumed with Range.
+// Samsung's cloud binary endpoint uses the current FUS session nonce and auth
+// produced by BinaryInit. Bifrost does not send the XML session cookie on the
+// binary request, so keep the nonce but omit the cookie here.
 function cloudAuthorization(session) {
-  return `FUS nonce="", signature="${session.auth}", nc="", type="", realm=""`;
+  return `FUS nonce="${session.nonce}", signature="${session.auth}", nc="", type="", realm=""`;
 }
 
 async function request(session, path, body, fetchImpl, signal, retry = true) {
