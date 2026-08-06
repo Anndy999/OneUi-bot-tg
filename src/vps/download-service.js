@@ -78,7 +78,7 @@ export function createDownloadConfig(env = process.env) {
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
       1024 * 1024 * 1024,
-      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 128 * 1024 * 1024)
+      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
     )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
@@ -242,6 +242,20 @@ async function writeChunk(writer, chunk) {
     writer.once("drain", onDrain);
     writer.once("error", onError);
   });
+}
+
+async function writeChunkAt(file, chunk, position) {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await file.write(
+      chunk,
+      offset,
+      chunk.byteLength - offset,
+      position + offset
+    );
+    if (!bytesWritten) throw new Error("firmware part write made no progress");
+    offset += bytesWritten;
+  }
 }
 
 async function finishWriteStream(writer) {
@@ -778,18 +792,25 @@ export class FirmwareDownloadService {
     }
   }
 
-  async downloadParallel(partPath, job, controller) {
+  async downloadParallel(partPath, job, controller, { refreshAuthorization = null } = {}) {
     if (this.config.parallelSegments < 2) return false;
-    const probe = await this.fetchOfficial(job.sourceUrl, controller.signal, {
-      ...(job.sourceHeaders || {}),
-      range: "bytes=0-0",
-      "accept-encoding": "identity"
-    });
+    const fetchRange = async (range, signal) => {
+      while (true) {
+        const response = await this.fetchOfficial(job.sourceUrl, signal, {
+          ...(job.sourceHeaders || {}),
+          range,
+          "accept-encoding": "identity"
+        });
+        if (response.status !== 401) return response;
+        await cancelResponseBody(response.body);
+        if (!refreshAuthorization) throw new OfficialSourceAuthorizationError();
+        // Refresh one shared FUS session without aborting healthy lanes. Active
+        // responses have already been authorized and can continue transferring.
+        await refreshAuthorization();
+      }
+    };
+    const probe = await fetchRange("bytes=0-0", controller.signal);
     const probeRange = contentRange(probe.headers.get("content-range"));
-    if (probe.status === 401) {
-      await cancelResponseBody(probe.body);
-      throw new OfficialSourceAuthorizationError();
-    }
     await cancelResponseBody(probe.body);
     if (probe.status !== 206 || !probeRange || probeRange.start !== 0 || probeRange.end !== 0) return false;
     const total = probeRange.total;
@@ -895,65 +916,60 @@ export class FirmwareDownloadService {
       };
       const downloadSegment = async (segment) => {
         let attempts = 0;
-        while (segment.bytes < segment.end - segment.start + 1) {
-          if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
-          const start = segment.start + segment.bytes;
-          let response;
-          let reader;
-          let writer;
-          let writerEnded = false;
-          try {
-            response = await this.fetchOfficial(job.sourceUrl, segmentSignal, {
-              ...(job.sourceHeaders || {}),
-              range: `bytes=${start}-${segment.end}`,
-              "accept-encoding": "identity"
-            });
-            if (response.status === 401) {
-              await cancelResponseBody(response.body);
-              throw new OfficialSourceAuthorizationError();
+        const file = await open(partPath, "r+");
+        try {
+          while (segment.bytes < segment.end - segment.start + 1) {
+            if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
+            const start = segment.start + segment.bytes;
+            let reader;
+            let requestBytes = 0;
+            try {
+              const response = await fetchRange(`bytes=${start}-${segment.end}`, segmentSignal);
+              const range = contentRange(response.headers.get("content-range"));
+              if (response.status !== 206 || !range || range.start !== start || range.end !== segment.end || range.total !== total) {
+                await cancelResponseBody(response.body);
+                throw new Error("Samsung official source rejected parallel range download");
+              }
+              reader = response.body?.getReader();
+              if (!reader) throw new Error("Samsung official source returned an empty segment");
+              let position = start;
+              while (true) {
+                if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
+                const { done, value } = await withBodyIdleDeadline(
+                  reader.read(),
+                  this.config.bodyIdleTimeoutMs,
+                  segmentSignal
+                );
+                if (done) break;
+                const remaining = segment.end + 1 - position;
+                if (value.byteLength > remaining) throw new Error("Samsung official source returned an oversized segment");
+                // Record durable byte progress only after the positional write
+                // completes. Destroying a buffered WriteStream used to leave a
+                // small unwritten hole while the resume map skipped over it.
+                await writeChunkAt(file, value, position);
+                position += value.byteLength;
+                requestBytes += value.byteLength;
+                segment.bytes += value.byteLength;
+                await checkFreeSpace();
+                await persistProgress();
+              }
+              if (position !== segment.end + 1) throw new Error("Samsung official source returned an incomplete segment");
+              attempts = 0;
+            } catch (error) {
+              if (segmentSignal.aborted) throw error;
+              // A connection that transferred useful bytes can resume exactly
+              // at the committed offset and should not consume the no-progress
+              // retry budget for a multi-gigabyte firmware.
+              attempts = requestBytes > 0 ? 0 : attempts + 1;
+              if (attempts > this.config.parallelRetries) throw error;
+              await waitWithAbort(250 * Math.max(1, attempts), segmentSignal);
+              continue;
+            } finally {
+              await cancelBodyReader(reader);
             }
-            const range = contentRange(response.headers.get("content-range"));
-            if (response.status !== 206 || !range || range.start !== start || range.end !== segment.end || range.total !== total) {
-              throw new Error("Samsung official source rejected parallel range download");
-            }
-            reader = response.body?.getReader();
-            if (!reader) throw new Error("Samsung official source returned an empty segment");
-            writer = createWriteStream(partPath, { flags: "r+", mode: 0o640, start, highWaterMark: 4 * 1024 * 1024 });
-            let writerError = null;
-            writer.on("error", (error) => { writerError = error; });
-            let position = start;
-            while (true) {
-              if (segmentSignal.aborted) throw segmentSignal.reason || new Error("download cancelled by administrator");
-              const { done, value } = await withBodyIdleDeadline(
-                reader.read(),
-                this.config.bodyIdleTimeoutMs,
-                segmentSignal
-              );
-              if (done) break;
-              const remaining = segment.end + 1 - position;
-              if (value.byteLength > remaining) throw new Error("Samsung official source returned an oversized segment");
-              await writeChunk(writer, value);
-              if (writerError) throw writerError;
-              position += value.byteLength;
-              segment.bytes += value.byteLength;
-              await checkFreeSpace();
-              await persistProgress();
-            }
-            await finishWriteStream(writer);
-            writerEnded = true;
-            if (writerError) throw writerError;
-            if (position !== segment.end + 1) throw new Error("Samsung official source returned an incomplete segment");
-          } catch (error) {
-            if (segmentSignal.aborted) throw error;
-            if (error instanceof OfficialSourceAuthorizationError) throw error;
-            attempts += 1;
-            if (attempts > this.config.parallelRetries) throw error;
-            await waitWithAbort(250 * attempts, segmentSignal);
-            continue;
-          } finally {
-            await cancelBodyReader(reader);
-            if (writer && !writerEnded) writer.destroy();
           }
+        } finally {
+          await file.close();
         }
       };
       const segmentTasks = Array.from({ length: laneCount }, async (_, lane) => {
@@ -1030,15 +1046,38 @@ export class FirmwareDownloadService {
       job.updatedAt = new Date(downloadStartedAt).toISOString();
       await this.persist();
       let actualCrc32 = null;
-      const resolveFusJob = async () => {
+      const resolveFusJob = async ({ refresh = false } = {}) => {
         const resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
-        job.sourceUrl = resolved.sourceUrl;
+        const nextSourceUrl = String(resolved.sourceUrl || "");
+        const nextEncryptedFileName = safeName(resolved.fileName, "firmware.bin");
+        const nextExpectedCrc32 = expectedCrc32(resolved.crc32);
+        const nextSize = Math.max(0, Number(resolved.size || 0));
+        const nextDecryption = resolved.decryption?.keySeed
+          ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) }
+          : null;
+        if (refresh) {
+          if (job.encryptedFileName && nextEncryptedFileName !== job.encryptedFileName) {
+            throw new Error("Samsung FUS authorization refresh returned a different firmware file");
+          }
+          if (Number(job.totalBytes || 0) > 0 && nextSize > 0 && nextSize !== Number(job.totalBytes)) {
+            throw new Error("Samsung FUS authorization refresh returned a different firmware size");
+          }
+          if (job.expectedCrc32 !== null && job.expectedCrc32 !== undefined &&
+              nextExpectedCrc32 !== null && nextExpectedCrc32 !== job.expectedCrc32) {
+            throw new Error("Samsung FUS authorization refresh returned a different firmware checksum");
+          }
+          if (job.decryption?.keySeed &&
+              (!nextDecryption?.keySeed || nextDecryption.mode !== job.decryption.mode || nextDecryption.keySeed !== job.decryption.keySeed)) {
+            throw new Error("Samsung FUS authorization refresh returned different firmware decryption metadata");
+          }
+        }
+        job.sourceUrl = nextSourceUrl;
         job.sourceUrlHash = sourceUrlHash(job.sourceUrl);
         job.sourceHost = new URL(job.sourceUrl).hostname;
         job.sourceHeaders = resolved.sourceHeaders || null;
-        job.encryptedFileName = safeName(resolved.fileName, "firmware.bin");
-        job.decryption = resolved.decryption?.keySeed ? { mode: resolved.decryption.mode, keySeed: String(resolved.decryption.keySeed) } : null;
-        job.expectedCrc32 = expectedCrc32(resolved.crc32);
+        job.encryptedFileName = nextEncryptedFileName;
+        job.decryption = nextDecryption;
+        if (nextExpectedCrc32 !== null || !refresh) job.expectedCrc32 = nextExpectedCrc32;
         job.originalName = job.decryption ? decryptFileName(job.encryptedFileName) : job.encryptedFileName;
         job.fileName = `${job.id}${extname(job.originalName).slice(0, 12) || ".bin"}`;
         if (resolved.version) job.version = resolved.version;
@@ -1049,24 +1088,32 @@ export class FirmwareDownloadService {
         let parallelCompleted = false;
         let authorizationRefreshesWithoutProgress = 0;
         let authorizationRefreshBytes = Number(job.bytes || 0);
-        const refreshFusAuthorization = async () => {
-          const currentBytes = Number(job.bytes || 0);
-          if (currentBytes > authorizationRefreshBytes) {
-            authorizationRefreshBytes = currentBytes;
-            authorizationRefreshesWithoutProgress = 0;
-          } else {
-            authorizationRefreshesWithoutProgress += 1;
-          }
-          if (authorizationRefreshesWithoutProgress >= 2) {
-            throw new Error("Samsung official source repeatedly rejected a refreshed FUS authorization before download progress could continue");
-          }
-          this.logger.warn?.("Samsung FUS download authorization expired; refreshing the official download session.");
-          resetSpeedTracking(job, "download", Math.max(0, currentBytes - Number(job.downloadStartBytes || 0)), this.now());
-          await resolveFusJob();
+        let authorizationRefreshPromise = null;
+        const refreshFusAuthorization = () => {
+          if (authorizationRefreshPromise) return authorizationRefreshPromise;
+          authorizationRefreshPromise = (async () => {
+            const currentBytes = Number(job.bytes || 0);
+            if (currentBytes > authorizationRefreshBytes) {
+              authorizationRefreshBytes = currentBytes;
+              authorizationRefreshesWithoutProgress = 0;
+            } else {
+              authorizationRefreshesWithoutProgress += 1;
+            }
+            if (authorizationRefreshesWithoutProgress >= 2) {
+              throw new Error("Samsung official source repeatedly rejected a refreshed FUS authorization before download progress could continue");
+            }
+            this.logger.warn?.("Samsung FUS download authorization expired; refreshing one shared official session without stopping active lanes.");
+            await resolveFusJob({ refresh: true });
+          })().finally(() => {
+            authorizationRefreshPromise = null;
+          });
+          return authorizationRefreshPromise;
         };
         while (true) {
           try {
-            parallelCompleted = await this.downloadParallel(partPath, job, controller);
+            parallelCompleted = await this.downloadParallel(partPath, job, controller, {
+              refreshAuthorization: job.downloadMode === "fus" ? refreshFusAuthorization : null
+            });
             break;
           } catch (error) {
             if (!(error instanceof OfficialSourceAuthorizationError) || job.downloadMode !== "fus") throw error;
@@ -1212,8 +1259,14 @@ export class FirmwareDownloadService {
       delete job.downloadVerified;
       delete job.verifyBytes;
       if (job.state !== "cancelled") {
-        job.state = "failed";
-        job.error = String(error?.message || error || "download failed").slice(0, 240);
+        const configuredAttempts = Math.max(1, Number(queueJob?.opts?.attempts || 1));
+        const attemptsMade = Math.max(0, Number(queueJob?.attemptsMade || 0));
+        const retryScheduled = attemptsMade + 1 < configuredAttempts;
+        job.state = retryScheduled ? "queued" : "failed";
+        const message = String(error?.message || error || "download failed");
+        job.error = retryScheduled
+          ? `${message}; a clean automatic retry is scheduled`.slice(0, 240)
+          : message.slice(0, 240);
         job.updatedAt = new Date(this.now()).toISOString();
         await this.persist();
       }

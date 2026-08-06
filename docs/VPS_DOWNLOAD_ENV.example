@@ -1,7 +1,7 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.18.0
+APP_VERSION=2.18.1
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
@@ -27,9 +27,9 @@ DOWNLOAD_PARALLEL_SEGMENTS=24
 # Return to 16 (then 12) if Samsung begins rejecting or slowing Range requests.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
-# A lane claims another completed work range automatically. This prevents one
-# slow final connection from holding the whole firmware task open.
-DOWNLOAD_PARALLEL_CHUNK_BYTES=134217728
+# 256 MiB ranges keep each authorized connection useful for longer and reduce
+# reconnect waves while dynamic lane claiming still prevents a slow final tail.
+DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
 # Files smaller than this use one connection; failed range probes fall back automatically.
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.

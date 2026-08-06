@@ -61,14 +61,16 @@ sudo systemctl status oneui-download.service --no-pager -l
 ```
 
 Use `DOWNLOAD_PARALLEL_SEGMENTS=24` for the bounded high-throughput profile.
-The downloader assigns 128 MiB Range work blocks to those lanes dynamically,
-so a slow final Samsung connection does not hold the entire file open. If the
+The downloader assigns 256 MiB Range work blocks to those lanes dynamically,
+which reduces reconnection waves while preventing one slow final Samsung
+connection from holding the entire file open. If the
 official source starts rejecting or slowing Range requests, return to `16`,
 then `12`. The hard cap is `32`; do not use unbounded connection counts.
 
 If a task reports HTTP 401 from the official source, the downloader refreshes
-the FUS session and resumes its durable unfinished Range segments. Completed
-byte ranges are retained, so a large firmware does not restart from zero. If
+one shared FUS session without stopping already-authorized healthy lanes, then
+resumes only the rejected range. Completed byte ranges are retained, so a
+large firmware does not restart from zero. If
 two freshly created sessions are rejected before any additional byte is
 transferred, the task fails safely instead of looping forever. Retry later and
 do not copy authorization headers or credentials into logs or chat.

@@ -25,7 +25,7 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 24);
-  assert.equal(config.parallelChunkBytes, 128 * 1024 * 1024);
+  assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
   assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 32);
@@ -423,6 +423,9 @@ test("FUS download refreshes an expired authorization and resumes unfinished Ran
   try {
     const fixture = Buffer.from("FUS authorization resume fixture", "utf8");
     let resolveCalls = 0;
+    let markHealthyLaneStarted;
+    const healthyLaneStarted = new Promise((resolve) => { markHealthyLaneStarted = resolve; });
+    let healthyLaneCancelled = false;
     const rangeAuthorizations = [];
     const service = await new FirmwareDownloadService({
       config: createDownloadConfig({
@@ -451,7 +454,31 @@ test("FUS download refreshes an expired authorization and resumes unfinished Ran
         if (!match) return new Response(fixture, { status: 200 });
         const start = Number(match[1]);
         const end = Math.min(fixture.length - 1, Number(match[2]));
-        if (authorization === "session-1" && start > 0) return new Response("unauthorized", { status: 401 });
+        if (authorization === "session-1" && start === 0 && end > 0) {
+          return new Response(new ReadableStream({
+            start(controller) {
+              markHealthyLaneStarted();
+              controller.enqueue(fixture.subarray(start, start + 4));
+              setTimeout(() => {
+                try {
+                  controller.enqueue(fixture.subarray(start + 4, end + 1));
+                  controller.close();
+                } catch {}
+              }, 25);
+            },
+            cancel() { healthyLaneCancelled = true; }
+          }), {
+            status: 206,
+            headers: {
+              "content-range": `bytes ${start}-${end}/${fixture.length}`,
+              "content-length": String(end - start + 1)
+            }
+          });
+        }
+        if (authorization === "session-1" && start > 0) {
+          await healthyLaneStarted;
+          return new Response("unauthorized", { status: 401 });
+        }
         return new Response(fixture.subarray(start, end + 1), {
           status: 206,
           headers: {
@@ -465,6 +492,7 @@ test("FUS download refreshes an expired authorization and resumes unfinished Ran
     await service.runJob({ data: { id: job.id } });
     assert.equal(service.get(job.id).state, "completed");
     assert.equal(resolveCalls, 2);
+    assert.equal(healthyLaneCancelled, false);
     assert.ok(rangeAuthorizations.some((value) => value === "session-1:bytes=0-0"));
     assert.ok(rangeAuthorizations.some((value) => value.startsWith("session-1:bytes=") && !value.endsWith("bytes=0-0")));
     assert.ok(rangeAuthorizations.some((value) => value.startsWith("session-2:bytes=") && !value.endsWith("bytes=0-0")));
@@ -604,6 +632,14 @@ test("download service rejects a Samsung file whose advertised CRC32 does not ma
     const job = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
     await assert.rejects(() => service.runJob({ data: { id: job.id } }), /CRC verification failed/);
     assert.equal(service.get(job.id).state, "failed");
+
+    const retrying = await service.create({ model: "SM-S9380", csc: "CHC", version: "S9380TEST/S9380CHC/S9380MODEM" }, "owner");
+    await assert.rejects(
+      () => service.runJob({ data: { id: retrying.id }, opts: { attempts: 2 }, attemptsMade: 0 }),
+      /CRC verification failed/
+    );
+    assert.equal(service.get(retrying.id).state, "queued");
+    assert.match(service.get(retrying.id).error, /automatic retry is scheduled/);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
