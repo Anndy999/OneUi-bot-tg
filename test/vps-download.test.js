@@ -36,19 +36,22 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 8);
-  assert.equal(config.parallelMaxSegments, 8);
+  assert.equal(config.parallelMaxSegments, 12);
   assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 150 * 1024 * 1024);
+  assert.equal(config.decryptWorkerCount, 4);
+  assert.equal(config.decryptWorkerMinBytes, 128 * 1024 * 1024);
+  assert.equal(config.decryptChunkBytes, 16 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
-  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 8);
+  assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 12);
   const staleHighConcurrency = createDownloadConfig({
     DOWNLOAD_PARALLEL_SEGMENTS: "24",
     DOWNLOAD_PARALLEL_MAX_SEGMENTS: "24"
   });
-  assert.equal(staleHighConcurrency.parallelSegments, 8);
-  assert.equal(staleHighConcurrency.parallelMaxSegments, 8);
+  assert.equal(staleHighConcurrency.parallelSegments, 12);
+  assert.equal(staleHighConcurrency.parallelMaxSegments, 12);
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
@@ -953,6 +956,42 @@ test("download service decrypts Samsung enc4 firmware before marking it complete
     assert.equal(completed.percent, 100);
     assert.equal(Object.hasOwn(completed, "decryption"), false);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), plaintext);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("large AES firmware decryption can use bounded worker lanes without changing output", async () => {
+  const dir = await tempDir();
+  try {
+    const keySeed = "parallel-enc4-test-key-seed";
+    const plaintext = Buffer.alloc(128, 0x5a);
+    const cipher = createCipheriv("aes-128-ecb", createHash("md5").update(keySeed, "utf8").digest(), null);
+    cipher.setAutoPadding(false);
+    const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({
+        DOWNLOAD_DIR: dir,
+        DOWNLOAD_MIN_FREE_BYTES: "0",
+        DOWNLOAD_DECRYPT_WORKERS: "2",
+        DOWNLOAD_DECRYPT_WORKER_MIN_BYTES: "1",
+        DOWNLOAD_DECRYPT_CHUNK_BYTES: "32"
+      })
+    }).init({ startQueue: false });
+    const inputPath = join(dir, "parallel-input.enc4");
+    const outputPath = join(dir, "parallel-output.zip");
+    await writeFile(inputPath, encrypted);
+    const job = {
+      id: "parallel-decrypt-test",
+      state: "decrypting",
+      decryption: { keySeed },
+      decryptBytes: 0,
+      speedBytesPerSecond: 0
+    };
+    await service.decryptFirmwarePart(job, inputPath, outputPath, new AbortController());
+    assert.deepEqual(await readFile(outputPath), plaintext);
+    assert.equal(job.decryptBytes, plaintext.length);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

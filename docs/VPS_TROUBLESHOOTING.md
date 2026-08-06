@@ -39,11 +39,13 @@ chat. Logs should contain error categories, not Tokens or passwords.
 
 ## Firmware download speed, pause, and resume
 
-Large Samsung files use eight bounded, staggered HTTP Range connections by
-default. This matches Bifrost's public per-download connection limit and
-avoids the common failure mode where dozens of FUS connections lower the total
-speed through per-IP congestion control or random concurrent disk writes. It
-cannot guarantee a speed higher than Samsung's route to the VPS.
+Large Samsung files use bounded, staggered HTTP Range connections. The default
+starts at eight and can grow to twelve only after a sustained low-rate sample;
+the recommended high-throughput profile sets both values to twelve. This follows
+Bifrost's long-lived segmented-download design while avoiding the old 16/24
+connection burst that could lower total speed through per-IP throttling or
+random concurrent disk writes. It cannot guarantee a speed higher than
+Samsung's route to the VPS.
 
 Use **暂停** in the administrator download detail view to preserve a
 Range-capable partial download, then **继续下载** to request only its unfinished
@@ -61,14 +63,13 @@ sudo systemctl restart oneui-download.service
 sudo systemctl status oneui-download.service --no-pager -l
 ```
 
-Use `DOWNLOAD_PARALLEL_SEGMENTS=8` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=8`
-for the stable high-throughput profile. The downloader assigns 256 MiB Range
-work blocks dynamically, commits 4 MiB positional-write batches, and records
-progress only after a batch reaches disk. This reduces reconnection waves and
-filesystem overhead without allowing an interrupted batch to create a checksum
-hole. Do not raise the lane count merely to chase a brief peak: test one full
-firmware first. The hard cap remains `48`, but values above eight are an
-operator experiment, not the recommended default.
+Use `DOWNLOAD_PARALLEL_SEGMENTS=12` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=12`
+for the recommended high-throughput profile. The downloader assigns twelve equal,
+long-lived Range work blocks, commits 4 MiB positional-write batches, and
+records progress only after a batch reaches disk. This reduces reconnection
+waves and filesystem overhead without allowing an interrupted batch to create
+a checksum hole. If the VPS route is throttled, lower both values to 8. The
+hard cap is 12; values above it are clamped safely.
 
 If a task reports HTTP 401 from the official source, the downloader refreshes
 one shared FUS session without stopping already-authorized healthy lanes, then
@@ -88,25 +89,28 @@ keeps shutdown below the unit's systemd timeout; the next start resumes the
 saved task. Do not use `kill -9` or delete a `*.part` file to work around a
 slow restart.
 
-The service now hard-caps one Samsung firmware task at eight concurrent Range
+The service now hard-caps one Samsung firmware task at twelve concurrent Range
 connections and uses one long-lived equal range per connection, matching
-Bifrost. Values such as `16` or `24` left in an older environment file are
-safely reduced to eight after the application update.
+Bifrost's segmented layout. Values such as `16` or `24` left in an older
+environment file are safely reduced to twelve after the application update.
 If the service is healthy but the expected throughput override is incomplete,
 replace the dedicated systemd drop-in as a whole instead of appending partial
 environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.19.0
+Environment=APP_VERSION=2.20.0
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
-Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
-Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
+Environment=DOWNLOAD_PARALLEL_SEGMENTS=12
+Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=12
 Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=136314880
 Environment=DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
 Environment=DOWNLOAD_PARALLEL_SCALE_STEP=2
 Environment=DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 Environment=DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+Environment=DOWNLOAD_DECRYPT_WORKERS=4
+Environment=DOWNLOAD_DECRYPT_WORKER_MIN_BYTES=134217728
+Environment=DOWNLOAD_DECRYPT_CHUNK_BYTES=16777216
 ```
 
 Apply it with `sudo systemctl daemon-reload` followed by a restart of only
@@ -124,6 +128,13 @@ CPU is not held by a JavaScript byte-by-byte checksum loop and progress writes
 do not stall file I/O. Ensure the download unit uses the bundled Node 22 path;
 do not lower integrity checking or delete the encrypted part to make the final
 stage appear faster.
+
+For large AES firmware files, v2.20.0 can decrypt independent AES-ECB blocks
+with up to four bounded Node worker threads (`DOWNLOAD_DECRYPT_WORKERS=4`,
+16 MiB chunks). This is the same block-independent cipher model used by
+Bifrost, while files below 128 MiB keep the simpler single-stream path. The
+worker pool is closed on pause, cancel, or service restart; it never skips the
+final output or CRC checks.
 
 The Telegram task card refreshes every five seconds on the production VPS.
 During CRC verification it shows `Verified: x / total`, verification speed and

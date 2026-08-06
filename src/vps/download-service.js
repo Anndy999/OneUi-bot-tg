@@ -4,11 +4,13 @@ import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, rea
 import { basename, extname, join, relative, resolve } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
+import { availableParallelism } from "node:os";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { Worker as NodeWorker } from "node:worker_threads";
 import * as zlib from "node:zlib";
 import Fastify from "fastify";
-import { Queue, Worker } from "bullmq";
+import { Queue, Worker as BullWorker } from "bullmq";
 import Redis from "ioredis";
 import { constantTimeSecretEquals } from "./config.js";
 import { resolveVpsOfficialFirmwareDownload } from "./fus-resolver.js";
@@ -20,17 +22,17 @@ const IO_BUFFER_BYTES = 4 * 1024 * 1024;
 const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
 const MAX_PARALLEL_RANGE_COUNT = 512;
-// Samsung FUS starts throttling a single client aggressively when it opens a
-// large burst of Range requests. Bifrost uses eight connections per task; keep
-// the same hard ceiling so a stale VPS environment variable cannot silently
-// turn one download back into 16 or 24 competing connections.
-const MAX_PARALLEL_LANE_COUNT = 8;
-// Bifrost's public downloader uses eight connections per download. Starting
-// dozens of Samsung FUS ranges at once can reduce aggregate throughput when
-// the CDN applies per-IP congestion control and also turns local writes into
-// random I/O. Eight is the stable, reversible default; operators can still
-// opt into a different bounded value through the protected environment file.
+// Samsung FUS can throttle a single client when it opens a large burst of
+// Range requests. Bifrost's public baseline is eight connections; this worker
+// starts there and can add up to twelve only when the measured rate is below
+// the configured target. This keeps the tail responsive without returning to
+// the old 16/24-connection burst profile.
+const MAX_PARALLEL_LANE_COUNT = 12;
 const DEFAULT_PARALLEL_LANES = 8;
+const DEFAULT_PARALLEL_MAX_LANES = 12;
+const DEFAULT_DECRYPT_WORKERS = Math.max(1, Math.min(4, availableParallelism()));
+const DEFAULT_DECRYPT_CHUNK_BYTES = 16 * 1024 * 1024;
+const DEFAULT_DECRYPT_WORKER_MIN_BYTES = 128 * 1024 * 1024;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -77,6 +79,18 @@ export function createDownloadConfig(env = process.env) {
     1,
     MAX_PARALLEL_LANE_COUNT
   );
+  const parallelMaxSegments = integer(
+    env.DOWNLOAD_PARALLEL_MAX_SEGMENTS || DEFAULT_PARALLEL_MAX_LANES,
+    DEFAULT_PARALLEL_MAX_LANES,
+    parallelSegments,
+    MAX_PARALLEL_LANE_COUNT
+  );
+  const decryptChunkBytes = integer(
+    env.DOWNLOAD_DECRYPT_CHUNK_BYTES || DEFAULT_DECRYPT_CHUNK_BYTES,
+    DEFAULT_DECRYPT_CHUNK_BYTES,
+    16 * 1024,
+    64 * 1024 * 1024
+  );
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -101,12 +115,7 @@ export function createDownloadConfig(env = process.env) {
     // This avoids turning a temporary authorization refresh into a burst of
     // new requests while still allowing a rate-limited route to scale up.
     parallelSegments,
-    parallelMaxSegments: integer(
-      env.DOWNLOAD_PARALLEL_MAX_SEGMENTS || DEFAULT_PARALLEL_LANES,
-      DEFAULT_PARALLEL_LANES,
-      parallelSegments,
-      MAX_PARALLEL_LANE_COUNT
-    ),
+    parallelMaxSegments,
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
@@ -124,6 +133,14 @@ export function createDownloadConfig(env = process.env) {
     )),
     parallelScaleIntervalMs: integer(env.DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS || 8_000, 8_000, 1_000, 60_000),
     parallelScaleStep: integer(env.DOWNLOAD_PARALLEL_SCALE_STEP || 4, 4, 1, 16),
+    decryptWorkerCount: integer(
+      env.DOWNLOAD_DECRYPT_WORKERS || DEFAULT_DECRYPT_WORKERS,
+      DEFAULT_DECRYPT_WORKERS,
+      1,
+      8
+    ),
+    decryptWorkerMinBytes: bytes(env.DOWNLOAD_DECRYPT_WORKER_MIN_BYTES, DEFAULT_DECRYPT_WORKER_MIN_BYTES),
+    decryptChunkBytes: decryptChunkBytes - (decryptChunkBytes % 16),
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
@@ -507,6 +524,102 @@ function expectedCrc32(value) {
   return Number(text) >>> 0;
 }
 
+// AES-128-ECB blocks are independent when padding is disabled.  Large
+// Samsung packages can therefore use a small bounded worker pool without
+// changing the cipher, output bytes, or integrity checks.  Small files keep
+// the original stream path to avoid worker startup overhead.
+class AesDecryptWorkerPool {
+  constructor(key, count) {
+    this.closed = false;
+    this.nextWorker = 0;
+    this.nextId = 0;
+    this.pending = new Map();
+    this.failedWorkers = new Set();
+    const workerOptions = {
+      type: "module",
+      workerData: { keyHex: key.toString("hex") }
+    };
+    // Node rejects --input-type inside a Worker. Normal systemd launches do
+    // not set it; only override execArgv for stdin/eval diagnostics.
+    if (process.execArgv.some((argument) => argument.startsWith("--input-type"))) {
+      workerOptions.execArgv = process.execArgv.filter((argument) => !argument.startsWith("--input-type"));
+    }
+    this.workers = Array.from({ length: count }, () => new NodeWorker(
+      new URL("./decrypt-worker.js", import.meta.url),
+      workerOptions
+    ));
+    for (const worker of this.workers) {
+      worker.on("message", (message) => this.resolveMessage(worker, message));
+      worker.on("error", (error) => this.failWorker(worker, error));
+      worker.on("exit", (code) => {
+        if (!this.closed && code !== 0) this.failWorker(worker, new Error(`decrypt worker exited with code ${code}`));
+      });
+    }
+  }
+
+  resolveMessage(worker, message) {
+    const pending = this.pending.get(message?.id);
+    if (!pending || pending.worker !== worker) return;
+    this.pending.delete(message.id);
+    if (message.error) pending.reject(new Error(String(message.error)));
+    else pending.resolve(Buffer.from(message.data));
+  }
+
+  failWorker(worker, error) {
+    this.failedWorkers.add(worker);
+    for (const [id, pending] of this.pending) {
+      if (pending.worker !== worker) continue;
+      this.pending.delete(id);
+      pending.reject(error);
+    }
+  }
+
+  run(chunk) {
+    if (this.closed) return Promise.reject(new Error("decrypt worker pool is closed"));
+    if (!chunk?.length || chunk.byteLength % 16 !== 0) {
+      return Promise.reject(new Error("encrypted firmware size is not AES block aligned"));
+    }
+    const source = chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength
+      ? chunk.buffer
+      : Uint8Array.from(chunk).buffer;
+    const id = ++this.nextId;
+    let worker = null;
+    for (let offset = 0; offset < this.workers.length; offset += 1) {
+      const candidate = this.workers[(this.nextWorker + offset) % this.workers.length];
+      if (this.failedWorkers.has(candidate)) continue;
+      worker = candidate;
+      this.nextWorker = (this.workers.indexOf(candidate) + 1) % this.workers.length;
+      break;
+    }
+    if (!worker) return Promise.reject(new Error("all decrypt workers have failed"));
+    return new Promise((resolveResult, rejectResult) => {
+      this.pending.set(id, { worker, resolve: resolveResult, reject: rejectResult });
+      try {
+        worker.postMessage({ id, data: source }, [source]);
+      } catch (error) {
+        this.pending.delete(id);
+        rejectResult(error);
+      }
+    });
+  }
+
+  abort(reason = new Error("download cancelled by administrator")) {
+    if (this.closed) return;
+    this.closed = true;
+    for (const pending of this.pending.values()) pending.reject(reason);
+    this.pending.clear();
+    for (const worker of this.workers) worker.terminate().catch(() => {});
+  }
+
+  async close() {
+    if (!this.closed) this.closed = true;
+    for (const pending of this.pending.values()) pending.reject(new Error("decrypt worker pool is closing"));
+    this.pending.clear();
+    await Promise.allSettled(this.workers.map((worker) => worker.terminate()));
+    this.workers = [];
+  }
+}
+
 function connectionOptions(redisUrl) {
   const url = new URL(redisUrl);
   const options = {
@@ -560,7 +673,7 @@ export class FirmwareDownloadService {
       this.queue = new Queue("firmware-download", { connection: connectionOptions(this.config.redisUrl), prefix: this.config.queuePrefix });
       const workerConnection = new Redis(this.config.redisUrl, { ...options, lazyConnect: true });
       workerConnection.on("error", (error) => this.logger.warn?.(`Download worker Redis error: ${error.message}`));
-      this.worker = new Worker("firmware-download", (job) => this.runJob(job), {
+      this.worker = new BullWorker("firmware-download", (job) => this.runJob(job), {
         connection: workerConnection,
         prefix: this.config.queuePrefix,
         concurrency: 1
@@ -880,6 +993,73 @@ export class FirmwareDownloadService {
   }
 
   async decryptFirmwarePart(job, encryptedPath, outputPath, controller) {
+    const encrypted = await stat(encryptedPath).catch(() => null);
+    const useWorkers = this.config.decryptWorkerCount > 1 &&
+      encrypted?.size >= this.config.decryptWorkerMinBytes &&
+      encrypted.size % 16 === 0;
+    if (useWorkers) return this.decryptFirmwarePartParallel(job, encryptedPath, outputPath, controller);
+    return this.decryptFirmwarePartStream(job, encryptedPath, outputPath, controller);
+  }
+
+  async decryptFirmwarePartParallel(job, encryptedPath, outputPath, controller) {
+    const reader = createReadStream(encryptedPath, { highWaterMark: this.config.decryptChunkBytes });
+    const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
+    const pool = new AesDecryptWorkerPool(decryptionKey(job.decryption?.keySeed), this.config.decryptWorkerCount);
+    const pending = [];
+    const maxPending = Math.max(1, this.config.decryptWorkerCount * 2);
+    let processed = 0;
+    let lastPersist = 0;
+    let persistFailure = null;
+    let persistPending = Promise.resolve();
+    let writerFailure = null;
+    const onWriterError = (error) => { writerFailure ||= error; };
+    writer.on("error", onWriterError);
+    const onAbort = () => pool.abort(controller.signal.reason || new Error("download cancelled by administrator"));
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    const consume = async (chunk) => {
+      if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+      if (writerFailure) throw writerFailure;
+      await writeChunk(writer, chunk);
+      if (writerFailure) throw writerFailure;
+      processed += chunk.length;
+      job.decryptBytes = processed;
+      const now = this.now();
+      updateRollingSpeed(job, "decrypt", processed, now);
+      // Do not pause the worker pipeline on an index snapshot. The final
+      // await still turns a persistence failure into a safe failed task.
+      if (now - lastPersist > 1000) {
+        lastPersist = now;
+        job.updatedAt = new Date(now).toISOString();
+        persistPending = persistPending.then(() => this.persist()).catch((error) => {
+          persistFailure ||= error;
+        });
+      }
+    };
+    try {
+      for await (const chunk of reader) {
+        if (controller.signal.aborted) throw controller.signal.reason || new Error("download cancelled by administrator");
+        if (chunk.length % 16 !== 0) throw new Error("encrypted firmware size is not AES block aligned");
+        pending.push(pool.run(chunk));
+        if (pending.length >= maxPending) await consume(await pending.shift());
+      }
+      while (pending.length) await consume(await pending.shift());
+      if (writerFailure) throw writerFailure;
+      await finishWriteStream(writer);
+      await persistPending;
+      if (persistFailure) throw persistFailure;
+    } catch (error) {
+      reader.destroy();
+      writer.destroy();
+      pool.abort(error);
+      throw error;
+    } finally {
+      controller.signal.removeEventListener("abort", onAbort);
+      writer.removeListener("error", onWriterError);
+      await pool.close();
+    }
+  }
+
+  async decryptFirmwarePartStream(job, encryptedPath, outputPath, controller) {
     const reader = createReadStream(encryptedPath, { highWaterMark: IO_BUFFER_BYTES });
     const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
     const decipher = createDecipheriv("aes-128-ecb", decryptionKey(job.decryption?.keySeed), null);
@@ -948,9 +1128,9 @@ export class FirmwareDownloadService {
     job.totalBytes = total;
     // Match Bifrost's layout: one long-lived Range request per lane for the
     // whole transfer. Samsung FUS can sharply throttle a client that keeps
-    // opening fresh 256 MiB requests. Eight equal, persistent ranges avoid
-    // that mid-download collapse while still preserving each range's offset
-    // for a safe resume after a pause or a renewed authorization.
+    // opening fresh 256 MiB requests. Equal, persistent ranges avoid that
+    // mid-download collapse while the bounded lane scaler can grow the
+    // conservative eight-lane baseline to the configured twelve-lane ceiling.
     const requestedSegmentCount = Math.min(
       MAX_PARALLEL_RANGE_COUNT,
       total,
@@ -1658,7 +1838,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.18.0") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.20.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   let closePromise = null;
