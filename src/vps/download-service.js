@@ -1443,7 +1443,12 @@ export class FirmwareDownloadService {
       controller.abort(new Error("download service is shutting down"));
     }
     await this.persist().catch(() => {});
-    await this.worker?.close().catch(() => {});
+    // BullMQ's default close waits for the active processor to finish. A FUS
+    // request can still be waiting on the upstream source at this point, which
+    // previously let systemd hit TimeoutStopSec and SIGKILL the process. The
+    // job state has already been persisted as queued and its AbortController
+    // has been signalled above, so force-close is the safe shutdown behavior.
+    await this.worker?.close(true).catch(() => {});
     await this.queue?.close().catch(() => {});
     this.redis?.disconnect();
   }
@@ -1569,8 +1574,29 @@ export async function startDownloadServer({ env = process.env, logger = console 
   const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.18.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
-  const close = async () => { await app.close().catch(() => {}); await service.close(); };
-  process.once("SIGINT", close);
-  process.once("SIGTERM", close);
+  let closePromise = null;
+  const close = () => {
+    if (!closePromise) {
+      closePromise = (async () => {
+        await app.close().catch(() => {});
+        await service.close();
+      })();
+    }
+    return closePromise;
+  };
+  const stop = (signal) => {
+    // Keep shutdown bounded below systemd's 30-second TimeoutStopSec. The
+    // persisted task state lets the next service instance resume safely if an
+    // upstream socket ignores abort during process shutdown.
+    const hardExit = setTimeout(() => {
+      logger.error?.(`Download service shutdown exceeded 20 seconds after ${signal}; exiting for systemd recovery.`);
+      process.exit(1);
+    }, 20_000);
+    close().catch((error) => {
+      logger.error?.(`Download service shutdown failed: ${error?.message || error}`);
+    }).finally(() => clearTimeout(hardExit));
+  };
+  process.once("SIGINT", () => stop("SIGINT"));
+  process.once("SIGTERM", () => stop("SIGTERM"));
   return { app, service, config, close };
 }

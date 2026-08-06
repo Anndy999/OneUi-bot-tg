@@ -77,6 +77,38 @@ two freshly created sessions are rejected before any additional byte is
 transferred, the task fails safely instead of looping forever. Retry later and
 do not copy authorization headers or credentials into logs or chat.
 
+## Download service stops slowly during an update
+
+An update or a manual restart first marks any active firmware task as queued,
+persists its completed byte ranges, and aborts its active official-source
+connections. The BullMQ worker is then force-closed so it does not wait
+indefinitely for an upstream socket. A final 20-second application deadline
+keeps shutdown below the unit's systemd timeout; the next start resumes the
+saved task. Do not use `kill -9` or delete a `*.part` file to work around a
+slow restart.
+
+If the service is healthy but the expected throughput override is incomplete,
+replace the dedicated systemd drop-in as a whole instead of appending partial
+environment lines. Keep the task index out of the public firmware directory:
+
+```ini
+[Service]
+Environment=APP_VERSION=2.18.3
+Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
+Environment=DOWNLOAD_PARALLEL_SEGMENTS=24
+Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=48
+Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=157286400
+Environment=DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
+Environment=DOWNLOAD_PARALLEL_SCALE_STEP=4
+Environment=DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
+Environment=DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+```
+
+Apply it with `sudo systemctl daemon-reload` followed by a restart of only
+`oneui-download.service`. Check `curl -fsS http://127.0.0.1:8788/health`
+afterward. Never put Redis URLs, API keys, or other protected values in this
+drop-in or in the repository.
+
 ## Service will not start
 
 Check the application unit and dependencies:

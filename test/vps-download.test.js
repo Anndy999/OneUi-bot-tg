@@ -59,6 +59,35 @@ test("download index can stay outside the public firmware directory", async () =
   }
 });
 
+test("download shutdown persists active work and force-closes the BullMQ worker", async () => {
+  const dir = await tempDir();
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" })
+    }).init({ startQueue: false });
+    let aborted = false;
+    let forceClose = null;
+    service.jobs.set("active", {
+      id: "active",
+      state: "downloading",
+      speedBytesPerSecond: 123,
+      updatedAt: new Date().toISOString()
+    });
+    service.controllers.set("active", { abort() { aborted = true; } });
+    service.worker = { async close(force) { forceClose = force; } };
+
+    await service.close();
+
+    assert.equal(aborted, true);
+    assert.equal(forceClose, true);
+    assert.equal(service.get("active").state, "queued");
+    const saved = JSON.parse(await readFile(join(dir, "index.json"), "utf8"));
+    assert.equal(saved.active.state, "queued");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("download speed uses a phase-local rolling window", () => {
   const job = {};
   updateRollingSpeed(job, "download", 0, 0);
