@@ -39,11 +39,11 @@ chat. Logs should contain error categories, not Tokens or passwords.
 
 ## Firmware download speed, pause, and resume
 
-Large Samsung files start with 24 bounded, staggered HTTP Range connections.
-If the rolling aggregate speed stays below 150 MiB/s, the downloader adds four
-lanes every eight seconds up to 48; it does not open all of them at once. This
-can improve throughput when Samsung limits one TCP connection, but it cannot
-guarantee a speed higher than Samsung's route to the VPS.
+Large Samsung files use eight bounded, staggered HTTP Range connections by
+default. This matches Bifrost's public per-download connection limit and
+avoids the common failure mode where dozens of FUS connections lower the total
+speed through per-IP congestion control or random concurrent disk writes. It
+cannot guarantee a speed higher than Samsung's route to the VPS.
 
 Use **暂停** in the administrator download detail view to preserve a
 Range-capable partial download, then **继续下载** to request only its unfinished
@@ -61,13 +61,14 @@ sudo systemctl restart oneui-download.service
 sudo systemctl status oneui-download.service --no-pager -l
 ```
 
-Use `DOWNLOAD_PARALLEL_SEGMENTS=24` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=48`
-for the bounded high-throughput profile. The downloader assigns 256 MiB Range
+Use `DOWNLOAD_PARALLEL_SEGMENTS=8` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=8`
+for the stable high-throughput profile. The downloader assigns 256 MiB Range
 work blocks dynamically, commits 4 MiB positional-write batches, and records
 progress only after a batch reaches disk. This reduces reconnection waves and
 filesystem overhead without allowing an interrupted batch to create a checksum
-hole. If the official source begins rejecting ranges, set both lane values to
-`16`, then `12`. The hard cap is `48`; do not use unbounded connection counts.
+hole. Do not raise the lane count merely to chase a brief peak: test one full
+firmware first. The hard cap remains `48`, but values above eight are an
+operator experiment, not the recommended default.
 
 If a task reports HTTP 401 from the official source, the downloader refreshes
 one shared FUS session without stopping already-authorized healthy lanes, then
@@ -93,13 +94,13 @@ environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.18.3
+Environment=APP_VERSION=2.18.4
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
-Environment=DOWNLOAD_PARALLEL_SEGMENTS=24
-Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=48
-Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=157286400
+Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
+Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
+Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=136314880
 Environment=DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
-Environment=DOWNLOAD_PARALLEL_SCALE_STEP=4
+Environment=DOWNLOAD_PARALLEL_SCALE_STEP=2
 Environment=DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 Environment=DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
 ```

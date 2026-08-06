@@ -24,8 +24,8 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 8788);
   assert.equal(config.indexDir, config.dir);
-  assert.equal(config.parallelSegments, 24);
-  assert.equal(config.parallelMaxSegments, 48);
+  assert.equal(config.parallelSegments, 8);
+  assert.equal(config.parallelMaxSegments, 8);
   assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 150 * 1024 * 1024);

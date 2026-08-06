@@ -1,7 +1,7 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.18.3
+APP_VERSION=2.18.4
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
@@ -22,17 +22,16 @@ DOWNLOAD_BODY_IDLE_TIMEOUT_MS=120000
 DOWNLOAD_JOB_STALE_MS=300000
 # Bound local download API request handling.
 DOWNLOAD_API_REQUEST_TIMEOUT_MS=30000
-DOWNLOAD_PARALLEL_SEGMENTS=24
-# Initial range: 1-48. Start at 24; the service expands gradually only when the
-# rolling aggregate speed remains under the target. It never starts all lanes at once.
-DOWNLOAD_PARALLEL_MAX_SEGMENTS=48
-# The stability target is 150 MiB/s. This is an expansion threshold, not a
-# promise: Samsung CDN routing and per-IP limits ultimately decide the ceiling.
-DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=157286400
+DOWNLOAD_PARALLEL_SEGMENTS=8
+# Bifrost-compatible stable profile: keep eight concurrent FUS connections.
+# More connections can reduce aggregate speed when Samsung throttles one VPS IP.
+DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
+# Kept for an operator who intentionally raises the maximum above eight.
+DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=136314880
 DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
-DOWNLOAD_PARALLEL_SCALE_STEP=4
-# Return to 16 (then 12) initial lanes and set MAX_SEGMENTS to the same value
-# only if Samsung begins rejecting Range requests.
+DOWNLOAD_PARALLEL_SCALE_STEP=2
+# Keep both lane values at 8 for the stable profile. Increase them only after a
+# measured real-VPS test shows a sustained improvement, not a brief peak.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
 # 256 MiB ranges keep each authorized connection useful for longer and reduce

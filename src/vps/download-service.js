@@ -18,6 +18,12 @@ const SPEED_WINDOW_MS = 10 * 1000;
 const SPEED_SAMPLE_MS = 1000;
 const MAX_PARALLEL_RANGE_COUNT = 512;
 const MAX_PARALLEL_LANE_COUNT = 48;
+// Bifrost's public downloader uses eight connections per download. Starting
+// dozens of Samsung FUS ranges at once can reduce aggregate throughput when
+// the CDN applies per-IP congestion control and also turns local writes into
+// random I/O. Eight is the stable, reversible default; operators can still
+// opt into a different bounded value through the protected environment file.
+const DEFAULT_PARALLEL_LANES = 8;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -55,7 +61,12 @@ export function createDownloadConfig(env = process.env) {
     .filter(Boolean);
   const dir = resolve(text(env.DOWNLOAD_DIR, "./data/firmware"));
   const bodyIdleTimeoutMs = integer(env.DOWNLOAD_BODY_IDLE_TIMEOUT_MS || 120_000, 120_000, 5_000, 15 * 60_000);
-  const parallelSegments = integer(env.DOWNLOAD_PARALLEL_SEGMENTS || 24, 24, 1, MAX_PARALLEL_LANE_COUNT);
+  const parallelSegments = integer(
+    env.DOWNLOAD_PARALLEL_SEGMENTS || DEFAULT_PARALLEL_LANES,
+    DEFAULT_PARALLEL_LANES,
+    1,
+    MAX_PARALLEL_LANE_COUNT
+  );
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -81,8 +92,8 @@ export function createDownloadConfig(env = process.env) {
     // new requests while still allowing a rate-limited route to scale up.
     parallelSegments,
     parallelMaxSegments: integer(
-      env.DOWNLOAD_PARALLEL_MAX_SEGMENTS || 48,
-      48,
+      env.DOWNLOAD_PARALLEL_MAX_SEGMENTS || DEFAULT_PARALLEL_LANES,
+      DEFAULT_PARALLEL_LANES,
       parallelSegments,
       MAX_PARALLEL_LANE_COUNT
     ),
