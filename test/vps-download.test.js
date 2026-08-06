@@ -40,7 +40,9 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 150 * 1024 * 1024);
-  assert.equal(config.decryptWorkerCount, 4);
+  assert.equal(config.decryptMode, "stream");
+  assert.equal(config.decryptStreamChunkBytes, 4 * 1024 * 1024);
+  assert.equal(config.decryptWorkerCount, 1);
   assert.equal(config.decryptWorkerMinBytes, 128 * 1024 * 1024);
   assert.equal(config.decryptChunkBytes, 16 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
@@ -974,6 +976,7 @@ test("large AES firmware decryption can use bounded worker lanes without changin
       config: createDownloadConfig({
         DOWNLOAD_DIR: dir,
         DOWNLOAD_MIN_FREE_BYTES: "0",
+        DOWNLOAD_DECRYPT_MODE: "parallel",
         DOWNLOAD_DECRYPT_WORKERS: "2",
         DOWNLOAD_DECRYPT_WORKER_MIN_BYTES: "1",
         DOWNLOAD_DECRYPT_CHUNK_BYTES: "32"

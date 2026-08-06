@@ -4,7 +4,6 @@ import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, rea
 import { basename, extname, join, relative, resolve } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
-import { availableParallelism } from "node:os";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Worker as NodeWorker } from "node:worker_threads";
@@ -30,9 +29,11 @@ const MAX_PARALLEL_RANGE_COUNT = 512;
 const MAX_PARALLEL_LANE_COUNT = 12;
 const DEFAULT_PARALLEL_LANES = 8;
 const DEFAULT_PARALLEL_MAX_LANES = 12;
-const DEFAULT_DECRYPT_WORKERS = Math.max(1, Math.min(4, availableParallelism()));
-const DEFAULT_DECRYPT_CHUNK_BYTES = 16 * 1024 * 1024;
-const DEFAULT_DECRYPT_WORKER_MIN_BYTES = 128 * 1024 * 1024;
+// Bifrost keeps one native AES-ECB cipher alive and feeds it bounded blocks.
+// Node's native stream performs better with a 4 MiB high-water mark on the
+// VPS profile, while the cipher and output ordering remain Bifrost-compatible.
+const DEFAULT_DECRYPT_MODE = "stream";
+const DEFAULT_DECRYPT_STREAM_CHUNK_BYTES = 4 * 1024 * 1024;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -85,12 +86,9 @@ export function createDownloadConfig(env = process.env) {
     parallelSegments,
     MAX_PARALLEL_LANE_COUNT
   );
-  const decryptChunkBytes = integer(
-    env.DOWNLOAD_DECRYPT_CHUNK_BYTES || DEFAULT_DECRYPT_CHUNK_BYTES,
-    DEFAULT_DECRYPT_CHUNK_BYTES,
-    16 * 1024,
-    64 * 1024 * 1024
-  );
+  const decryptMode = ["stream", "parallel"].includes(text(env.DOWNLOAD_DECRYPT_MODE))
+    ? text(env.DOWNLOAD_DECRYPT_MODE)
+    : DEFAULT_DECRYPT_MODE;
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -133,14 +131,21 @@ export function createDownloadConfig(env = process.env) {
     )),
     parallelScaleIntervalMs: integer(env.DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS || 8_000, 8_000, 1_000, 60_000),
     parallelScaleStep: integer(env.DOWNLOAD_PARALLEL_SCALE_STEP || 4, 4, 1, 16),
-    decryptWorkerCount: integer(
-      env.DOWNLOAD_DECRYPT_WORKERS || DEFAULT_DECRYPT_WORKERS,
-      DEFAULT_DECRYPT_WORKERS,
-      1,
-      8
+    decryptMode,
+    decryptStreamChunkBytes: integer(
+      env.DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES || DEFAULT_DECRYPT_STREAM_CHUNK_BYTES,
+      DEFAULT_DECRYPT_STREAM_CHUNK_BYTES,
+      64 * 1024,
+      4 * 1024 * 1024
     ),
-    decryptWorkerMinBytes: bytes(env.DOWNLOAD_DECRYPT_WORKER_MIN_BYTES, DEFAULT_DECRYPT_WORKER_MIN_BYTES),
-    decryptChunkBytes: decryptChunkBytes - (decryptChunkBytes % 16),
+    // Retain the legacy values for configuration compatibility. They are
+    // consulted only when an operator explicitly opts into parallel mode.
+    decryptWorkerCount: integer(env.DOWNLOAD_DECRYPT_WORKERS || 1, 1, 1, 8),
+    decryptWorkerMinBytes: bytes(env.DOWNLOAD_DECRYPT_WORKER_MIN_BYTES, 128 * 1024 * 1024),
+    decryptChunkBytes: Math.max(16 * 1024, Math.min(
+      64 * 1024 * 1024,
+      bytes(env.DOWNLOAD_DECRYPT_CHUNK_BYTES, 16 * 1024 * 1024)
+    )) & ~15,
     allowedHosts: [...new Set([...DEFAULT_ALLOWED_HOSTS, ...configuredHosts])]
   };
 }
@@ -994,7 +999,8 @@ export class FirmwareDownloadService {
 
   async decryptFirmwarePart(job, encryptedPath, outputPath, controller) {
     const encrypted = await stat(encryptedPath).catch(() => null);
-    const useWorkers = this.config.decryptWorkerCount > 1 &&
+    const useWorkers = this.config.decryptMode === "parallel" &&
+      this.config.decryptWorkerCount > 1 &&
       encrypted?.size >= this.config.decryptWorkerMinBytes &&
       encrypted.size % 16 === 0;
     if (useWorkers) return this.decryptFirmwarePartParallel(job, encryptedPath, outputPath, controller);
@@ -1060,8 +1066,15 @@ export class FirmwareDownloadService {
   }
 
   async decryptFirmwarePartStream(job, encryptedPath, outputPath, controller) {
-    const reader = createReadStream(encryptedPath, { highWaterMark: IO_BUFFER_BYTES });
-    const writer = createWriteStream(outputPath, { flags: "w", mode: 0o640, highWaterMark: IO_BUFFER_BYTES });
+    // Keep one native AES-ECB stream alive for the whole file, matching
+    // Bifrost's decryptProgress implementation. Each block is independent,
+    // but a single stream avoids worker message copies and random disk I/O.
+    const reader = createReadStream(encryptedPath, { highWaterMark: this.config.decryptStreamChunkBytes });
+    const writer = createWriteStream(outputPath, {
+      flags: "w",
+      mode: 0o640,
+      highWaterMark: this.config.decryptStreamChunkBytes
+    });
     const decipher = createDecipheriv("aes-128-ecb", decryptionKey(job.decryption?.keySeed), null);
     decipher.setAutoPadding(false);
     let processed = 0;
@@ -1838,7 +1851,7 @@ export async function startDownloadServer({ env = process.env, logger = console 
   if (!config.apiSecret) throw new Error("DOWNLOAD_API_SECRET is required");
   if (!config.redisUrl) throw new Error("REDIS_URL is required for the download service");
   const service = await new FirmwareDownloadService({ config, logger, fusEnv: env }).init({ startQueue: true });
-  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.20.0") });
+  const app = buildDownloadApp({ service, version: text(env.APP_VERSION, "2.21.0") });
   await app.listen({ host: config.host, port: config.port });
   logger.info?.(`OneUI download API listening on ${config.host}:${config.port}`);
   let closePromise = null;

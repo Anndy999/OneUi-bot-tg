@@ -99,7 +99,7 @@ environment lines. Keep the task index out of the public firmware directory:
 
 ```ini
 [Service]
-Environment=APP_VERSION=2.20.0
+Environment=APP_VERSION=2.21.0
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 Environment=DOWNLOAD_PARALLEL_SEGMENTS=12
 Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=12
@@ -108,9 +108,8 @@ Environment=DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
 Environment=DOWNLOAD_PARALLEL_SCALE_STEP=2
 Environment=DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 Environment=DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
-Environment=DOWNLOAD_DECRYPT_WORKERS=4
-Environment=DOWNLOAD_DECRYPT_WORKER_MIN_BYTES=134217728
-Environment=DOWNLOAD_DECRYPT_CHUNK_BYTES=16777216
+Environment=DOWNLOAD_DECRYPT_MODE=stream
+Environment=DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES=4194304
 ```
 
 Apply it with `sudo systemctl daemon-reload` followed by a restart of only
@@ -129,12 +128,12 @@ do not stall file I/O. Ensure the download unit uses the bundled Node 22 path;
 do not lower integrity checking or delete the encrypted part to make the final
 stage appear faster.
 
-For large AES firmware files, v2.20.0 can decrypt independent AES-ECB blocks
-with up to four bounded Node worker threads (`DOWNLOAD_DECRYPT_WORKERS=4`,
-16 MiB chunks). This is the same block-independent cipher model used by
-Bifrost, while files below 128 MiB keep the simpler single-stream path. The
-worker pool is closed on pause, cancel, or service restart; it never skips the
-final output or CRC checks.
+For large AES firmware files, v2.21.0 uses one native AES-ECB cipher stream
+with bounded blocks, matching Bifrost's `decryptProgress` design. The Node VPS
+profile uses 4 MiB I/O blocks to reduce callback overhead while avoiding
+cross-thread buffer copies and random output writes. A parallel
+worker path remains available only when `DOWNLOAD_DECRYPT_MODE=parallel` is
+explicitly selected; it is not the recommended default.
 
 The Telegram task card refreshes every five seconds on the production VPS.
 During CRC verification it shows `Verified: x / total`, verification speed and

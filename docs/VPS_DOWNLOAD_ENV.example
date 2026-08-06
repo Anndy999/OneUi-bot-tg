@@ -1,7 +1,7 @@
 # Copy to /etc/oneui-bot/oneui-download.env on the VPS.
 # Never commit the real file or send its values in chat.
 NODE_ENV=production
-APP_VERSION=2.20.0
+APP_VERSION=2.21.0
 DOWNLOAD_HOST=127.0.0.1
 DOWNLOAD_PORT=8788
 DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
@@ -43,11 +43,12 @@ DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.
 DOWNLOAD_PARALLEL_RETRIES=3
-# AES-ECB blocks are independent. Large packages use a bounded native worker
-# pool for decryption; small packages keep the single-stream path.
-DOWNLOAD_DECRYPT_WORKERS=4
-DOWNLOAD_DECRYPT_WORKER_MIN_BYTES=134217728
-DOWNLOAD_DECRYPT_CHUNK_BYTES=16777216
+# Bifrost-compatible decryption: one native AES-ECB stream and bounded blocks.
+# This avoids worker message copies and keeps the output write sequential.
+DOWNLOAD_DECRYPT_MODE=stream
+DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES=4194304
+# Parallel mode remains an explicit experiment only; do not enable it merely
+# because the VPS has more CPU cores.
 # A paused Range-capable download resumes its saved byte ranges after restart.
 # Do not manually delete *.part files; use the Telegram Delete button instead.
 DOWNLOAD_QUEUE_PREFIX=oneui-download
