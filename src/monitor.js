@@ -605,9 +605,11 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
     });
     // A version change sends one notification and keeps the normal schedule.
     const rollout = await createRolloutProposalForUpdate(env, item, parsed, now);
-    const updateNotice = notifyFirmwareUpdate(env, item, oldLatest, parsed, {
-      notifyManagers: !rollout?.proposal
-    });
+    const updateNotice = rollout?.suppressUpdate
+      ? Promise.resolve({ attempted: 0, queued: 0, sent: 0, suppressed: true })
+      : notifyFirmwareUpdate(env, item, oldLatest, parsed, {
+        notifyManagers: !rollout?.proposal
+      });
     const rolloutNotice = rollout?.proposal
       ? notifyRolloutProposal(env, rollout.proposal)
       : null;

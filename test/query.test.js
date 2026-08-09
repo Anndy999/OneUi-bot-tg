@@ -3523,6 +3523,10 @@ test("first /start shows onboarding once and My Devices is available to the owne
   }, payloads);
   assert.equal(await hasCompletedOnboarding(env, "9911"), true);
   assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")));
+  const onboarding = payloads.find((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心"));
+  assert.match(String(onboarding.body.text || ""), /Acknowledgements/);
+  assert.match(String(onboarding.body.text || ""), /@Dalee1ee/);
+  assert.match(String(onboarding.body.text || ""), /@fahadalijaved/);
   const secondPayloads = [];
   await dispatchTelegramTestUpdate(env, {
     update_id: 700011,

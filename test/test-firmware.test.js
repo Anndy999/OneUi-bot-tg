@@ -26,6 +26,12 @@ import {
   getMonitorItems,
   resetStateMemoryCache
 } from "../src/state.js";
+import {
+  activateTestFirmwareRolloutStage,
+  applyRolloutProposalDecision,
+  createRolloutProposalForUpdate,
+  getRolloutChains
+} from "../src/rollout-chain.js";
 
 const MODEL = "SM-S9480";
 const CSC = "CHC";
@@ -36,6 +42,11 @@ const KOO_VERSION_WITHOUT_LATEST = "S948NKSU0AVA1/S948NOKR0AVA1/S948NKSU0AVA1";
 const KOO_MD5_WITHOUT_LATEST = createHash("md5").update(KOO_VERSION_WITHOUT_LATEST).digest("hex");
 const KOO_HASHFIRM_RANGE_VERSION = "S948NKST0AUA0/S948NOKR0AUA0/S948NKST0AUA0";
 const KOO_HASHFIRM_RANGE_MD5 = createHash("md5").update(KOO_HASHFIRM_RANGE_VERSION).digest("hex");
+const KOO_HMAC_SHA256 = "6d67e7dcb90d17d83b482064e3deaeb882ae9f7341f41aada162f8cb57232c07";
+const KOO_CROSS_CP_VERSION = "S948NKSU4AZH2/S948NOKR4AZH2/S948NKSS4AZG1";
+const KOO_CROSS_CP_MD5 = createHash("md5").update(KOO_CROSS_CP_VERSION).digest("hex");
+const CHC_CURRENT_TEST_VERSION = "S9480ZCS4AZH1/S9480CHC4AZH1/S9480ZCS4AZH1";
+const CHC_CURRENT_TEST_MD5 = createHash("md5").update(CHC_CURRENT_TEST_VERSION).digest("hex");
 const UNRESOLVED_SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MULTI_TEST_VERSIONS = [
   "S9480ZCU0AVA1/S9480CHC0AVA1/S9480ZCU0AVA1",
@@ -114,6 +125,54 @@ test("KOO fallback ranges resolve the regional build when version.test.xml has n
   assert.equal(result.matches[0].version, KOO_VERSION_WITHOUT_LATEST);
 });
 
+test("Samsung HMAC-SHA256 test hashes resolve to the latest candidate", async () => {
+  const result = await runTestFirmwareDecryptor({
+    model: "SM-S948N",
+    csc: "KOO",
+    testXml: `<root><value>${KOO_HMAC_SHA256}</value></root>`
+  }, {
+    env: { TEST_FIRMWARE_PYTHON_BIN: process.platform === "win32" ? "python" : "python3" },
+    timeoutMs: 120_000,
+    logger: quietLogger()
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].version, KOO_VERSION_WITHOUT_LATEST);
+});
+
+test("bounded CP seed pool resolves a regional CP from the previous month", async () => {
+  const result = await runTestFirmwareDecryptor({
+    model: "SM-S948N",
+    csc: "KOO",
+    latestVersion: KOO_CROSS_CP_VERSION,
+    testXml: `<root><value>${KOO_CROSS_CP_MD5}</value></root>`
+  }, {
+    env: { TEST_FIRMWARE_PYTHON_BIN: process.platform === "win32" ? "python" : "python3" },
+    timeoutMs: 120_000,
+    logger: quietLogger()
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].version, KOO_CROSS_CP_VERSION);
+});
+
+test("canonical current-month builds are resolved before the CP expansion cap", async () => {
+  const result = await runTestFirmwareDecryptor({
+    model: MODEL,
+    csc: CSC,
+    latestVersion: LATEST,
+    testXml: `<root><value>${CHC_CURRENT_TEST_MD5}</value></root>`
+  }, {
+    env: { TEST_FIRMWARE_PYTHON_BIN: process.platform === "win32" ? "python" : "python3" },
+    timeoutMs: 120_000,
+    logger: quietLogger()
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].version, CHC_CURRENT_TEST_VERSION);
+  assert.equal(result.candidateLimitReached, false);
+});
+
 test("Samsung candidate ranges include zero builds, six year codes, and T engineering builds", async () => {
   const result = await runTestFirmwareDecryptor({
     model: "SM-S948N",
@@ -157,7 +216,7 @@ test("automatic KOO progress clearly reports the deployment trigger and result",
   assert.match(started, /已自动开始测试固件解密/);
   assert.match(started, /触发：机器人更新/);
   assert.match(finished, /自动测试固件解密完成/);
-  assert.match(finished, /SM-S948N \/ KOO：已解密/);
+  assert.match(finished, /SM-S948N \/ KOO：最新测试版本/);
   assert.match(finished, /S948NKSU0AVA1\/S948NOKR0AVA1\/S948NKSU0AVA1/);
 });
 
@@ -309,6 +368,17 @@ test("ordinary users cannot enqueue the admin-only test scan command", async () 
   assert.equal(queue.length, 0);
 });
 
+test("test scan uses the ordinary query parser for short and lowercase model input", async () => {
+  const queue = [];
+  const app = runtime({ queue });
+  const handled = await handleTestFirmwareTelegramCommand({
+    message: { chat: { id: "100" }, text: "/testscan 948n koo" }
+  }, app, quietLogger());
+  assert.equal(handled, true);
+  const job = queue.find((entry) => entry.maintenance);
+  assert.deepEqual(job?.data?.target, { model: "SM-S948N", csc: "KOO", key: "SM-S948N:KOO" });
+});
+
 test("additional administrators cannot run owner-only test firmware commands during testing", async () => {
   const queue = [];
   const app = runtime({ queue });
@@ -392,12 +462,22 @@ test("test firmware panel exposes status and an inline-only EUX confirmation gat
   assert.equal(panel.replyMarkup.inline_keyboard.flat().some((button) => button.callback_data === "test-fw:manual"), false);
 });
 
-test("EUX success enables only the exact formal monitor target", async () => {
+test("KOO confirmation enables S26 Korea while EUX decryption stays rollout-gated", async () => {
   resetStateMemoryCache();
   const history = new InMemoryTestFirmwareHistoryRepository();
   const app = runtime({ history });
   app.env.FIRMWARE_KV = new MemoryStorage();
-  await history.confirmKooAndEnableEux("S948NKSU0AVA1/S948NOKR0AVA1/S948NKSU0AVA1", "100");
+  await history.upsertResolved({
+    model: "SM-S948N",
+    csc: "KOO",
+    hashType: "md5",
+    hashValue: "0123456789abcdef0123456789abcdef",
+    pda: "S948NKSU0AVA1",
+    cscBuild: "S948NOKR0AVA1",
+    cp: "S948NKSU0AVA1"
+  });
+  const confirmed = await confirmKooAndEnableEux(app, "100", quietLogger());
+  assert.equal(confirmed.ok, true);
   const result = await scanTestFirmwareTarget(app, { model: "SM-S948B", csc: "EUX" }, {
     testXml: TEST_XML,
     latestVersionOverride: LATEST,
@@ -406,9 +486,91 @@ test("EUX success enables only the exact formal monitor target", async () => {
   assert.equal(result.status, "resolved");
   const items = await getMonitorItems(app.env);
   const eux = items.find((item) => item.model === "SM-S948B" && item.csc === "EUX");
-  assert.equal(eux?.enabled, true);
-  assert.equal(eux?.testFirmwareMonitorOverride, true);
-  assert.equal(items.some((item) => item.model === "SM-S948N" && item.csc === "KOO"), false);
+  assert.equal(eux?.enabled, false);
+  assert.equal(eux?.paused, true);
+  const koreanS26 = items.filter((item) => item.rolloutChainId === "s26" && item.rolloutStageId === "kr");
+  assert.equal(koreanS26.length, 3);
+  assert.equal(koreanS26.every((item) => item.enabled === true && item.paused === false), true);
+});
+
+test("one S26 Korea update creates one proposal and pauses the whole current region", async () => {
+  resetStateMemoryCache();
+  const app = runtime();
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  await activateTestFirmwareRolloutStage(app.env, "s26", "kr");
+  const parsed = { latest: "S942NKSU1AZH1/S942NOKR1AZH1/S942NKSU1AZH1" };
+  const first = await createRolloutProposalForUpdate(app.env, {
+    model: "SM-S942N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  }, parsed, new Date("2026-08-09T04:00:00.000Z"));
+  assert.ok(first?.proposal?.id);
+  const duplicate = await createRolloutProposalForUpdate(app.env, {
+    model: "SM-S947N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  }, { latest: "S947NKSU1AZH1/S947NOKR1AZH1/S947NKSU1AZH1" }, new Date("2026-08-09T04:01:00.000Z"));
+  assert.equal(duplicate?.suppressUpdate, true);
+  assert.equal(duplicate?.proposal, null);
+  const items = await getMonitorItems(app.env);
+  const currentRegion = items.filter((item) => item.rolloutChainId === "s26" && item.rolloutStageId === "kr");
+  assert.equal(currentRegion.length, 3);
+  assert.equal(currentRegion.every((item) => item.enabled === false && item.paused === true), true);
+  const chains = await getRolloutChains(app.env);
+  const chain = chains.chains.find((item) => item.id === "s26");
+  assert.equal(chain.status, "awaiting_confirmation");
+  assert.equal(chain.pendingProposalId, first.proposal.id);
+});
+
+test("approving a rollout proposal advances S26 and starts dependent S25 Korea", async () => {
+  resetStateMemoryCache();
+  const app = runtime();
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  await activateTestFirmwareRolloutStage(app.env, "s26", "kr");
+  const result = await createRolloutProposalForUpdate(app.env, {
+    model: "SM-S948N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  }, { latest: "S948NKSU1AZH1/S948NOKR1AZH1/S948NKSU1AZH1" });
+  const decision = await applyRolloutProposalDecision(app.env, result.proposal.id, "approve", "100");
+  assert.equal(decision.ok, true);
+  const chains = await getRolloutChains(app.env);
+  const s26 = chains.chains.find((item) => item.id === "s26");
+  const s25 = chains.chains.find((item) => item.id === "s25");
+  assert.equal(s26.activeStageId, "eu");
+  assert.equal(s26.status, "active");
+  assert.equal(s25.activeStageId, "kr");
+  assert.equal(s25.status, "active");
+  const items = await getMonitorItems(app.env);
+  assert.equal(items.find((item) => item.model === "SM-S942B" && item.csc === "EUX")?.enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S931N" && item.csc === "KOO")?.enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S942N" && item.csc === "KOO")?.enabled, false);
+});
+
+test("skipping a rollout proposal reactivates the current region without advancing", async () => {
+  resetStateMemoryCache();
+  const app = runtime();
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  await activateTestFirmwareRolloutStage(app.env, "s26", "kr");
+  const result = await createRolloutProposalForUpdate(app.env, {
+    model: "SM-S942N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  }, { latest: "S942NKSU1AZH1/S942NOKR1AZH1/S942NKSU1AZH1" });
+  const decision = await applyRolloutProposalDecision(app.env, result.proposal.id, "skip", "100");
+  assert.equal(decision.ok, true);
+  const chains = await getRolloutChains(app.env);
+  const s26 = chains.chains.find((item) => item.id === "s26");
+  assert.equal(s26.activeStageId, "kr");
+  assert.equal(s26.status, "active");
+  assert.equal(s26.pendingProposalId, "");
+  const items = await getMonitorItems(app.env);
+  const currentRegion = items.filter((item) => item.rolloutChainId === "s26" && item.rolloutStageId === "kr");
+  assert.equal(currentRegion.every((item) => item.enabled === true && item.paused === false), true);
 });
 
 test("startup pipeline queues KOO once and retries are protected by a durable claim", async () => {

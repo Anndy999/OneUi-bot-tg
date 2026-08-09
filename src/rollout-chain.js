@@ -331,6 +331,36 @@ export async function setRolloutChainStage(env, chainId, stageId) {
   return saveChains(env, chains);
 }
 
+// The test-build pipeline uses the same persisted rollout chain as ordinary
+// monitoring. This is the single gate that opens S26 Korea after the owner or
+// an administrator confirms the verified KOO test build. EUX/TGY/CHC remain
+// prepared-only until the currently active region produces an official update.
+export async function activateTestFirmwareRolloutStage(env, chainId = "s26", stageId = "kr") {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  const stage = findStage(chain, stageId);
+  if (!chain || !stage) throw new Error("测试固件发布链或地区不存在");
+  if (!stage.targets.length) throw new Error("测试固件发布链韩版没有可监控的官方型号");
+  chain.enabled = true;
+  chain.status = "active";
+  chain.activeStageId = stage.id;
+  chain.pendingProposalId = "";
+  await activateOnlyStage(env, chain, stage);
+  return saveChains(env, chains);
+}
+
+// Recover an already-confirmed pipeline after a restart or an older release
+// that had temporarily paused the legacy rollout state. Never reset a chain
+// that is already progressing through a later region.
+export async function ensureTestFirmwareRolloutStage(env, chainId = "s26", stageId = "kr") {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain) throw new Error("测试固件发布链不存在");
+  if (chain.enabled && ["active", "awaiting_confirmation"].includes(chain.status)) return chains;
+  if (chain.status === "completed") return chains;
+  return activateTestFirmwareRolloutStage(env, chainId, stageId);
+}
+
 // Pause both legacy rollout chains without deleting their targets or history.
 // Test-build confirmation owns the temporary EUX activation while this gate is
 // paused, so the existing rollout state remains recoverable.
@@ -358,7 +388,13 @@ export async function createRolloutProposalForUpdate(env, item, parsed, now = ne
   if (!chainId || !stageId) return null;
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
-  if (!chain || !chain.enabled || chain.status === "completed" || chain.activeStageId !== stageId || chain.pendingProposalId) return null;
+  if (!chain || !chain.enabled || chain.status === "completed" || chain.activeStageId !== stageId) return null;
+  // A second model in the same region may finish its query while the first
+  // model is waiting for confirmation. Suppress its duplicate public update
+  // notification and keep exactly one proposal for the region.
+  if (chain.pendingProposalId || chain.status === "awaiting_confirmation") {
+    return { proposal: null, suppressUpdate: true, chain, stage: findStage(chain, stageId) };
+  }
   const stage = findStage(chain, stageId);
   const configured = stage?.targets.some((target) => target.model === item.model && target.csc === item.csc);
   if (!configured) return null;
@@ -390,6 +426,29 @@ export async function createRolloutProposalForUpdate(env, item, parsed, now = ne
   chain.status = "awaiting_confirmation";
   await putRolloutProposal(env, proposal);
   await saveChains(env, chains);
+  // Pause the whole active region as soon as the first official update is
+  // detected. This prevents another model from producing duplicate pushes
+  // while the owner/admin confirmation is pending. The approve path keeps the
+  // pause; the skip path explicitly reactivates the stage.
+  const resumeAt = nextBeijingMonthStart(now);
+  for (const target of stage.targets) {
+    await snoozeMonitorItem(env, target.model, target.csc, resumeAt, {
+      updateVersion: proposal.source.version,
+      reason: "rollout_pending_confirmation"
+    }).catch(() => {});
+    await upsertMonitorItem(env, {
+      ...target,
+      enabled: false,
+      paused: true,
+      pauseReason: "rollout_pending_confirmation",
+      resumeAt: resumeAt.toISOString(),
+      pauseSource: "rollout_chain",
+      priority: "high",
+      intervalMinutes: chain.intervalMinutes,
+      rolloutChainId: chain.id,
+      rolloutStageId: stage.id
+    }).catch(() => {});
+  }
   return { proposal, chain, stage, next, startChain };
 }
 
@@ -511,6 +570,7 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
     proposal.decidedBy = String(decidedBy || "");
     chain.pendingProposalId = "";
     chain.status = "active";
+    await activateStage(env, chain, stage);
     await putRolloutProposal(env, proposal);
     await saveChains(env, chains);
     return { ok: true, decision: "skip", proposal, chain };
@@ -527,7 +587,10 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
       updateVersion: proposal.source.version,
       reason: "rollout_release_pause"
     });
-    if (!paused?.ok) return { ok: false, reason: "pause_failed", proposal };
+    // The local monitor item is also updated below. A missing scheduler
+    // binding is therefore a safe compatibility fallback; an explicit
+    // scheduler rejection still aborts the transition.
+    if (paused && !paused.ok) return { ok: false, reason: "pause_failed", proposal };
   }
   if (next) {
     await activateStage(env, chain, next);

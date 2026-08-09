@@ -1258,6 +1258,9 @@ function onboardingText(identity, lang = "zh") {
       "2. Use the result card to refresh, open Samsung notes, or save the device",
       "3. Open My Devices to query saved devices and manage new-version notifications",
       "",
+      "Acknowledgements",
+      "Special thanks to @Dalee1ee for providing the VPS server and @fahadalijaved for providing the firmware decryption method.",
+      "",
       identity === "allowed"
         ? "You can start querying now. Notifications are sent only when a monitored target has a new version."
         : "Request access first to query firmware."
@@ -1269,6 +1272,9 @@ function onboardingText(identity, lang = "zh") {
     "1. 发送 Model + CSC，例如：SM-S948B EUX",
     "2. 在结果卡片中实时刷新、查看三星说明，或保存设备",
     "3. 打开“我的设备”快捷查询，并管理新版本通知",
+    "",
+    "Acknowledgements",
+    "Special thanks to @Dalee1ee for providing the VPS server and @fahadalijaved for providing the firmware decryption method.",
     "",
     identity === "allowed"
       ? "你现在可以开始查询。只有监控到新版本时才会推送通知。"
