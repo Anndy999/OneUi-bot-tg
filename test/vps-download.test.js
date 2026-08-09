@@ -1005,7 +1005,7 @@ test("download service resolves a Samsung FUS job inside the VPS worker", async 
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret" }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       resolveImpl: async () => ({
         sourceUrl: "http://cloud-neofussvr.samsungmobile.com/NF_SmartDownloadBinaryForMass.do?file=path%2Ffirmware.zip",

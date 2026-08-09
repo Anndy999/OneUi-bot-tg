@@ -1,4 +1,4 @@
-import { docUrl, normalizeFirmwareVersion } from "./utils.js";
+import { docUrl, firmwareVersionFingerprint, normalizeFirmwareVersion } from "./utils.js";
 import { validateModelCsc } from "./targets.js";
 
 const FUS_BASE = "https://neofussvr.sslcs.cdngc.net";
@@ -767,7 +767,7 @@ export async function querySmartHistory(env, model, csc, options = {}) {
     throw error;
   }
   const parseStartedAt = Date.now();
-  const parsed = parseSmartHistory(xml, normalizedModel, normalizedCsc);
+  const parsed = parseSmartHistory(xml, normalizedModel, normalizedCsc, options);
   if (options.timing && typeof options.timing === "object") {
     options.timing.parseHistoryMs = Number(options.timing.parseHistoryMs || 0) +
       (Date.now() - parseStartedAt);
@@ -978,7 +978,7 @@ export function officialCscOptionsFromSmartHistoryRows(rows = []) {
   return [...byCsc.values()];
 }
 
-export function parseSmartHistory(xml, model, csc) {
+export function parseSmartHistory(xml, model, csc, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const rows = parseSmartHistoryRows(xml, normalizedModel, normalizedCsc);
 
@@ -997,7 +997,25 @@ export function parseSmartHistory(xml, model, csc) {
     error.officialCscOptions = officialCscOptionsFromSmartHistoryRows(rows);
     throw error;
   }
-  const candidates = rows.filter((row) => row.cscRank === bestCscRank);
+  let candidates = rows.filter((row) => row.cscRank === bestCscRank);
+  const requestedVersion = normalizeFirmwareVersion(options.requestedVersion || "");
+  if (requestedVersion) {
+    const requestedParts = requestedVersion.split("/").filter(Boolean);
+    candidates = candidates.filter((row) => requestedParts.length === 1
+      ? row.pda === requestedParts[0]
+      : firmwareVersionFingerprint(row.latest) === firmwareVersionFingerprint(requestedVersion));
+    if (!candidates.length) {
+      const error = new Error(`Samsung SmartHistory has no matching firmware version for ${requestedVersion}`);
+      error.code = "FUS_SMART_HISTORY_VERSION_NOT_FOUND";
+      error.requestedVersion = requestedVersion;
+      error.availableVersions = rows
+        .filter((row) => row.cscRank === bestCscRank)
+        .map((row) => row.latest)
+        .filter(Boolean)
+        .slice(-10);
+      throw error;
+    }
+  }
   candidates.sort((a, b) => {
     if (a.sequence !== null && b.sequence !== null && a.sequence !== b.sequence) return a.sequence - b.sequence;
     if (a.sequence === null && b.sequence !== null) return -1;
@@ -1037,6 +1055,7 @@ export function parseSmartHistory(xml, model, csc) {
       exists: latest.exists,
       platform: latest.platform
     },
-    rawOutput: xml
+    rawOutput: xml,
+    ...(requestedVersion ? { requestedVersion } : {})
   };
 }

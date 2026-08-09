@@ -734,6 +734,34 @@ test("firmware input parser normalizes supported short, full, slash, and colon f
   assert.deepEqual(parseFirmwareInput("hello"), { matched: false, reason: "unrecognized" });
 });
 
+test("firmware input parser preserves an optional exact version", () => {
+  const version = "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1";
+  assert.deepEqual(parseFirmwareInput(`9480 chc ${version}`), {
+    matched: true,
+    model: "SM-S9480",
+    csc: "CHC",
+    sourceFormat: "short_model_space_csc",
+    version
+  });
+});
+
+test("SmartHistory selects an exact historical firmware version when requested", () => {
+  const oldVersion = "S9480ZCU1/S9480CHC1/S9480ZCU1";
+  const latestVersion = "S9480ZCU2/S9480CHC2/S9480ZCU2";
+  const selected = parseSmartHistory(historyDocument([
+    historyRow({ sequence: "1", localCsc: "CHC", model: "SM-S9480", version: oldVersion }),
+    historyRow({ sequence: "2", localCsc: "CHC", model: "SM-S9480", version: latestVersion })
+  ]), "SM-S9480", "CHC", { requestedVersion: oldVersion });
+  assert.equal(selected.latest, oldVersion);
+  assert.equal(selected.requestedVersion, oldVersion);
+  assert.throws(
+    () => parseSmartHistory(historyDocument([
+      historyRow({ sequence: "2", localCsc: "CHC", model: "SM-S9480", version: latestVersion })
+    ]), "SM-S9480", "CHC", { requestedVersion: oldVersion }),
+    (error) => error.code === "FUS_SMART_HISTORY_VERSION_NOT_FOUND"
+  );
+});
+
 test("tablet and watch aliases resolve to exact Samsung models", () => {
   const cases = [
     ["930 chn", "SM-X930", "CHN"],
@@ -2981,6 +3009,26 @@ test("slow firmware input shows a delayed placeholder and then edits it with the
   assert.ok(firmwareResult);
   assert.ok(firmwareResult.url.includes("editMessageText"));
   assert.equal(result.historyCalls, 1);
+});
+
+test("exact firmware input returns the selected version and keeps it on the admin download action", async () => {
+  const oldVersion = "S9480ZCU1/S9480CHC1/S9480ZCU1";
+  const latestVersion = "S9480ZCU2/S9480CHC2/S9480ZCU2";
+  const result = await dispatchFirmwareQueryUpdate({
+    input: `9480 chc ${oldVersion}`,
+    historyRows: [
+      historyRow({ sequence: "1", localCsc: "CHC", model: "SM-S9480", version: oldVersion }),
+      historyRow({ sequence: "2", localCsc: "CHC", model: "SM-S9480", version: latestVersion })
+    ]
+  });
+  assert.equal(result.response.status, 200);
+  const response = result.telegram.find((entry) => entry.body.text?.includes("指定版本"));
+  assert.ok(response);
+  assert.match(response.body.text, new RegExp(oldVersion.replaceAll("/", "\\/")));
+  const downloadButton = response.body.reply_markup?.inline_keyboard
+    ?.flat()
+    .find((button) => String(button.callback_data || "").startsWith("admin:download-exact:"));
+  assert.ok(downloadButton);
 });
 
 test("query result is queued for retry when Telegram is temporarily unavailable", async () => {

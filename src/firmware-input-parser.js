@@ -7,6 +7,24 @@ function normalizeInput(value) {
     .replace(/\s+/g, " ");
 }
 
+function isFirmwareVersionToken(value) {
+  const token = String(value || "").trim();
+  if (!token) return false;
+  if (/^[A-Z0-9]+(?:\/[A-Z0-9]+){2,}$/i.test(token)) return true;
+  return /^[A-Z0-9]{10,}$/i.test(token) && /\d/.test(token);
+}
+
+function splitRequestedVersion(raw) {
+  const normalized = String(raw || "").trim().replace(/[,]+/g, " ");
+  const parts = normalized.split(/\s+/).filter(Boolean);
+  const candidate = parts.at(-1) || "";
+  if (!isFirmwareVersionToken(candidate)) return { targetText: normalized, version: "" };
+  return {
+    targetText: parts.slice(0, -1).join(" "),
+    version: candidate.toUpperCase().replace(/\s*\/\s*/g, "/")
+  };
+}
+
 function sourceFormat(raw) {
   if (raw.includes(":")) return "model_colon_csc";
   if (raw.includes("/")) return "model_slash_csc";
@@ -17,7 +35,8 @@ function sourceFormat(raw) {
 
 export function parseFirmwareInput(text, defaultCsc = "CHC") {
   const raw = String(text || "").trim();
-  const normalized = normalizeInput(raw);
+  const requested = splitRequestedVersion(raw);
+  const normalized = normalizeInput(requested.targetText);
   if (!normalized) return { matched: false, reason: "empty" };
 
   const parts = normalized.split(" ");
@@ -34,12 +53,14 @@ export function parseFirmwareInput(text, defaultCsc = "CHC") {
 
   try {
     const target = parseModelQuery(normalized, defaultCsc);
-    return {
+    const result = {
       matched: true,
       model: target.model,
       csc: target.csc,
-      sourceFormat: sourceFormat(raw)
+      sourceFormat: sourceFormat(requested.targetText)
     };
+    if (requested.version) result.version = requested.version;
+    return result;
   } catch (error) {
     return {
       matched: false,
@@ -85,7 +106,8 @@ export function firmwareInputHelp(lang = "zh", reason = "unrecognized", details 
       "Send a model and CSC, for example:",
       "Phone: SM-S9480 TGY",
       "Tablet: tab11u wifi CHN",
-      "Watch: watch8 44 CHC"
+      "Watch: watch8 44 CHC",
+      "Exact version: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1"
     ].join("\n");
   }
   const headline = reason === "missing_csc"
@@ -97,6 +119,7 @@ export function firmwareInputHelp(lang = "zh", reason = "unrecognized", details 
     "请按以下格式输入：",
     "手机：SM-S9480 TGY",
     "平板：tab11u wifi CHN",
-    "手表：watch8 44 CHC"
+    "手表：watch8 44 CHC",
+    "指定版本：SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1"
   ].join("\n");
 }

@@ -406,6 +406,9 @@ export function formatFirmwareResult(result, options = {}) {
   const lang = options.lang || "zh";
   const buildDate = firmwareBuildDateDisplay(result, lang).text;
   const latest = normalizeFirmwareVersion(result.latest) || String(result.latest || "").trim();
+  const versionLabel = result.requestedVersion
+    ? (lang === "en" ? "Selected version" : "指定版本")
+    : (lang === "en" ? "Latest version" : "最新版本");
   const android = displayAndroidVersion(result.android, lang);
   const hasAndroid = android && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(android);
   const hasBuildDate = buildDate && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(buildDate);
@@ -416,7 +419,7 @@ export function formatFirmwareResult(result, options = {}) {
       "",
       `${result.model} · ${result.csc}`,
       "",
-      "Latest version",
+      versionLabel,
       latest,
       ...(hasAndroid ? ["", `Android: ${android}`] : []),
       ...(hasBuildDate ? ["", `Build: ${buildDate}`] : [])
@@ -432,7 +435,7 @@ export function formatFirmwareResult(result, options = {}) {
     "",
     `${result.model} · ${result.csc}`,
     "",
-    "最新版本",
+    versionLabel,
     latest,
     ...(hasAndroid ? ["", `Android：${android}`] : []),
     ...(hasBuildDate ? ["", `构建：${buildDate}`] : [])
@@ -513,6 +516,12 @@ export function formatQueryFailure(reason, lang = "zh") {
 function friendlyQueryFailureReason(reason, lang = "zh") {
   const raw = String(reason || "").trim();
   const lower = raw.toLowerCase();
+
+  if (lower.includes("no matching firmware version")) {
+    return lang === "en"
+      ? "Samsung SmartHistory did not return this exact firmware version for the requested CSC. Check the full version string or choose one of the versions returned by Samsung."
+      : "三星官方历史记录中没有找到这个 CSC 对应的精确版本。请检查完整版本号，或选择三星官方返回的其他版本。";
+  }
 
   if (lower.includes("smarthistory") || lower.includes("smart history") || lower.includes("no usable firmware history")) {
     return lang === "en"

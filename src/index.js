@@ -15,6 +15,7 @@ import {
 import { adminHelpParts, guideText } from "./guides.js";
 import { formatSchedule, processMonitorQueueMessage, runMonitor, runScheduledTasks } from "./monitor.js";
 import { coordinatedFirmwareQuery } from "./firmware-query-coordinator.js";
+import { queryFirmwareHistory } from "./samsung.js";
 import { applyFlagshipProposalDecision } from "./flagship-priority.js";
 import {
   addRolloutTarget,
@@ -592,10 +593,10 @@ export async function processTelegramUpdate(update, env, origin = "", ctx = null
     return jsonResponse({ ok: true, limited: true });
   }
 
-  runBackground(ctx, handleManualQuery(env, chatId, `${input.model} ${input.csc}`, {
+  runBackground(ctx, handleManualQuery(env, chatId, `${input.model} ${input.csc}${input.version ? ` ${input.version}` : ""}`, {
     identity,
     ctx,
-    query: { model: input.model, csc: input.csc }
+    query: { model: input.model, csc: input.csc, ...(input.version ? { version: input.version } : {}) }
   }));
   return jsonResponse({ ok: true, processing: true });
 }
@@ -778,6 +779,28 @@ async function clearAdminDownloadInput(env, chatId) {
 
 async function hasAdminDownloadInput(env, chatId) {
   return Boolean(await kvGetJson(env, adminDownloadSessionKey(chatId), null));
+}
+
+function exactDownloadCandidateKey(chatId, token) {
+  return `admin:download-candidate:${String(chatId || "")}:${String(token || "")}`;
+}
+
+function createExactDownloadToken() {
+  return randomId().replace(/[^a-z0-9]/gi, "").slice(0, 12).toLowerCase();
+}
+
+async function saveExactDownloadCandidate(env, chatId, token, request) {
+  if (!env.FIRMWARE_KV || !token || !request?.version) return false;
+  await kvPutJson(env, exactDownloadCandidateKey(chatId, token), {
+    model: request.model,
+    csc: request.csc,
+    version: request.version
+  }, { expirationTtl: ADMIN_DOWNLOAD_SESSION_TTL_SECONDS });
+  return true;
+}
+
+async function getExactDownloadCandidate(env, chatId, token) {
+  return kvGetJson(env, exactDownloadCandidateKey(chatId, token), null);
 }
 
 function legacyFormatDownloadJob(job, lang = "zh") {
@@ -1063,8 +1086,8 @@ async function renderUserDevices(env, chatId, messageId = null) {
 }
 
 function queryHelpText(lang = "zh") {
-  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
-  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
+  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
+  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
   /* legacy copy retained below */
   if (lang === "en") {
     return [
@@ -1089,7 +1112,7 @@ function queryHelpText(lang = "zh") {
 }
 
 
-function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed") {
+function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed", options = {}) {
   const normalizedModel = String(model || "").toUpperCase();
   const normalizedCsc = String(csc || "").toUpperCase();
   {
@@ -1103,7 +1126,9 @@ function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed") {
     { text: en ? "Monitor" : "\u52a0\u5165\u76d1\u63a7", callback_data: `monitor-item:add:${normalizedModel}:${normalizedCsc}` },
     { text: en ? "Clear cache" : "\u6e05\u7f13\u5b58", callback_data: `admin:cache-target:${normalizedModel}:${normalizedCsc}` }
   ]);
-  if (identity === "admin") rows.push([{ text: en ? "Download firmware" : "\u4e0b\u8f7d\u56fa\u4ef6", callback_data: `admin:download-start:${normalizedModel}:${normalizedCsc}` }]);
+  if (identity === "admin" && (!options.requestedVersion || options.downloadToken)) rows.push([{ text: en ? "Download firmware" : "\u4e0b\u8f7d\u56fa\u4ef6", callback_data: options.downloadToken
+    ? `admin:download-exact:${options.downloadToken}`
+    : `admin:download-start:${normalizedModel}:${normalizedCsc}` }]);
   rows.push([{ text: en ? "Home" : "\u9996\u9875", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
   }
@@ -1665,14 +1690,13 @@ function parseAccessDecisionText(text) {
 }
 
 function parseAdminDownloadInput(text) {
-  const tokens = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (tokens.length < 2) return null;
-  let version = "";
-  if (tokens.length >= 3 && (tokens.at(-1).includes("/") || /^[A-Z0-9]{10,}$/i.test(tokens.at(-1)))) version = tokens.pop();
-  const csc = tokens.pop();
-  const parsed = parseFirmwareInput(`${tokens.join(" ")} ${csc}`);
+  const parsed = parseFirmwareInput(text);
   if (!parsed.matched) return null;
-  return { model: parsed.model, csc: parsed.csc, version };
+  return {
+    model: parsed.model,
+    csc: parsed.csc,
+    ...(parsed.version ? { version: parsed.version } : {})
+  };
 }
 
 function canFallbackToOfficialVersionMetadata(error) {
@@ -1680,7 +1704,15 @@ function canFallbackToOfficialVersionMetadata(error) {
 }
 
 async function resolveAdminDownloadVersion(env, request) {
-  if (request.version) return request.version;
+  if (request.version) {
+    const parts = String(request.version).split("/").filter(Boolean);
+    if (parts.length > 1) return request.version;
+    const exact = await queryFirmwareHistory(env, request.model, request.csc, {
+      role: "admin",
+      requestedVersion: request.version
+    });
+    return exact.latest;
+  }
   try {
     const history = await querySmartHistory(env, request.model, request.csc, { role: "admin" });
     return history.latest;
@@ -2321,6 +2353,18 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   if (data === "admin:dl:discard") {
     await clearAdminDownloadInput(env, chatId);
     await renderDownloadMenu(env, chatId, messageId);
+    return;
+  }
+  if (data.startsWith("admin:download-exact:")) {
+    const token = data.slice("admin:download-exact:".length);
+    const request = await getExactDownloadCandidate(env, chatId, token);
+    if (!request?.model || !request?.csc || !request?.version) {
+      await safeEditOrSend(env, chatId, messageId, lang === "en"
+        ? "This selected firmware version has expired. Query it again before downloading."
+        : "该指定版本已过期，请重新查询后再下载。", downloadMenuKeyboard([], lang));
+      return;
+    }
+    runBackground(ctx, startAdminFirmwareDownload(env, chatId, request, { messageId }));
     return;
   }
   if (data.startsWith("admin:dl:view:") || data.startsWith("admin:dl:refresh:")) {
@@ -3952,9 +3996,23 @@ async function handleManualQuery(env, chatId, text, options = {}) {
   markFirmwareTargetHot(query.model, query.csc, 30 * 60);
   runBackground(options.ctx, recordFirmwareQueryDemand(env, query.model, query.csc));
   const adminRealtime = identity === "admin" && cacheSettings.adminRealtimeEnabled === true;
-  const forceRefresh = Boolean(options.refresh || refreshInfo.refresh || adminRealtime);
+  const forceRefresh = Boolean(options.refresh || refreshInfo.refresh || adminRealtime || query.version);
   const cacheDisabled = !cacheSettings.enabled;
-  const keyboard = firmwareResultKeyboard(query.model, query.csc, lang, identity);
+  let downloadToken = query.version && identity === "admin" && env.FIRMWARE_KV
+    ? createExactDownloadToken()
+    : "";
+  if (downloadToken) {
+    try {
+      await saveExactDownloadCandidate(env, chatId, downloadToken, query);
+    } catch (error) {
+      console.log(`Exact download candidate was not persisted: ${error.message}`);
+      downloadToken = "";
+    }
+  }
+  const keyboard = firmwareResultKeyboard(query.model, query.csc, lang, identity, {
+    downloadToken,
+    requestedVersion: query.version
+  });
   let staleCache = null;
   let outputMessageId = options.targetMessageId || null;
   const cacheLookupStartedAt = Date.now();
@@ -4005,15 +4063,20 @@ async function handleManualQuery(env, chatId, text, options = {}) {
 
   const fetchLive = async () => {
     const coordinatorStartedAt = Date.now();
-    const result = await singleFlightFirmware(query.model, query.csc, () => coordinatedFirmwareQuery(
-      env,
-      query.model,
-      query.csc,
-      {
-        refresh: forceRefresh,
-        role: identity === "admin" ? "admin" : "interactive"
-      }
-    ));
+    const result = query.version
+      ? await queryFirmwareHistory(env, query.model, query.csc, {
+          role: identity === "admin" ? "admin" : "interactive",
+          requestedVersion: query.version
+        })
+      : await singleFlightFirmware(query.model, query.csc, () => coordinatedFirmwareQuery(
+          env,
+          query.model,
+          query.csc,
+          {
+            refresh: forceRefresh,
+            role: identity === "admin" ? "admin" : "interactive"
+          }
+        ));
     const coordinatorHopMs = Date.now() - coordinatorStartedAt;
     const cacheValue = result.canonicalCache || (
       result.parsed?.sourceType === "version_xml"
@@ -4026,7 +4089,8 @@ async function handleManualQuery(env, chatId, text, options = {}) {
           result.parsed
         )
     );
-    if (cacheSettings.enabled && cacheValue.sourceType === "smart_history") {
+    if (query.version) cacheValue.requestedVersion = query.version;
+    if (!query.version && cacheSettings.enabled && cacheValue.sourceType === "smart_history") {
       setL1Firmware(query.model, query.csc, cacheValue, l1CacheTtlSeconds(env));
       setFirmwareMemoryCache(query.model, query.csc, cacheValue);
       if (!result.canonicalCache) {
@@ -4056,7 +4120,7 @@ async function handleManualQuery(env, chatId, text, options = {}) {
     return cacheValue;
   };
 
-  if (!forceRefresh && cacheSettings.enabled) {
+  if (!query.version && !forceRefresh && cacheSettings.enabled) {
     const negative = getNegativeFirmware(query.model, query.csc);
     if (negative) {
       await deliverFailure(negative);

@@ -42,7 +42,8 @@ function waitForShared(promise, signal) {
 
 function singleFlightSmartHistory(env, model, csc, options = {}) {
   const role = serviceClass(options);
-  const key = `${role}:${model}:${csc}`;
+  const requestedVersion = String(options.requestedVersion || "").trim().toUpperCase();
+  const key = `${role}:${model}:${csc}:${requestedVersion}`;
   let shared = smartHistoryFlights.get(key);
   const joined = Boolean(shared);
   if (!shared) {
@@ -56,6 +57,7 @@ function singleFlightSmartHistory(env, model, csc, options = {}) {
         timeoutMs: historyRequestTimeoutMs(env),
         role,
         monitor: Boolean(options.monitor),
+        requestedVersion,
         timing
       }))
       .then((parsed) => ({ parsed, timing }))
@@ -157,7 +159,8 @@ export async function queryFirmwareHistory(env, model, csc, options = {}) {
       ...shared.timing,
       historyMs,
       singleFlightJoined: shared.joined
-    }
+    },
+    ...(parsed.requestedVersion ? { requestedVersion: parsed.requestedVersion } : {})
   });
   result.parsed.queryTiming = result.queryTiming;
   return result;
