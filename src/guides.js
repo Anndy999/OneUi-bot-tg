@@ -19,7 +19,7 @@ function chineseGuide(identity) {
       "新固件只通知一次，监控继续运行。",
       "监控间隔：/moninterval 15（1-1440 分钟）。",
       "",
-      "详细命令：点击“命令”或发送 /adminhelp。"
+      "日常管理请使用管理台的四个入口；兼容维护命令可发送 /adminhelp 查看。"
     ].join("\n");
   }
   if (identity === "allowed") {
@@ -62,7 +62,7 @@ function englishGuide(identity) {
       "Firmware updates are sent once only. Monitoring continues on its normal schedule without acknowledgement reminders.",
       "Use /moninterval 15 to apply one default 15-minute monitoring interval. The valid range is 1-1440 minutes.",
       "",
-      "Open Commands or send /adminhelp for the full list."
+      "Use the four Admin panels for daily work; send /adminhelp only for compatibility maintenance commands."
     ].join("\n");
   }
   if (identity === "allowed") {

@@ -42,6 +42,9 @@ export function createVpsConfig(env = process.env) {
     scheduleStaleMs: bounded(env.VPS_SCHEDULE_STALE_MS, 5 * 60_000, 60_000, 30 * 60_000),
     testFirmwareScanEnabled: bool(env.TEST_FIRMWARE_SCAN_ENABLED, true),
     testFirmwareScanTime: text(env.TEST_FIRMWARE_SCAN_TIME, "18:00"),
+    // Code releases use this non-secret marker to run the KOO bootstrap once.
+    // Operators normally leave it unset; the shipped default changes with the release.
+    testFirmwareReleaseId: text(env.TEST_FIRMWARE_RELEASE_ID, "2.22.0"),
     // Keep the scan window independent of the VPS system timezone.
     testFirmwareTimezone: "Asia/Shanghai",
     testFirmwarePythonBin: text(env.TEST_FIRMWARE_PYTHON_BIN),

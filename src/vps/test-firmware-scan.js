@@ -13,6 +13,7 @@ import {
   getAdminChatIds,
   getAllowedUsers,
   getFirmwareQueryCache,
+  getMonitorItems,
   getMonitorRuntime,
   getUserDevices,
   getUserLanguage,
@@ -27,7 +28,10 @@ import { createTestFirmwareHistoryRepository } from "./test-firmware-history.js"
 
 const SCAN_LOCK_KEY = "test-firmware:scan";
 const DEFAULT_SCAN_LOCK_MS = 2 * 60 * 60 * 1000;
-const PIPELINE_STARTUP_SCAN_ID = "s948n-koo-eux-v2";
+const STARTUP_LOCK_RETRY_DELAY_MS = 30_000;
+const STARTUP_LOCK_RETRY_LIMIT = 3;
+const DEFAULT_PIPELINE_RELEASE_ID = "2.22.0";
+const PIPELINE_STARTUP_SCAN_ID = `s948n-koo-eux:${DEFAULT_PIPELINE_RELEASE_ID}`;
 const KOO_TARGET = Object.freeze({ model: "SM-S948N", csc: "KOO" });
 const EUX_TARGET = Object.freeze({ model: "SM-S948B", csc: "EUX" });
 
@@ -38,6 +42,15 @@ function safeText(value, fallback = "") {
 
 function configFor(runtime) {
   return runtime?.config || {};
+}
+
+function startupScanIdFor(runtime) {
+  const requested = safeText(configFor(runtime).testFirmwareReleaseId, DEFAULT_PIPELINE_RELEASE_ID);
+  const releaseId = requested
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64) || DEFAULT_PIPELINE_RELEASE_ID;
+  return `s948n-koo-eux:${releaseId}`;
 }
 
 function repositoryFor(runtime) {
@@ -242,6 +255,25 @@ async function currentLatestVersion(env, item) {
   }
 }
 
+async function activateOfficialEuxMonitor(runtime, target, at, logger = console) {
+  try {
+    await upsertMonitorItem(runtime.env, {
+      model: target.model,
+      csc: target.csc,
+      enabled: true,
+      paused: false,
+      pauseReason: "",
+      testFirmwareMonitorOverride: true
+    });
+    await forceMonitorDue(runtime.env, target.model, target.csc, at);
+    logger.info?.(`[test-fw] EUX decrypt success; official monitor activated for ${target.model}/${target.csc}`);
+    return true;
+  } catch (error) {
+    logger.warn?.(`[test-fw] monitor activation deferred for ${target.model}/${target.csc}: ${String(error?.message || error).slice(0, 180)}`);
+    return false;
+  }
+}
+
 export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = false, now = new Date(), logger = console, testXml = null, latestVersionOverride = "", onProgress = null } = {}) {
   const target = validateModelCsc(item.model, item.csc);
   const repository = repositoryFor(runtime);
@@ -323,24 +355,6 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
         notified += 1;
       }
     }
-    // Only the confirmed EUX stage activates official monitoring. KOO is the
-    // review gate and must not start the official monitor by itself.
-    if (isEuxTarget(target) && pipelineState.euxEnabled) {
-      try {
-        await upsertMonitorItem(runtime.env, {
-          model: target.model,
-          csc: target.csc,
-          enabled: true,
-          paused: false,
-          pauseReason: "",
-          testFirmwareMonitorOverride: true
-        });
-        await forceMonitorDue(runtime.env, target.model, target.csc, at);
-        logger.info?.(`[test-fw] EUX decrypt success; official monitor activated for ${target.model}/${target.csc}`);
-      } catch (error) {
-        logger.warn?.(`[test-fw] monitor activation deferred for ${target.model}/${target.csc}: ${String(error?.message || error).slice(0, 180)}`);
-      }
-    }
   }
   for (const hash of unresolved) {
     const key = stableHashKey(hash.hash_type, hash.hash_value);
@@ -362,6 +376,14 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
     }
   }
 
+  // Only the confirmed exact EUX target may enable formal monitoring. Repeat
+  // the activation check on later scans as well, so a transient state-store
+  // error cannot leave an already-decrypted EUX build unmonitored forever.
+  const hasResolvedEux = isEuxTarget(target) && pipelineState.euxEnabled && (
+    matches.length > 0 || Boolean(resolvedVersionFromRows(known))
+  );
+  if (hasResolvedEux) await activateOfficialEuxMonitor(runtime, target, at, logger);
+
   const summary = {
     status: selectedHashes.length === 0 ? "unchanged" : matches.length ? "resolved" : "unresolved",
     model: target.model,
@@ -370,6 +392,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
     newHashCount: selectedHashes.length,
     resolvedCount: matches.length,
     unresolvedCount: unresolved.length,
+    resolvedVersion: matches.map(fullVersion).filter(Boolean).join("、").slice(0, 360),
     notified,
     warnings,
     candidateLimitReached: Boolean(result.candidateLimitReached),
@@ -382,12 +405,12 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
   return summary;
 }
 
-export async function executeTestFirmwareScan(runtime, { target = null, retryUnresolved = false, chatId = "", progressChatId = chatId, now = new Date(), logger = console, testXml = null, latestVersionOverride = "" } = {}) {
+export async function executeTestFirmwareScan(runtime, { target = null, retryUnresolved = false, chatId = "", progressChatId = chatId, automatic = false, now = new Date(), logger = console, testXml = null, latestVersionOverride = "" } = {}) {
   const pipelineState = await pipelineStateFor(runtime);
   const items = target
     ? [validateModelCsc(target.model, target.csc)]
     : pipelineTargets(pipelineState).map((item) => ({ ...item }));
-  const progress = progressChatId ? await createTestFirmwareProgress(runtime.env, progressChatId, items) : null;
+  const progress = progressChatId ? await createTestFirmwareProgress(runtime.env, progressChatId, items, { automatic }) : null;
   const results = [];
   for (const item of items) {
     progress?.setTarget(item, results.length, items.length);
@@ -421,17 +444,35 @@ function progressBar(percent, width = 12) {
   return `${"█".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`;
 }
 
-function progressText(target, event = {}, index = 0, total = 1, summary = null) {
+function scanSummaryLine(result = {}) {
+  const label = `${result.model || "未知型号"} / ${result.csc || "未知 CSC"}`;
+  if (result.status === "resolved") {
+    const version = String(result.resolvedVersion || "").replace(/\s+/g, " ").slice(0, 180);
+    return version
+      ? `✅ ${label}：已解密\n${version}`
+      : `✅ ${label}：已解密 ${Number(result.resolvedCount || 0)} 个版本`;
+  }
+  if (result.status === "unchanged") return `ℹ️ ${label}：暂无新的测试固件`;
+  if (result.status === "unresolved") return `⚠️ ${label}：发现 ${Number(result.unresolvedCount || 0)} 个待解密项目`;
+  const error = String(result.error || "请求失败").replace(/\s+/g, " ").slice(0, 100);
+  return `❌ ${label}：${error}`;
+}
+
+function progressText(target, event = {}, index = 0, total = 1, summary = null, options = {}) {
+  const automatic = Boolean(options.automatic);
   const percent = event.maxCandidates > 0
     ? Math.min(99, Math.floor((event.candidates / event.maxCandidates) * 100))
     : event.phase === "finalizing" ? 100 : 0;
   const phase = event.phase === "finalizing" ? "整理解密结果" : "计算候选版本";
   const header = summary
-    ? (summary.ok ? "✅ 测试固件解密完成" : "⚠️ 测试固件解密完成，但有目标失败")
-    : "🔐 正在解密测试固件";
+    ? (summary.ok
+      ? (automatic ? "✅ 自动测试固件解密完成" : "✅ 测试固件解密完成")
+      : (automatic ? "⚠️ 自动测试固件解密完成，但有目标失败" : "⚠️ 测试固件解密完成，但有目标失败"))
+    : (automatic ? "🔐 已自动开始测试固件解密" : "🔐 正在解密测试固件");
   const lines = [
     header,
     "",
+    automatic ? "触发：机器人更新" : "",
     `目标：${target?.model || ""} / ${target?.csc || ""}`,
     `阶段：${summary ? "已完成" : phase}`,
     `进度：${progressBar(summary ? 100 : percent)} ${summary ? 100 : percent}%`,
@@ -440,14 +481,15 @@ function progressText(target, event = {}, index = 0, total = 1, summary = null) 
     total > 1 ? `目标序号：${Math.min(total, index + 1)} / ${total}` : ""
   ];
   if (summary) {
-    lines.push(`成功解密：${summary.resolved}`, `失败：${summary.failed}`);
+    lines.push(`成功解密：${summary.resolved}`, `失败：${summary.failed}`, "", ...summary.results.map(scanSummaryLine));
   }
   return lines.filter(Boolean).join("\n");
 }
 
-async function createTestFirmwareProgress(env, chatId, items) {
+async function createTestFirmwareProgress(env, chatId, items, options = {}) {
   const first = items[0] || {};
-  const sent = await sendTelegramMessageResult(env, chatId, progressText(first, {}, 0, items.length));
+  const automatic = Boolean(options.automatic);
+  const sent = await sendTelegramMessageResult(env, chatId, progressText(first, {}, 0, items.length, null, { automatic }));
   if (!sent.ok || !sent.messageId) return null;
   const state = {
     chatId: String(chatId),
@@ -455,6 +497,7 @@ async function createTestFirmwareProgress(env, chatId, items) {
     target: first,
     index: 0,
     total: items.length,
+    automatic,
     lastAt: 0,
     lastText: "",
     pending: Promise.resolve(),
@@ -468,7 +511,7 @@ async function createTestFirmwareProgress(env, chatId, items) {
       if (!this.messageId) return;
       const now = Date.now();
       if (!force && now - this.lastAt < 2000) return;
-      const text = progressText(this.target, event, this.index, this.total);
+      const text = progressText(this.target, event, this.index, this.total, null, { automatic: this.automatic });
       if (text === this.lastText) return;
       this.lastAt = now;
       this.lastText = text;
@@ -478,7 +521,7 @@ async function createTestFirmwareProgress(env, chatId, items) {
     },
     async finish(summary) {
       this.update({ phase: "finalizing", candidates: 0, maxCandidates: 0, matched: summary.resolved }, true);
-      const text = progressText(this.target, { phase: "finalizing", candidates: 0, maxCandidates: 0, matched: summary.resolved }, this.index, this.total, summary);
+      const text = progressText(this.target, { phase: "finalizing", candidates: 0, maxCandidates: 0, matched: summary.resolved }, this.index, this.total, summary, { automatic: this.automatic });
       if (this.messageId && text !== this.lastText) {
         this.lastText = text;
         this.pending = this.pending
@@ -489,6 +532,76 @@ async function createTestFirmwareProgress(env, chatId, items) {
     }
   };
   return state;
+}
+
+function testFirmwareTargetStateText(target, targetState, version, { waitingForConfirmation = false } = {}, lang = "zh") {
+  if (waitingForConfirmation) return lang === "en" ? "waiting for KOO confirmation" : "等待 KOO 确认";
+  if (version) return lang === "en" ? `decrypted\n${version}` : `已解密\n${version}`;
+  switch (String(targetState?.lastStatus || "")) {
+    case "unchanged":
+      return lang === "en" ? "no new test firmware" : "暂无新的测试固件";
+    case "unresolved":
+      return lang === "en" ? "new item awaiting decryption" : "发现待解密项目";
+    case "failed":
+      return lang === "en" ? "last run failed; automatic retry remains available" : "上次失败，后续自动任务会重试";
+    default:
+      return lang === "en" ? "waiting for automatic task" : "等待自动任务";
+  }
+}
+
+function testFirmwareStatusKeyboard(pipelineState, kooVersion, lang = "zh") {
+  const en = lang === "en";
+  const rows = [[{ text: en ? "Refresh" : "刷新状态", callback_data: "test-fw:refresh" }]];
+  if (kooVersion && !pipelineState?.euxEnabled) {
+    rows.push([{ text: en ? "Confirm KOO and decrypt EUX" : "确认 KOO 并解密 EUX", callback_data: "test-fw:confirm-eux" }]);
+  }
+  rows.push([{ text: en ? "Back to firmware tasks" : "返回固件任务", callback_data: "admin:firmware-menu" }]);
+  return { inline_keyboard: rows };
+}
+
+export async function renderTestFirmwareStatusPanel(runtime, chatId, messageId = null) {
+  const repository = repositoryFor(runtime);
+  const getTargetState = typeof repository.getTargetState === "function"
+    ? repository.getTargetState.bind(repository)
+    : async () => null;
+  const [pipelineState, kooRows, euxRows, kooTargetState, euxTargetState, monitorItems] = await Promise.all([
+    pipelineStateFor(runtime),
+    repository.listHashes(KOO_TARGET.model, KOO_TARGET.csc),
+    repository.listHashes(EUX_TARGET.model, EUX_TARGET.csc),
+    getTargetState(KOO_TARGET.model, KOO_TARGET.csc),
+    getTargetState(EUX_TARGET.model, EUX_TARGET.csc),
+    getMonitorItems(runtime.env).catch(() => [])
+  ]);
+  const lang = await getUserLanguage(runtime.env, chatId);
+  const kooVersion = resolvedVersionFromRows(kooRows);
+  const euxVersion = resolvedVersionFromRows(euxRows);
+  const formalMonitorEnabled = monitorItems.some((item) =>
+    isTarget(item, EUX_TARGET) && item.enabled !== false && item.testFirmwareMonitorOverride === true
+  );
+  const lines = lang === "en"
+    ? [
+        "🧪 Test firmware",
+        "",
+        `KOO: ${testFirmwareTargetStateText(KOO_TARGET, kooTargetState, kooVersion, {}, lang)}`,
+        `EUX: ${testFirmwareTargetStateText(EUX_TARGET, euxTargetState, euxVersion, { waitingForConfirmation: !pipelineState.euxEnabled }, lang)}`,
+        `Official monitor: ${formalMonitorEnabled ? "enabled for SM-S948B / EUX" : (pipelineState.euxEnabled ? "waiting for EUX decryption" : "waiting for KOO confirmation")}`
+      ]
+    : [
+        "🧪 测试固件",
+        "",
+        `KOO：${testFirmwareTargetStateText(KOO_TARGET, kooTargetState, kooVersion, {}, lang)}`,
+        `EUX：${testFirmwareTargetStateText(EUX_TARGET, euxTargetState, euxVersion, { waitingForConfirmation: !pipelineState.euxEnabled }, lang)}`,
+        `正式监控：${formalMonitorEnabled ? "已开启（SM-S948B / EUX）" : (pipelineState.euxEnabled ? "等待 EUX 解密成功" : "等待 KOO 确认")}`
+      ];
+  const text = lines.join("\n");
+  const replyMarkup = testFirmwareStatusKeyboard(pipelineState, kooVersion, lang);
+  if (messageId) {
+    const edited = await editTelegramMessageResult(runtime.env, chatId, messageId, text, replyMarkup);
+    const detail = String(edited?.error || edited?.data?.description || "");
+    if (edited.ok || /message is not modified/i.test(detail)) return { text, replyMarkup };
+  }
+  await sendTelegramMessage(runtime.env, chatId, text, replyMarkup);
+  return { text, replyMarkup };
 }
 
 export async function confirmKooAndEnableEux(runtime, chatId, logger = console) {
@@ -523,22 +636,24 @@ export async function bootstrapTestFirmwarePipeline(runtime, logger = console) {
   const config = configFor(runtime);
   if (config.testFirmwareScanEnabled === false) return { queued: false, reason: "disabled" };
   const repository = repositoryFor(runtime);
-  const claimed = await repository.claimStartupScan(PIPELINE_STARTUP_SCAN_ID, new Date().toISOString());
+  const startupScanId = startupScanIdFor(runtime);
+  const claimed = await repository.claimStartupScan(startupScanId, new Date().toISOString());
   if (!claimed) return { queued: false, reason: "already_claimed" };
   try {
     await pauseAllRolloutChains(runtime.env);
     await runtime.queues.maintenance.add("oneui", {
-      id: `test-firmware-startup:${PIPELINE_STARTUP_SCAN_ID}`,
+      id: `test-firmware-startup:${startupScanId}`,
       kind: "test-firmware-startup-scan",
+      startupScanId,
       target: { ...KOO_TARGET },
       retryUnresolved: true,
       chatId: String(runtime.env.TELEGRAM_CHAT_ID || ""),
       createdAt: new Date().toISOString()
-    }, { jobId: `test-firmware-startup:${PIPELINE_STARTUP_SCAN_ID}`, attempts: 1, removeOnComplete: { age: 7 * 24 * 60 * 60, count: 100 } });
-    logger.info?.(`[test-fw] startup pipeline queued for ${targetLabel(KOO_TARGET)}`);
-    return { queued: true, target: { ...KOO_TARGET } };
+    }, { jobId: `test-firmware-startup:${startupScanId}`, attempts: 1, removeOnComplete: { age: 7 * 24 * 60 * 60, count: 100 } });
+    logger.info?.(`[test-fw] startup pipeline queued for ${targetLabel(KOO_TARGET)} (${startupScanId})`);
+    return { queued: true, target: { ...KOO_TARGET }, startupScanId };
   } catch (error) {
-    await repository.releaseStartupScan(PIPELINE_STARTUP_SCAN_ID, new Date().toISOString()).catch(() => {});
+    await repository.releaseStartupScan(startupScanId, new Date().toISOString()).catch(() => {});
     logger.error?.(`[test-fw] startup pipeline enqueue failed: ${String(error?.message || error).slice(0, 180)}`);
     return { queued: false, reason: "enqueue_failed" };
   }
@@ -622,6 +737,33 @@ export async function maybeScheduleTestFirmwareScan(runtime, now = new Date(), l
   }
 }
 
+async function retryStartupScanAfterLock(runtime, data, logger = console) {
+  const retries = Math.max(0, Math.floor(Number(data.startupLockRetries || 0)));
+  if (retries >= STARTUP_LOCK_RETRY_LIMIT) return false;
+  const startupScanId = String(data.startupScanId || startupScanIdFor(runtime));
+  const nextRetry = retries + 1;
+  const retryJobId = `test-firmware-startup:${startupScanId}:lock-retry:${nextRetry}:${randomUUID()}`;
+  try {
+    await runtime.queues.maintenance.add("oneui", {
+      ...data,
+      id: retryJobId,
+      startupScanId,
+      startupLockRetries: nextRetry,
+      createdAt: new Date().toISOString()
+    }, {
+      jobId: retryJobId,
+      delay: STARTUP_LOCK_RETRY_DELAY_MS,
+      attempts: 1,
+      removeOnComplete: { age: 7 * 24 * 60 * 60, count: 100 }
+    });
+    logger.warn?.(`[test-fw] startup scan lock is busy; retry ${nextRetry}/${STARTUP_LOCK_RETRY_LIMIT} queued`);
+    return true;
+  } catch (error) {
+    logger.warn?.(`[test-fw] startup lock retry enqueue failed: ${String(error?.message || error).slice(0, 180)}`);
+    return false;
+  }
+}
+
 export async function processTestFirmwareMaintenanceJob(job, runtime, logger = console) {
   const data = job?.data || {};
   if (!["test-firmware-scheduled-scan", "test-firmware-manual-scan", "test-firmware-startup-scan", "test-firmware-eux-scan"].includes(data.kind)) return null;
@@ -637,25 +779,35 @@ export async function processTestFirmwareMaintenanceJob(job, runtime, logger = c
     retryUnresolved: Boolean(data.retryUnresolved),
     chatId: data.chatId || "",
     progressChatId: data.chatId || "",
+    automatic: data.kind === "test-firmware-startup-scan",
     logger
   });
-  if (!locked.acquired && data.chatId) {
+  const lockRetryQueued = data.kind === "test-firmware-startup-scan" && !locked.acquired
+    ? await retryStartupScanAfterLock(runtime, data, logger)
+    : false;
+  if (!locked.acquired && data.chatId && !lockRetryQueued) {
     await sendTelegramMessage(runtime.env, data.chatId, "⏳ Samsung 测试固件扫描正在运行，请等待当前任务完成。");
   }
   const summary = locked.acquired ? locked.summary : { ok: false, reason: "already_running" };
-  if (data.kind === "test-firmware-startup-scan" && !summary.ok) {
-    await repository.releaseStartupScan(PIPELINE_STARTUP_SCAN_ID, new Date().toISOString()).catch(() => {});
+  if (data.kind === "test-firmware-startup-scan" && !summary.ok && !lockRetryQueued) {
+    await repository.releaseStartupScan(data.startupScanId || startupScanIdFor(runtime), new Date().toISOString()).catch(() => {});
   }
-  return summary;
+  return lockRetryQueued ? { ...summary, retryQueued: true } : summary;
 }
 
 export async function handleTestFirmwareTelegramCallback(update, runtime, logger = console) {
   const callback = update?.callback_query;
-  if (String(callback?.data || "") !== "test-fw:confirm-eux") return false;
+  const data = String(callback?.data || "");
+  if (!["test-fw:menu", "test-fw:refresh", "test-fw:confirm-eux"].includes(data)) return false;
   const chatId = String(chatIdFromUpdate(update) || "").trim();
   if (!chatId) return true;
   if (await getIdentity(runtime.env, chatId) !== "admin") {
     await answerCallbackQuery(runtime.env, callback.id, "无权限", { showAlert: true });
+    return true;
+  }
+  if (data === "test-fw:menu" || data === "test-fw:refresh") {
+    await answerCallbackQuery(runtime.env, callback.id, data === "test-fw:refresh" ? "正在刷新…" : "正在打开…");
+    await renderTestFirmwareStatusPanel(runtime, chatId, callback.message?.message_id);
     return true;
   }
   await answerCallbackQuery(runtime.env, callback.id, "正在确认…");
@@ -699,7 +851,7 @@ export async function handleTestFirmwareTelegramCommand(update, runtime, logger 
     return true;
   }
   const args = parts.slice(1);
-  let target = null;
+  let target = { ...KOO_TARGET };
   if (args.length > 0) {
     if (args.length !== 2) {
       await sendTelegramMessage(runtime.env, chatId, "用法：/testscan [MODEL CSC]");
@@ -721,9 +873,7 @@ export async function handleTestFirmwareTelegramCommand(update, runtime, logger 
       chatId,
       createdAt: new Date().toISOString()
     }, { attempts: 1, removeOnComplete: { age: 24 * 60 * 60, count: 100 } });
-    await sendTelegramMessage(runtime.env, chatId, target
-      ? `✅ 已加入测试固件扫描：${target.model} / ${target.csc}`
-      : "✅ 已加入全部测试固件扫描，按现有监控顺序执行。\n扫描完成后只向你返回结果。" );
+    await sendTelegramMessage(runtime.env, chatId, `✅ 已加入测试固件扫描：${target.model} / ${target.csc}\n扫描完成后只向你返回结果。`);
   } catch (error) {
     logger.error?.(`[test-fw] manual scan enqueue failed: ${String(error?.message || error).slice(0, 180)}`);
     await sendTelegramMessage(runtime.env, chatId, "❌ 测试固件扫描暂时无法启动。");
@@ -737,6 +887,8 @@ export {
   PIPELINE_STARTUP_SCAN_ID,
   SCAN_LOCK_KEY,
   pipelineTargets,
+  progressText as testFirmwareProgressText,
   resolvedVersionFromRows,
+  startupScanIdFor,
   testBuildText
 };

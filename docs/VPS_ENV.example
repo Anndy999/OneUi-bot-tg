@@ -14,8 +14,11 @@ VPS_SCHEDULE_INTERVAL_MS=60000
 TEST_FIRMWARE_SCAN_ENABLED=true
 TEST_FIRMWARE_SCAN_TIME=18:00
 TEST_FIRMWARE_TIMEZONE=Asia/Shanghai
-# The staged pipeline uses the fixed release gate s948n-koo-eux-v2:
+# Each shipped release runs SM-S948N/KOO once after the VPS bot starts:
 # startup -> SM-S948N/KOO -> administrator confirmation -> SM-S948B/EUX.
+# TEST_FIRMWARE_RELEASE_ID is optional and non-secret; leave it unset unless
+# a deliberate one-time re-run of the current release is required.
+# TEST_FIRMWARE_RELEASE_ID=2.22.0
 # TEST_FIRMWARE_PYTHON_BIN=python3
 # TEST_FIRMWARE_REQUEST_TIMEOUT_MS=12000
 # TEST_FIRMWARE_DECRYPT_TIMEOUT_MS=120000

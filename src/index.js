@@ -178,7 +178,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.18.0";
+const APP_VERSION = "2.22.0";
 
 export default {
   async fetch(request, env, ctx) {
@@ -318,51 +318,90 @@ async function telegramBotApi(env, method, payload = null) {
   }
 }
 
-const PUBLIC_TELEGRAM_COMMANDS = [
+// Telegram exposes one native command menu per chat. Keep that surface small:
+// deeper actions remain available through the inline management panels, and the
+// long-standing slash commands remain accepted as compatibility aliases.
+const UNAUTHORIZED_TELEGRAM_COMMANDS = [
+  { command: "start", description: "打开主菜单" },
+  { command: "apply", description: "申请查询权限" },
+  { command: "help", description: "使用说明" }
+];
+
+const ALLOWED_TELEGRAM_COMMANDS = [
   { command: "start", description: "打开主菜单" },
   { command: "devices", description: "我的设备" },
-  { command: "status", description: "服务状态" },
-  { command: "language", description: "切换中英文" },
-  { command: "help", description: "使用说明" },
-  { command: "apply", description: "申请查询权限" },
-  { command: "whoami", description: "查看我的 Chat ID" }
+  { command: "help", description: "使用说明" }
 ];
 
 const ADMIN_TELEGRAM_COMMANDS = [
-  { command: "download", description: "official firmware download" },
-  ...PUBLIC_TELEGRAM_COMMANDS,
-  { command: "testscan", description: "扫描测试固件构建号" },
-  { command: "testconfirm", description: "确认 KOO 并开启 EUX 解密" },
-  { command: "admin", description: "管理员面板" },
-  { command: "chain", description: "发布链" },
-  { command: "checknow", description: "立即检查" },
-  { command: "moninterval", description: "监控间隔" },
-  { command: "monsnooze", description: "暂停监控" },
-  { command: "adminhelp", description: "管理员命令" }
+  { command: "start", description: "打开主菜单" },
+  { command: "admin", description: "管理台" },
+  { command: "download", description: "固件下载" },
+  { command: "help", description: "使用说明" }
 ];
 
+const TELEGRAM_COMMAND_SCOPE_REGISTRY_KEY = "telegram:command-scopes:v1";
+
+function uniqueTelegramCommandChatIds(values = []) {
+  return [...new Set(values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean))];
+}
+
+async function telegramCommandScopeChatIds(env) {
+  const stored = await kvGetJson(env, TELEGRAM_COMMAND_SCOPE_REGISTRY_KEY, { chatIds: [] });
+  return uniqueTelegramCommandChatIds(Array.isArray(stored?.chatIds) ? stored.chatIds : []);
+}
+
 async function syncTelegramCommands(env) {
-  // Clear inherited scopes first; Telegram otherwise may prefer an old
-  // private-chat command menu over the current default menu.
+  const [admins, allowedUsers, previousChatIds] = await Promise.all([
+    getAdminChatIds(env),
+    getAllowedUsers(env),
+    telegramCommandScopeChatIds(env)
+  ]);
+  const adminChatIds = uniqueTelegramCommandChatIds(admins);
+  const adminSet = new Set(adminChatIds);
+  const allowedChatIds = uniqueTelegramCommandChatIds(allowedUsers.map((user) => user?.chatId))
+    .filter((chatId) => !adminSet.has(chatId));
+  const managedChatIds = uniqueTelegramCommandChatIds([
+    ...previousChatIds,
+    ...adminChatIds,
+    ...allowedChatIds
+  ]);
+
+  // Clear inherited and previously-managed chat scopes first; Telegram can
+  // otherwise keep an old per-chat menu after a role has changed.
   const scopes = [
     { type: "default" },
     { type: "all_private_chats" },
     { type: "all_group_chats" },
-    { type: "all_chat_administrators" }
+    { type: "all_chat_administrators" },
+    ...managedChatIds.map((chatId) => ({ type: "chat", chat_id: chatId }))
   ];
   for (const scope of scopes) {
     const cleared = await telegramBotApi(env, "deleteMyCommands", { scope });
     if (!cleared.ok) return cleared;
   }
-  const publicResult = await telegramBotApi(env, "setMyCommands", { commands: PUBLIC_TELEGRAM_COMMANDS });
+  const publicResult = await telegramBotApi(env, "setMyCommands", { commands: UNAUTHORIZED_TELEGRAM_COMMANDS });
   if (!publicResult.ok) return publicResult;
-  for (const chatId of await getAdminChatIds(env)) {
+  for (const chatId of allowedChatIds) {
+    const result = await telegramBotApi(env, "setMyCommands", {
+      scope: { type: "chat", chat_id: chatId },
+      commands: ALLOWED_TELEGRAM_COMMANDS
+    });
+    if (!result.ok) return result;
+  }
+  for (const chatId of adminChatIds) {
     const result = await telegramBotApi(env, "setMyCommands", {
       scope: { type: "chat", chat_id: chatId },
       commands: ADMIN_TELEGRAM_COMMANDS
     });
     if (!result.ok) return result;
   }
+  await kvPutJson(env, TELEGRAM_COMMAND_SCOPE_REGISTRY_KEY, {
+    chatIds: uniqueTelegramCommandChatIds([...adminChatIds, ...allowedChatIds]),
+    updatedAt: new Date().toISOString()
+  });
   return publicResult;
 }
 
@@ -376,7 +415,7 @@ async function clearTelegramCommandsForChat(env, chatId) {
 function telegramCommandsSyncKey() {
   // Bump this when the command list changes. A shared VPS/Cloudflare KV may
   // already contain the application-version marker from an older command set.
-  return `telegram:commands:${APP_VERSION}:v2`;
+  return `telegram:commands:${APP_VERSION}:compact-v1`;
 }
 
 export async function ensureTelegramCommands(env) {
@@ -724,9 +763,9 @@ async function mainMenuText(env, identity, lang = "zh") {
       const s25 = chains.chains.find((chain) => chain.id === "s25");
       return [
         "Admin",
-        `Monitoring: ${regular.length} · paused ${paused}`,
+        `Monitoring: ${regular.length} · paused ${paused} · pending ${requests.length}`,
+        "Test firmware: runs automatically after deployment",
         `Rollout: S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`,
-        `Pending access: ${requests.length}`
       ].join("\n");
     }
     if (identity === "allowed") return "Samsung Firmware\n\nSend Model + CSC, for example: SM-S948B EUX.";
@@ -740,9 +779,9 @@ async function mainMenuText(env, identity, lang = "zh") {
     const s25 = chains.chains.find((chain) => chain.id === "s25");
     return [
       "管理员",
-      `监控：${regular.length} 个 · 暂停 ${paused}`,
-      `发布链：S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`,
-      `待审批：${requests.length}`
+      `监控：${regular.length} 个 · 暂停 ${paused} · 待审批 ${requests.length}`,
+      "测试固件：机器人更新后自动解密",
+      `发布链：S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`
     ].join("\n");
   }
   if (identity === "allowed") return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u53d1\u9001\u201c\u578b\u53f7 CSC\u201d\u5373\u53ef\u67e5\u8be2\u3002\n\u4f8b\u5982\uff1aSM-S948B EUX";
@@ -753,9 +792,8 @@ function mainMenuKeyboard(identity, lang = "zh") {
   const en = lang === "en";
   if (identity === "admin") {
     return { inline_keyboard: [
-      [{ text: en ? "Monitoring" : "\ud83d\udce1 监控", callback_data: "admin:monitor-menu" }, { text: en ? "Rollout" : "\ud83d\udce3 发布链", callback_data: "admin:rollout-menu" }],
-      [{ text: en ? "Users" : "\ud83d\udc65 用户", callback_data: "admin:access-menu" }, { text: en ? "Admins" : "\ud83d\udc51 管理员", callback_data: "admin:admins" }],
-      [{ text: en ? "Downloads" : "📦 下载", callback_data: "admin:download-menu" }, { text: en ? "More" : "更多", callback_data: "menu:more" }]
+      [{ text: en ? "Monitoring" : "\ud83d\udce1 监控管理", callback_data: "admin:monitor-menu" }, { text: en ? "Firmware tasks" : "📦 固件任务", callback_data: "admin:firmware-menu" }],
+      [{ text: en ? "Permissions" : "\ud83d\udc65 权限管理", callback_data: "admin:access-menu" }, { text: en ? "System" : "\u2699\ufe0f 系统", callback_data: "admin:system-menu" }]
     ] };
   }
   if (identity === "allowed") {
@@ -778,6 +816,42 @@ function adminMoreKeyboard(lang = "zh") {
     [{ text: en ? "Language" : "语言", callback_data: "menu:language" }],
     [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
   ] };
+}
+
+function firmwareTasksText(lang = "zh") {
+  if (lang === "en") {
+    return [
+      "📦 Firmware tasks",
+      "",
+      "Downloads: Samsung verification first, then administrator confirmation.",
+      "Test firmware: SM-S948N / KOO starts automatically after each deployed release. Confirm KOO only after reviewing its result; SM-S948B / EUX official monitoring starts only after its decryption succeeds."
+    ].join("\n");
+  }
+  return [
+    "📦 固件任务",
+    "",
+    "下载：先验证三星官方固件，确认后才开始下载。",
+    "测试固件：每次发布更新后自动解密 SM-S948N / KOO；确认 KOO 结果后才解密 SM-S948B / EUX，且仅在 EUX 解密成功后开启其正式监控。"
+  ].join("\n");
+}
+
+function firmwareTasksKeyboard(lang = "zh") {
+  const en = lang === "en";
+  return {
+    inline_keyboard: [
+      [
+        { text: en ? "Firmware download" : "📥 固件下载", callback_data: "admin:download-menu" },
+        { text: en ? "Test firmware" : "🧪 测试固件", callback_data: "test-fw:menu" }
+      ],
+      [{ text: en ? "Back" : "返回主菜单", callback_data: "menu:home" }]
+    ]
+  };
+}
+
+async function renderFirmwareTasksMenu(env, chatId, messageId = null) {
+  const lang = await getUserLanguage(env, chatId);
+  if (messageId) return safeEditOrSend(env, chatId, messageId, firmwareTasksText(lang), firmwareTasksKeyboard(lang));
+  return sendTelegramMessage(env, chatId, firmwareTasksText(lang), firmwareTasksKeyboard(lang));
 }
 
 const ADMIN_DOWNLOAD_SESSION_TTL_SECONDS = 10 * 60;
@@ -1499,6 +1573,7 @@ function monitorMenuKeyboard(lang = "zh") {
         { text: en ? "Health" : "健康", callback_data: "admin:monitor-health" },
         { text: en ? "Settings" : "设置", callback_data: "admin:monitor-more" }
       ],
+      [{ text: en ? "Release chain" : "发布链", callback_data: "admin:rollout-menu" }],
       [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
     ]
   };
@@ -1622,7 +1697,9 @@ async function formatMonitorCenterPanel(env, lang = "zh", filter = "all") {
     { text: en ? "Add" : "添加", callback_data: "admin:monitor-add-help" },
     { text: en ? `Check errors ${counts.failing}` : `检查异常 ${counts.failing}`, callback_data: "admin:monitor-retry-failed" }
   ], [
-    { text: en ? "Settings" : "设置", callback_data: "admin:monitor-more" },
+    { text: en ? "Release chain" : "发布链", callback_data: "admin:rollout-menu" },
+    { text: en ? "Settings" : "设置", callback_data: "admin:monitor-more" }
+  ], [
     { text: en ? "Back" : "返回", callback_data: "menu:home" }
   ]);
   const lines = [
@@ -1728,6 +1805,7 @@ function accessMenuKeyboard(settings, lang = "zh") {
         { text: en ? "Pending requests" : "待审批申请", callback_data: "admin:requests" },
         { text: en ? "Allowed users" : "授权用户", callback_data: "admin:users" }
       ],
+      [{ text: en ? "Administrators" : "管理员", callback_data: "admin:admins" }],
       [{
         text: enabled
           ? (en ? "Turn auto approve OFF" : "关闭自动审批")
@@ -1767,6 +1845,10 @@ function systemMenuKeyboard(settings, lang = "zh") {
       [
         { text: en ? "Performance" : "性能中心", callback_data: "admin:performance" },
         { text: en ? "Diagnostics" : "系统诊断", callback_data: "admin:diagnostics" }
+      ],
+      [
+        { text: en ? "Language" : "语言", callback_data: "menu:language" },
+        { text: en ? "Help" : "帮助", callback_data: "menu:help" }
       ],
       [{ text: en ? "Back" : "返回主菜单", callback_data: "menu:home" }]
     ]
@@ -2197,7 +2279,8 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity === "admin") {
-      await safeEditOrSend(env, chatId, messageId, adminMoreText(lang), adminMoreKeyboard(lang));
+      const settings = await getCacheSettings(env);
+      await safeEditOrSend(env, chatId, messageId, systemMenuText(settings, env, lang), systemMenuKeyboard(settings, lang));
     } else {
       await safeEditOrSend(env, chatId, messageId, userSettingsText(lang), userSettingsKeyboard(identity, lang));
     }
@@ -2215,7 +2298,8 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity === "admin") {
-      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), adminMoreKeyboard(lang));
+      const settings = await getCacheSettings(env);
+      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), systemMenuKeyboard(settings, lang));
     } else {
       await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang));
     }
@@ -2634,6 +2718,10 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     ]] });
     return;
   }
+  if (data === "admin:firmware-menu") {
+    await renderFirmwareTasksMenu(env, chatId, messageId);
+    return;
+  }
   if (data === "admin:download-menu") {
     await renderDownloadMenu(env, chatId, messageId);
     return;
@@ -2716,6 +2804,10 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     if (!await requireOwner(env, chatId)) return;
     const targetId = data.slice("admin:admin-remove:".length);
     const result = await removeAdditionalAdmin(env, targetId);
+    if (result.removed) {
+      await clearTelegramCommandsForChat(env, targetId);
+      await syncTelegramCommands(env).catch(() => null);
+    }
     const text = result.removed
       ? (lang === "en" ? "Administrator removed." : "\u5df2\u79fb\u9664\u7ba1\u7406\u5458\u3002")
       : (lang === "en" ? "This administrator cannot be removed." : "\u65e0\u6cd5\u79fb\u9664\u8be5\u7ba1\u7406\u5458\u3002");
@@ -2983,7 +3075,11 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
 
   if (data.startsWith("admin:user-remove-confirm:")) {
     const targetId = data.slice("admin:user-remove-confirm:".length);
-    await removeAllowedUser(env, targetId);
+    const removed = await removeAllowedUser(env, targetId);
+    if (removed) {
+      await clearTelegramCommandsForChat(env, targetId);
+      await syncTelegramCommands(env).catch(() => null);
+    }
     const panel = await formatUsersPanel(env, lang);
     const resultText = lang === "en"
       ? `✅ Access removed for ${targetId}.`
@@ -4741,7 +4837,7 @@ async function renderAdminsPanel(env, chatId, messageId = null) {
     ? ["👑 Administrators", "", "Owner: configured Telegram Chat ID", ...admins.map((admin, index) => `${index + 1}. ${admin.name || admin.chatId}\n   ${admin.chatId}`), "", "Add: /adminadd <Chat ID> <name>"].join("\n")
     : ["\ud83d\udc51 \u7ba1\u7406\u5458", "", "\u6240\u6709\u8005\uff1a\u5f53\u524d\u914d\u7f6e\u7684 Telegram Chat ID", ...admins.map((admin, index) => `${index + 1}. ${admin.name || admin.chatId}\n   ${admin.chatId}`), "", "\u6dfb\u52a0\uff1a/adminadd <Chat ID> <\u5907\u6ce8>"] .join("\n");
   const rows = admins.map((admin) => [{ text: `${lang === "en" ? "Remove" : "\u79fb\u9664"} ${(admin.name || admin.chatId).slice(0, 24)}`, callback_data: `admin:admin-remove:${admin.chatId}` }]);
-  rows.push([{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]);
+  rows.push([{ text: lang === "en" ? "Back" : "\u8fd4\u56de", callback_data: "admin:access-menu" }]);
   if (messageId) return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: rows });
   return sendTelegramMessage(env, chatId, text, { inline_keyboard: rows });
 }
@@ -4751,13 +4847,16 @@ function rolloutMenuKeyboard(chains, lang = "zh") {
   return {
     inline_keyboard: [
       chains.map((chain) => ({ text: `${chain.name} · ${chain.stages.find((stage) => stage.id === chain.activeStageId)?.name || "-"}`, callback_data: `admin:rollout:${chain.id}` })),
-      [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
+      [{ text: en ? "Back to monitoring" : "\u8fd4\u56de\u76d1\u63a7", callback_data: "admin:monitor-menu" }]
     ]
   };
 }
 
 function rolloutMenuStatus(chain, chains, lang = "zh") {
   const en = lang === "en";
+  if (!chain.enabled && chain.status === "needs_configuration") {
+    return en ? "paused" : "已暂停";
+  }
   if (chain.id === "s25" && !chain.enabled) {
     return en ? "waiting for S26 Korea" : "等待 S26 韩版确认";
   }
@@ -4878,6 +4977,7 @@ async function handleAccessApply(env, chatId, message, identity) {
   if (accessSettings.autoApprove) {
     const user = await addAllowedUser(env, applicant.chatId, applicant.name);
     await removeAccessRequest(env, applicant.chatId);
+    await syncTelegramCommands(env).catch(() => null);
     await sendTelegramMessage(env, chatId, accessApprovedText(lang), mainMenuKeyboard("allowed", lang));
 
     const adminId = adminChatId(env);
@@ -5013,6 +5113,7 @@ async function approveRequestById(env, chatId, targetId, messageId = null) {
   const name = request?.name || String(targetId);
   const user = await addAllowedUser(env, targetId, name);
   await removeAccessRequest(env, targetId);
+  await syncTelegramCommands(env).catch(() => null);
   if (messageId) {
     const adminLang = await getUserLanguage(env, chatId);
     await safeEditOrSend(env, chatId, messageId, [
@@ -5127,6 +5228,7 @@ async function handleUserAdd(env, chatId, args, message) {
     return;
   }
   const user = await addAllowedUser(env, targetId, name);
+  await syncTelegramCommands(env).catch(() => null);
   await sendTelegramMessage(env, chatId, [
     "✅ 已添加允许查询用户",
     "",
@@ -5142,6 +5244,10 @@ async function handleUserDel(env, chatId, args) {
     return;
   }
   const removed = await removeAllowedUser(env, targetId);
+  if (removed) {
+    await clearTelegramCommandsForChat(env, targetId);
+    await syncTelegramCommands(env).catch(() => null);
+  }
   await sendTelegramMessage(env, chatId, removed
     ? `✅ 已删除允许查询用户\n\nChat ID：${targetId}`
     : `未找到该授权用户。\n\nChat ID：${targetId}`);

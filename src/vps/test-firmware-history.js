@@ -150,6 +150,11 @@ export class InMemoryTestFirmwareHistoryRepository {
     });
   }
 
+  async getTargetState(model, csc) {
+    const [m, c] = targetParts(model, csc);
+    return clone(this.targets.get(`${m}:${c}`) || null);
+  }
+
   async claimScheduled(dateKey, at = new Date(this.now()).toISOString()) {
     const key = `scheduled:${String(dateKey)}`;
     if (this.scanRuns.has(key)) return { claimed: false, reason: "already_claimed" };
@@ -332,6 +337,29 @@ export class PostgresTestFirmwareHistoryRepository {
          updated_at = EXCLUDED.updated_at`,
       [m, c, String(at), String(result.status || "unknown"), String(result.error || ""), Number(result.hashCount || 0), Number(result.newHashCount || 0)]
     );
+  }
+
+  async getTargetState(model, csc) {
+    const [m, c] = targetParts(model, csc);
+    const result = await this.pool.query(
+      `SELECT model, csc, last_checked_at, last_status, last_error,
+              hash_count, new_hash_count, updated_at
+         FROM test_firmware_target_state
+        WHERE model = $1 AND csc = $2`,
+      [m, c]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      model: String(row.model || m),
+      csc: String(row.csc || c),
+      lastCheckedAt: String(row.last_checked_at || ""),
+      lastStatus: String(row.last_status || "unknown"),
+      lastError: String(row.last_error || ""),
+      hashCount: Number(row.hash_count || 0),
+      newHashCount: Number(row.new_hash_count || 0),
+      updatedAt: String(row.updated_at || "")
+    };
   }
 
   async claimScheduled(dateKey, at = new Date().toISOString()) {

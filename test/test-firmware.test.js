@@ -4,16 +4,22 @@ import { InMemoryTestFirmwareHistoryRepository } from "../src/vps/test-firmware-
 import { runTestFirmwareDecryptor } from "../src/vps/test-firmware-decryptor.js";
 import {
   bootstrapTestFirmwarePipeline,
+  SCAN_LOCK_KEY,
   confirmKooAndEnableEux,
   executeTestFirmwareScan,
   handleTestFirmwareTelegramCommand,
   maybeScheduleTestFirmwareScan,
+  processTestFirmwareMaintenanceJob,
+  renderTestFirmwareStatusPanel,
   scanTestFirmwareTarget,
+  startupScanIdFor,
   testBuildText,
+  testFirmwareProgressText,
   withTestFirmwareScanLock
 } from "../src/vps/test-firmware-scan.js";
 import { MemoryLockService } from "../src/runtime/locks.js";
 import { MemoryStorage } from "../src/runtime/storage.js";
+import { getMonitorItems, resetStateMemoryCache } from "../src/state.js";
 
 const MODEL = "SM-S9480";
 const CSC = "CHC";
@@ -41,7 +47,8 @@ function runtime({ queue = [], history = new InMemoryTestFirmwareHistoryReposito
       testFirmwareMaxCandidates: 10_000_000,
       testFirmwareScanLockMs: 30_000,
       testFirmwareScanEnabled: true,
-      testFirmwareScanTime: "18:00"
+      testFirmwareScanTime: "18:00",
+      testFirmwareReleaseId: "2.22.0"
     },
     context: { locks: new MemoryLockService() },
     queues: { maintenance: { async add(_name, data) { queue.push({ maintenance: true, data }); } } },
@@ -83,6 +90,27 @@ test("resolved test-build notification uses the compact full-version wording", (
     }, new Date(), "zh"),
     "🆕 新 Samsung 测试固件！\n\nSM-S9480 / CHC\n\n完整固件版本号：S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1"
   );
+});
+
+test("automatic KOO progress clearly reports the deployment trigger and result", () => {
+  const started = testFirmwareProgressText({ model: "SM-S948N", csc: "KOO" }, {}, 0, 1, null, { automatic: true });
+  const finished = testFirmwareProgressText({ model: "SM-S948N", csc: "KOO" }, {}, 0, 1, {
+    ok: true,
+    resolved: 1,
+    failed: 0,
+    results: [{
+      model: "SM-S948N",
+      csc: "KOO",
+      status: "resolved",
+      resolvedCount: 1,
+      resolvedVersion: "S948NKSU0AVA1/S948NOKR0AVA1/S948NKSU0AVA1"
+    }]
+  }, { automatic: true });
+  assert.match(started, /已自动开始测试固件解密/);
+  assert.match(started, /触发：机器人更新/);
+  assert.match(finished, /自动测试固件解密完成/);
+  assert.match(finished, /SM-S948N \/ KOO：已解密/);
+  assert.match(finished, /S948NKSU0AVA1\/S948NOKR0AVA1\/S948NKSU0AVA1/);
 });
 
 test("known hash is silent and does not run candidate matching", async () => {
@@ -216,6 +244,43 @@ test("the staged pipeline scans KOO first and only adds EUX after confirmation",
   assert.equal(queue.some((entry) => entry.maintenance && entry.data.kind === "test-firmware-eux-scan"), true);
 });
 
+test("test firmware panel exposes status and an inline-only EUX confirmation gate", async () => {
+  const history = new InMemoryTestFirmwareHistoryRepository();
+  const app = runtime({ history });
+  await history.upsertResolved({
+    model: "SM-S948N",
+    csc: "KOO",
+    hashType: "md5",
+    hashValue: "0123456789abcdef0123456789abcdef",
+    pda: "S948NKSU0AVA1",
+    cscBuild: "S948NOKR0AVA1",
+    cp: "S948NKSU0AVA1"
+  });
+  const panel = await renderTestFirmwareStatusPanel(app, "100");
+  assert.match(panel.text, /KOO：已解密/);
+  assert.equal(panel.replyMarkup.inline_keyboard.flat().some((button) => button.callback_data === "test-fw:confirm-eux"), true);
+  assert.equal(panel.replyMarkup.inline_keyboard.flat().some((button) => button.callback_data === "test-fw:manual"), false);
+});
+
+test("EUX success enables only the exact formal monitor target", async () => {
+  resetStateMemoryCache();
+  const history = new InMemoryTestFirmwareHistoryRepository();
+  const app = runtime({ history });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  await history.confirmKooAndEnableEux("S948NKSU0AVA1/S948NOKR0AVA1/S948NKSU0AVA1", "100");
+  const result = await scanTestFirmwareTarget(app, { model: "SM-S948B", csc: "EUX" }, {
+    testXml: TEST_XML,
+    latestVersionOverride: LATEST,
+    logger: quietLogger()
+  });
+  assert.equal(result.status, "resolved");
+  const items = await getMonitorItems(app.env);
+  const eux = items.find((item) => item.model === "SM-S948B" && item.csc === "EUX");
+  assert.equal(eux?.enabled, true);
+  assert.equal(eux?.testFirmwareMonitorOverride, true);
+  assert.equal(items.some((item) => item.model === "SM-S948N" && item.csc === "KOO"), false);
+});
+
 test("startup pipeline queues KOO once and retries are protected by a durable claim", async () => {
   const queue = [];
   const app = runtime({ queue });
@@ -224,6 +289,37 @@ test("startup pipeline queues KOO once and retries are protected by a durable cl
   const second = await bootstrapTestFirmwarePipeline(app, quietLogger());
   assert.equal(first.queued, true);
   assert.equal(first.target.model, "SM-S948N");
+  assert.equal(first.startupScanId, startupScanIdFor(app));
   assert.equal(second.reason, "already_claimed");
   assert.equal(queue.filter((entry) => entry.maintenance && entry.data.kind === "test-firmware-startup-scan").length, 1);
+  app.config.testFirmwareReleaseId = "2.22.1";
+  const nextRelease = await bootstrapTestFirmwarePipeline(app, quietLogger());
+  assert.equal(nextRelease.queued, true);
+  assert.equal(nextRelease.startupScanId, "s948n-koo-eux:2.22.1");
+  assert.equal(queue.filter((entry) => entry.maintenance && entry.data.kind === "test-firmware-startup-scan").length, 2);
+});
+
+test("startup KOO scan retries a busy lock without losing its release claim", async () => {
+  const queue = [];
+  const app = runtime({ queue });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  const queued = await bootstrapTestFirmwarePipeline(app, quietLogger());
+  const firstJob = queue.find((entry) => entry.maintenance && entry.data.kind === "test-firmware-startup-scan");
+  assert.equal(queued.queued, true);
+  assert.ok(firstJob);
+
+  const held = await app.context.locks.acquire(SCAN_LOCK_KEY, 60_000);
+  assert.equal(held.acquired, true);
+  try {
+    const result = await processTestFirmwareMaintenanceJob({ data: { ...firstJob.data, chatId: "" } }, app, quietLogger());
+    assert.equal(result.reason, "already_running");
+    assert.equal(result.retryQueued, true);
+  } finally {
+    await app.context.locks.release(SCAN_LOCK_KEY, held.token);
+  }
+
+  const retry = queue.find((entry) => entry.maintenance && entry.data.startupLockRetries === 1);
+  assert.ok(retry);
+  assert.equal(retry.data.startupScanId, queued.startupScanId);
+  assert.equal(await app.testFirmwareHistory.claimStartupScan(queued.startupScanId), false);
 });

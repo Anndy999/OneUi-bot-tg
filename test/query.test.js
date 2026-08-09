@@ -36,6 +36,7 @@ import {
   shouldRunNow
 } from "../src/monitor.js";
 import {
+  addAllowedUser,
   getFirmwareQueryCache,
   getFlagshipProposal,
   getAccessSettings,
@@ -3222,11 +3223,9 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   const callbacks = sent.body.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
   assert.deepEqual(callbacks, [
     "admin:monitor-menu",
-    "admin:rollout-menu",
+    "admin:firmware-menu",
     "admin:access-menu",
-    "admin:admins",
-    "admin:download-menu",
-    "menu:more"
+    "admin:system-menu"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
@@ -3458,6 +3457,8 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
     TELEGRAM_BOT_TOKEN: "test-token",
     TELEGRAM_CHAT_ID: "992"
   };
+  resetStateMemoryCache();
+  await addAllowedUser(env, "993", "Allowed user");
   await dispatchTelegramTestUpdate(env, {
     update_id: 700002,
     message: {
@@ -3470,13 +3471,16 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
   const sync = payloads.find((entry) => entry.url.includes("/setMyCommands"));
   assert.ok(sync);
   const clears = payloads.filter((entry) => entry.url.includes("/deleteMyCommands"));
-  assert.equal(clears.length, 4);
-  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "devices", "status", "language", "help", "apply", "whoami"]);
-  const adminSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.type === "chat");
+  assert.equal(clears.length, 6);
+  assert.deepEqual(sync.body.commands.map((item) => item.command), ["start", "apply", "help"]);
+  const adminSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.chat_id === "992");
   assert.ok(adminSync);
-  assert.ok(adminSync.body.commands.some((item) => item.command === "admin"));
-  assert.ok(adminSync.body.commands.some((item) => item.command === "testscan"));
-  assert.ok(adminSync.body.commands.some((item) => item.command === "testconfirm"));
+  assert.deepEqual(adminSync.body.commands.map((item) => item.command), ["start", "admin", "download", "help"]);
+  assert.equal(adminSync.body.commands.some((item) => item.command === "testscan"), false);
+  assert.equal(adminSync.body.commands.some((item) => item.command === "testconfirm"), false);
+  const allowedSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.chat_id === "993");
+  assert.ok(allowedSync);
+  assert.deepEqual(allowedSync.body.commands.map((item) => item.command), ["start", "devices", "help"]);
 });
 
 test("My Devices persists shortcuts, deduplicates targets, and toggles subscriptions", async () => {
