@@ -8,11 +8,13 @@ HEALTH_URL="http://127.0.0.1:8787/health"
 DOWNLOAD_SERVICE="oneui-download.service"
 DOWNLOAD_HEALTH_URL="http://127.0.0.1:8788/health"
 NPM_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/npm"
+NODE_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/node"
 download_was_active=false
 
 log() { printf "[oneui-update] %s\n" "$*"; }
 die() { printf "[oneui-update] ERROR: %s\n" "$*" >&2; exit 1; }
 git_cmd() { git -c "safe.directory=${PROJECT_DIR}" "$@"; }
+[[ -x "${NODE_BIN}" ]] || die "Node.js executable not found: ${NODE_BIN}"
 
 [[ "${EUID}" -eq 0 ]] || die "请使用 sudo 运行此脚本。"
 [[ -d "${PROJECT_DIR}/.git" ]] || die "项目尚未配置 Git 仓库。"
@@ -41,6 +43,17 @@ log "运行安全扫描。"
 "${NPM_BIN}" run security-check
 log "运行生产依赖审计。"
 "${NPM_BIN}" audit --omit=dev --audit-level=high
+
+log "Run database migrations."
+(
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+  [[ -n "${DATABASE_URL:-}" ]] || die "${ENV_FILE} 缺少 DATABASE_URL"
+  runuser -u oneui -- env HOME=/home/oneui DATABASE_URL="${DATABASE_URL}" \
+    "${NODE_BIN}" "${PROJECT_DIR}/scripts/migrate-vps.mjs"
+)
 
 systemctl daemon-reload
 if systemctl is-active --quiet "${DOWNLOAD_SERVICE}"; then

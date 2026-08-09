@@ -331,6 +331,22 @@ export async function setRolloutChainStage(env, chainId, stageId) {
   return saveChains(env, chains);
 }
 
+// Pause both legacy rollout chains without deleting their targets or history.
+// Test-build confirmation owns the temporary EUX activation while this gate is
+// paused, so the existing rollout state remains recoverable.
+export async function pauseAllRolloutChains(env) {
+  const chains = await getRolloutChains(env);
+  let changed = false;
+  for (const chain of chains.chains) {
+    if (!chain.enabled && !chain.pendingProposalId && chain.status === "needs_configuration") continue;
+    chain.enabled = false;
+    chain.status = "needs_configuration";
+    chain.pendingProposalId = "";
+    changed = true;
+  }
+  return changed ? saveChains(env, chains) : chains;
+}
+
 function nextBeijingMonthStart(now = new Date()) {
   const parts = beijingParts(now);
   return new Date(Date.UTC(Number(parts.year), Number(parts.month), 1, -8, 0, 0));
@@ -381,6 +397,7 @@ export async function isRolloutItemWithinSchedule(env, item, now = new Date()) {
   const chainId = cleanText(item?.rolloutChainId, 48);
   const stageId = cleanText(item?.rolloutStageId, 48);
   if (!chainId || !stageId) return true;
+  if (item?.testFirmwareMonitorOverride === true) return item.enabled !== false;
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
   if (!chain || !chain.enabled) return false;

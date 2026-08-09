@@ -247,6 +247,9 @@ export function normalizeMonitorItems(items) {
         adminDecision: String(item.adminDecision || "").trim(),
         rolloutChainId: String(item.rolloutChainId || "").trim().slice(0, 48),
         rolloutStageId: String(item.rolloutStageId || "").trim().slice(0, 48),
+        // A staged test-build confirmation may temporarily run the matching
+        // official monitor while the legacy rollout chain remains paused.
+        testFirmwareMonitorOverride: item.testFirmwareMonitorOverride === true,
         resumeAt: String(item.resumeAt || "").trim(),
         pausedAt: String(item.pausedAt || "").trim(),
         pauseSource: String(item.pauseSource || "").trim(),

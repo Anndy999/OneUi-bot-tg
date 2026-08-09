@@ -1266,9 +1266,14 @@ export class MonitorScheduler {
         "adminDecision",
         "resumeAt",
         "pausedAt",
-        "pauseSource"
+        "pauseSource",
+        "testFirmwareMonitorOverride"
       ]) {
-        if (item[field] !== undefined) existing[field] = String(item[field] || "");
+        if (item[field] !== undefined) {
+          existing[field] = field === "testFirmwareMonitorOverride"
+            ? item[field] === true
+            : String(item[field] || "");
+        }
       }
     } else {
       items.push({
@@ -1287,6 +1292,7 @@ export class MonitorScheduler {
         resumeAt: String(item.resumeAt || ""),
         pausedAt: String(item.pausedAt || ""),
         pauseSource: String(item.pauseSource || ""),
+        testFirmwareMonitorOverride: item.testFirmwareMonitorOverride === true,
         notifyAllowedUsers: item.notifyAllowedUsers !== false,
         intervalMinutes: Number(item.intervalMinutes || 0)
       });

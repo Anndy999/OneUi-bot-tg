@@ -618,6 +618,7 @@ export async function upsertMonitorItem(env, item) {
     if (item.pausedAt !== undefined) target.pausedAt = String(item.pausedAt || "");
     if (item.pauseSource !== undefined) target.pauseSource = String(item.pauseSource || "");
     if (item.notifyAllowedUsers !== undefined) target.notifyAllowedUsers = item.notifyAllowedUsers !== false;
+    if (item.testFirmwareMonitorOverride !== undefined) target.testFirmwareMonitorOverride = item.testFirmwareMonitorOverride === true;
   };
   if (existing) {
     existing.name = item.name || existing.name || `${model} ${csc}`;
@@ -643,6 +644,7 @@ export async function upsertMonitorItem(env, item) {
       resumeAt: String(item.resumeAt || ""),
       pausedAt: String(item.pausedAt || ""),
       pauseSource: String(item.pauseSource || ""),
+      testFirmwareMonitorOverride: item.testFirmwareMonitorOverride === true,
       notifyAllowedUsers: item.notifyAllowedUsers !== false,
       intervalMinutes: Number(item.intervalMinutes || 0)
     };

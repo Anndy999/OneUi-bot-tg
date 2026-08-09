@@ -10,14 +10,15 @@ The script is intentionally limited to the OneUI application. It verifies the
 checkout is on `main` and clean, fast-forwards from `origin/main`, then always
 installs the locked Node dependencies without lifecycle scripts, runs tests,
 runs the repository security scan, runs the production dependency audit,
-restarts `oneui-bot.service` and, if the optional download service is already
-active, restarts `oneui-download.service` and checks its local health endpoint.
+applies all idempotent database migrations, restarts `oneui-bot.service` and,
+if the optional download service is already active, restarts
+`oneui-download.service` and checks its local health endpoint.
 Re-running after a
 failed update therefore revalidates the same checkout instead of skipping
 tests.
 
 It does not restart PostgreSQL or Redis, change Telegram Webhook state, touch
-Cloudflare, modify Nginx/firewall/SSH, or run a database migration.
+Cloudflare, modify Nginx/firewall/SSH, or restart PostgreSQL/Redis.
 
 ## Expected verification
 
@@ -62,18 +63,58 @@ sudo journalctl -u oneui-download.service -n 80 --no-pager
   delete `app_kv`, `runtime_state`, `runtime_alarms`, Redis data, or user
   configuration as a troubleshooting shortcut.
 
-## Schema changes
+## Samsung test-build scan
 
-The normal update does not apply migrations. If a release adds a migration,
-take a PostgreSQL backup, review the SQL and compatibility impact, and approve
-the separate command before running it. Use the protected secret store to
-inject `DATABASE_URL`; never paste a real connection string into shell history
-or Git.
+The VPS-only test-build pipeline uses only the `version.test.xml` hash list and
+the pure Python decryption logic included in the repository. It does not
+download firmware, handle IMEI/device identity, or expose a public decryption
+endpoint.
 
-```bash
-cd /opt/oneui-bot
-sudo -u oneui npm run db:migrate
+On the first start after this release, the service pauses the existing S26/S25
+rollout chains without deleting their targets or history, then queues one
+immediate `SM-S948N/KOO` scan. After an administrator verifies the returned
+full version, use the button in the notification or `/testconfirm`. The bot
+then queues `SM-S948B/EUX`; only a successful EUX decryption enables that
+target's official firmware monitor. The existing rollout definitions remain
+recoverable and are not automatically deleted.
+
+The production scheduler claims at most one regular scan per Beijing date in
+the 18:00 window. New unresolved hashes are stored and warned to administrators
+once; they are not broadcast to ordinary users.
+
+```text
+/testscan              # administrator: run the current staged pipeline targets
+/testscan SM-S9480 CHC # administrator: scan one target and retry unresolved hashes
+/testconfirm            # confirm KOO and enable the EUX stage
 ```
+
+The no-argument scheduled pipeline scans only KOO before confirmation and KOO
+plus EUX after confirmation. `/testscan MODEL CSC` remains available for an
+administrator's one-off diagnostic scan; EUX is still blocked until KOO is
+confirmed.
+
+The VPS service synchronizes the Telegram shortcut command list on startup.
+The administrator's private command menu includes `/testconfirm`; if Telegram
+has cached an old menu, send `/synccommands` once from an administrator chat.
+During KOO or EUX decryption, the bot edits one progress message with the
+current phase, candidate count, percentage, and matched count. If Telegram
+delivery is temporarily unavailable, the scan continues and the final summary
+is sent when delivery recovers.
+
+The one-click update applies the repository migrations before restarting the
+application. It reads the protected `DATABASE_URL` from the VPS environment
+file without printing it. Keep a PostgreSQL backup before a production update.
+
+The scheduled scan is controlled by these non-secret settings in
+`/etc/oneui-bot/oneui-bot.env`:
+
+```text
+TEST_FIRMWARE_SCAN_ENABLED=true
+TEST_FIRMWARE_SCAN_TIME=18:00
+TEST_FIRMWARE_TIMEZONE=Asia/Shanghai
+```
+
+Do not manually add a second timer or cron job for this feature.
 
 ## Backup and rollback discipline
 

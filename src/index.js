@@ -331,6 +331,8 @@ const PUBLIC_TELEGRAM_COMMANDS = [
 const ADMIN_TELEGRAM_COMMANDS = [
   { command: "download", description: "official firmware download" },
   ...PUBLIC_TELEGRAM_COMMANDS,
+  { command: "testscan", description: "扫描测试固件构建号" },
+  { command: "testconfirm", description: "确认 KOO 并开启 EUX 解密" },
   { command: "admin", description: "管理员面板" },
   { command: "chain", description: "发布链" },
   { command: "checknow", description: "立即检查" },
@@ -372,10 +374,12 @@ async function clearTelegramCommandsForChat(env, chatId) {
 }
 
 function telegramCommandsSyncKey() {
-  return `telegram:commands:${APP_VERSION}`;
+  // Bump this when the command list changes. A shared VPS/Cloudflare KV may
+  // already contain the application-version marker from an older command set.
+  return `telegram:commands:${APP_VERSION}:v2`;
 }
 
-async function ensureTelegramCommands(env) {
+export async function ensureTelegramCommands(env) {
   if (String(env.TELEGRAM_COMMAND_SYNC_ENABLED ?? "true").toLowerCase() === "false") return false;
   if (!env.FIRMWARE_KV || !env.TELEGRAM_BOT_TOKEN) return false;
   const key = telegramCommandsSyncKey();
