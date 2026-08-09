@@ -3475,6 +3475,8 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
   const adminSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.type === "chat");
   assert.ok(adminSync);
   assert.ok(adminSync.body.commands.some((item) => item.command === "admin"));
+  assert.ok(adminSync.body.commands.some((item) => item.command === "testscan"));
+  assert.ok(adminSync.body.commands.some((item) => item.command === "testconfirm"));
 });
 
 test("My Devices persists shortcuts, deduplicates targets, and toggles subscriptions", async () => {
