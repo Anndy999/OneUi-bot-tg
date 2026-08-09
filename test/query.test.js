@@ -259,6 +259,33 @@ test("Samsung FUS download resolution signs BinaryInform and completes BinaryIni
   assert.equal(result.sourceHeaders.cookie, "JSESSIONID=test-session");
 });
 
+test("SmartHistory retries one S02 response with a fresh FUS session", async () => {
+  resetFusSession();
+  let nonceRequests = 0;
+  let historyRequests = 0;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("NF_SmartDownloadGenerateNonce")) {
+      nonceRequests += 1;
+      return nonceResponse();
+    }
+    if (value.includes("SmartHistory")) {
+      historyRequests += 1;
+      if (historyRequests === 1) {
+        return new Response("<FUSMsg><FUSBody><Results><Status>S02</Status></Results></FUSBody></FUSMsg>", { status: 200 });
+      }
+      return new Response(historyDocument([
+        historyRow({ sequence: "1", localCsc: "CHC", model: "SM-S9480", version: "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1" })
+      ]), { status: 200 });
+    }
+    throw new Error(`Unexpected FUS request: ${value}`);
+  };
+  const result = await querySmartHistory(env, "SM-S9480", "CHC");
+  assert.equal(result.latest, "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1");
+  assert.equal(historyRequests, 2);
+  assert.equal(nonceRequests, 2);
+});
+
 const env = {
   HISTORY_REQUEST_TIMEOUT_MS: "1000",
   HISTORY_TOTAL_DEADLINE_MS: "2000",

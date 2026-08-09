@@ -659,6 +659,7 @@ export async function generateNonce(env, options = {}) {
 async function ensureNonceWithOptions(env, lane, options = {}) {
   const startedAt = Date.now();
   const timing = options.timing && typeof options.timing === "object" ? options.timing : null;
+  if (options.forceNewSession === true) lane.session = null;
   if (isSessionUsable(env, lane)) {
     if (timing) {
       timing.sessionReused = true;
@@ -761,6 +762,13 @@ export async function querySmartHistory(env, model, csc, options = {}) {
   });
   const status = tagValue(xml, "Status");
   if (status && status !== "200" && status !== "S00") {
+    if (status === "S02" && options.retryStatusS02 !== true) {
+      return querySmartHistory(env, normalizedModel, normalizedCsc, {
+        ...options,
+        forceNewSession: true,
+        retryStatusS02: true
+      });
+    }
     const error = new Error(`SmartHistory returned ${status}`);
     error.code = "FUS_SMART_HISTORY_STATUS";
     error.status = status;
