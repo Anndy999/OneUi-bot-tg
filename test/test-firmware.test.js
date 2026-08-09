@@ -11,6 +11,7 @@ import {
   handleTestFirmwareTelegramCommand,
   maybeScheduleTestFirmwareScan,
   processTestFirmwareMaintenanceJob,
+  releasePublicTestFirmware,
   renderTestFirmwareStatusPanel,
   scanTestFirmwareTarget,
   startupScanIdFor,
@@ -297,6 +298,64 @@ test("progress mode edits one Telegram message and suppresses duplicate result n
   assert.equal(calls.filter((method) => method === "editMessageText").length > 0, true);
   assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware:")), false);
   assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware-unresolved:")), false);
+});
+
+test("KOO result exposes two confirmations and public release stays owner-gated", async () => {
+  resetStateMemoryCache();
+  const queue = [];
+  const history = new InMemoryTestFirmwareHistoryRepository();
+  const app = runtime({ queue, history });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  app.env.TELEGRAM_BOT_TOKEN = "unit-test-token";
+  await addAllowedUser(app.env, "200", "Allowed user");
+  const bodies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => ({
+    ok: true,
+    status: 200,
+    async json() {
+      if (init.body) bodies.push(JSON.parse(init.body));
+      return { ok: true, result: { message_id: 701 } };
+    }
+  });
+  try {
+    const first = await executeTestFirmwareScan(app, {
+      target: { model: "SM-S948N", csc: "KOO" },
+      progressChatId: "100",
+      chatId: "100",
+      testXml: `<root><value>${KOO_MD5_WITHOUT_LATEST}</value></root>`,
+      latestVersionOverride: KOO_VERSION_WITHOUT_LATEST,
+      logger: quietLogger()
+    });
+    assert.equal(first.resolved, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const finalProgress = bodies.at(-1);
+  const firstCallbacks = finalProgress.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
+  assert.equal(firstCallbacks.includes("test-fw:confirm-eux"), true);
+  assert.equal(firstCallbacks.includes("test-fw:release:pending"), true);
+
+  const confirmed = await confirmKooAndEnableEux(app, "100", quietLogger());
+  assert.equal(confirmed.ok, true);
+  const newBuild = await scanTestFirmwareTarget(app, { model: "SM-S948N", csc: "KOO" }, {
+    testXml: `<root><value>${KOO_CROSS_CP_MD5}</value></root>`,
+    latestVersionOverride: KOO_CROSS_CP_VERSION,
+    logger: quietLogger()
+  });
+  assert.equal(newBuild.status, "resolved");
+  const ownerNotice = queue.filter((entry) => entry.id?.startsWith("test-firmware:")).at(-1);
+  const releaseButton = ownerNotice.replyMarkup.inline_keyboard.flat().find((button) => button.callback_data?.startsWith("test-fw:release:"));
+  assert.ok(releaseButton);
+  assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware-public:")), false);
+
+  const released = await releasePublicTestFirmware(app, releaseButton.callback_data.slice("test-fw:release:".length), "100", quietLogger());
+  assert.equal(released.ok, true);
+  assert.equal(released.recipients, 1);
+  assert.equal(queue.filter((entry) => entry.id?.startsWith("test-firmware-public:")).length, 1);
+  const duplicate = await releasePublicTestFirmware(app, releaseButton.callback_data.slice("test-fw:release:".length), "100", quietLogger());
+  assert.equal(duplicate.reason, "stale_or_missing");
+  assert.equal(queue.filter((entry) => entry.id?.startsWith("test-firmware-public:")).length, 1);
 });
 
 test("a multi-version test scan stores every result but pushes only the latest one to the owner", async () => {

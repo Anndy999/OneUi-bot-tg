@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   answerCallbackQuery,
   chatIdFromUpdate,
@@ -9,10 +9,14 @@ import {
 } from "../telegram.js";
 import { enqueueTelegramNotification } from "../notification-queue.js";
 import {
+  getAdminChatIds,
+  getAllowedUsers,
   getFirmwareQueryCache,
   getMonitorItems,
   getMonitorRuntime,
-  getUserLanguage
+  getUserLanguage,
+  kvGetJson,
+  kvPutJson
 } from "../state.js";
 import {
   activateTestFirmwareRolloutStage,
@@ -33,6 +37,7 @@ const DEFAULT_PIPELINE_RELEASE_ID = "2.22.1";
 const PIPELINE_STARTUP_SCAN_ID = `s948n-koo-eux:${DEFAULT_PIPELINE_RELEASE_ID}`;
 const KOO_TARGET = Object.freeze({ model: "SM-S948N", csc: "KOO" });
 const EUX_TARGET = Object.freeze({ model: "SM-S948B", csc: "EUX" });
+const PUBLIC_RELEASE_STATE_KEY = "test-firmware:public-release";
 
 function safeText(value, fallback = "") {
   const result = String(value ?? fallback).trim();
@@ -110,6 +115,50 @@ function isTestFirmwareOwner(env, chatId) {
   return Boolean(owner) && owner === String(chatId || "").trim();
 }
 
+function publicReleaseId(item, match) {
+  return createHash("sha256")
+    .update(`${item.model}:${item.csc}:${match.hash_type}:${match.hash_value}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+async function publicReleaseStateFor(runtime) {
+  return kvGetJson(runtime.env, PUBLIC_RELEASE_STATE_KEY, null);
+}
+
+async function preparePublicRelease(runtime, item, match, pipelineState, at = new Date()) {
+  if (!isTarget(item, KOO_TARGET) || !pipelineState?.euxEnabled || !match) return null;
+  const version = fullVersion(match);
+  if (!version || version === String(pipelineState.kooConfirmedVersion || "")) return null;
+  const id = publicReleaseId(item, match);
+  const current = await publicReleaseStateFor(runtime);
+  if (current?.id === id && ["pending", "released"].includes(current.status)) return current;
+  const next = {
+    id,
+    status: "pending",
+    model: item.model,
+    csc: item.csc,
+    hashType: String(match.hash_type || "").toLowerCase(),
+    hashValue: String(match.hash_value || "").toLowerCase(),
+    version,
+    detectedAt: scanNow(at).toISOString(),
+    confirmedAt: "",
+    confirmedBy: "",
+    recipients: 0,
+    updatedAt: scanNow(at).toISOString()
+  };
+  await kvPutJson(runtime.env, PUBLIC_RELEASE_STATE_KEY, next);
+  return next;
+}
+
+function ordinaryUserIds(users = [], adminIds = []) {
+  const admins = new Set((adminIds || []).map((id) => String(id || "").trim()).filter(Boolean));
+  return [...new Set((users || [])
+    .map((user) => String(user?.chatId || "").trim())
+    .filter((chatId) => chatId && !admins.has(chatId)))]
+    .sort();
+}
+
 function isTarget(item, target) {
   return item?.model === target.model && item?.csc === target.csc;
 }
@@ -180,10 +229,15 @@ function unresolvedText(item, hash, at, lang = "zh") {
   ].join("\n");
 }
 
-function notificationKeyboard(item, { manager = false, pipelineState = null } = {}) {
+function notificationKeyboard(item, { manager = false, pipelineState = null, releaseState = null } = {}) {
   const rows = [];
   if (manager && isTarget(item, KOO_TARGET) && !pipelineState?.euxEnabled) {
-    rows.push([{ text: "✅ 确认并开启 EUX 解密", callback_data: "test-fw:confirm-eux" }]);
+    rows.push([{ text: "✅ 确认解密结果，开启监控", callback_data: "test-fw:confirm-eux" }]);
+  }
+  if (manager && isTarget(item, KOO_TARGET) && (
+    !pipelineState?.euxEnabled || releaseState?.status === "pending"
+  )) {
+    rows.push([{ text: "📣 通知普通用户", callback_data: `test-fw:release:${releaseState?.id || "pending"}` }]);
   }
   rows.push(
     [{ text: "查询详情", callback_data: `query:refresh:${item.model}:${item.csc}` }],
@@ -199,13 +253,19 @@ async function broadcastResolved(runtime, item, match, at, pipelineState) {
   const chatId = ownerChatId(env);
   if (!chatId) return { attempted: 0, queued: 0 };
   let queued = 0;
+  let releaseState = null;
   try {
     const lang = await getUserLanguage(env, chatId);
+    try {
+      releaseState = await preparePublicRelease(runtime, item, match, pipelineState, at);
+    } catch (error) {
+      console.log(`[test-fw] public release state deferred for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
+    }
     const delivery = await enqueueTelegramNotification(env, {
       id: `test-firmware:${item.model}:${item.csc}:${match.hash_type}:${match.hash_value}:${chatId}`,
       chatId,
       text: testBuildText(item, match, at, lang),
-      replyMarkup: notificationKeyboard(item, { manager: true, pipelineState }),
+      replyMarkup: notificationKeyboard(item, { manager: true, pipelineState, releaseState }),
       monitorEvent: {
         type: "test_build_detected",
         model: item.model,
@@ -219,6 +279,66 @@ async function broadcastResolved(runtime, item, match, at, pipelineState) {
     console.log(`[test-fw] owner notification failed for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
   }
   return { attempted: 1, queued };
+}
+
+async function releasePublicTestFirmware(runtime, releaseId, chatId, logger = console) {
+  if (!isTestFirmwareOwner(runtime.env, chatId)) return { ok: false, reason: "forbidden" };
+  const pipelineState = await pipelineStateFor(runtime);
+  if (String(releaseId || "") === "pending" && !pipelineState.euxEnabled) {
+    return { ok: false, reason: "confirm_first" };
+  }
+  const current = await publicReleaseStateFor(runtime);
+  if (!current || current.id !== String(releaseId || "") || current.status !== "pending") {
+    return { ok: false, reason: "stale_or_missing" };
+  }
+  const [admins, users] = await Promise.all([
+    getAdminChatIds(runtime.env),
+    getAllowedUsers(runtime.env)
+  ]);
+  const recipients = ordinaryUserIds(users, admins);
+  const failures = [];
+  let deliveries = 0;
+  for (const recipient of recipients) {
+    try {
+      const lang = await getUserLanguage(runtime.env, recipient);
+      const delivery = await enqueueTelegramNotification(runtime.env, {
+        id: `test-firmware-public:${current.id}:${recipient}`,
+        chatId: recipient,
+        text: testBuildText({ model: current.model, csc: current.csc }, {
+          version: current.version,
+          pda: current.version.split("/")[0],
+          csc_build: current.version.split("/")[1],
+          cp: current.version.split("/")[2]
+        }, new Date(current.detectedAt || Date.now()), lang),
+        monitorEvent: {
+          type: "test_build_public_release",
+          model: current.model,
+          csc: current.csc,
+          audience: "allowed_user",
+          source: "owner_confirmed_test_firmware"
+        }
+      });
+      if (delivery?.queued || delivery?.sent) deliveries += 1;
+      else failures.push(recipient);
+    } catch (error) {
+      failures.push(recipient);
+      logger.warn?.(`[test-fw] public release queue failed for ${recipient}: ${String(error?.message || error).slice(0, 160)}`);
+    }
+  }
+  if (failures.length) return { ok: false, reason: "enqueue_failed", deliveries, recipients: recipients.length, failures: failures.length };
+  const released = {
+    ...current,
+    status: "released",
+    confirmedAt: new Date().toISOString(),
+    confirmedBy: String(chatId),
+    recipients: recipients.length,
+    deliveries,
+    updatedAt: new Date().toISOString()
+  };
+  if (!await kvPutJson(runtime.env, PUBLIC_RELEASE_STATE_KEY, released)) {
+    return { ok: false, reason: "storage_unavailable", deliveries, recipients: recipients.length };
+  }
+  return { ok: true, version: current.version, recipients: recipients.length, deliveries };
 }
 
 async function warnOwner(runtime, item, hash, at) {
@@ -418,7 +538,9 @@ export async function executeTestFirmwareScan(runtime, { target = null, retryUnr
   const items = target
     ? [validateModelCsc(target.model, target.csc)]
     : pipelineTargets(pipelineState).map((item) => ({ ...item }));
-  const progress = progressChatId ? await createTestFirmwareProgress(runtime.env, progressChatId, items, { automatic }) : null;
+  const progress = progressChatId
+    ? await createTestFirmwareProgress(runtime.env, progressChatId, items, { automatic, pipelineState })
+    : null;
   const results = [];
   for (const item of items) {
     progress?.setTarget(item, results.length, items.length);
@@ -469,8 +591,28 @@ export async function executeTestFirmwareScan(runtime, { target = null, retryUnr
   const resolved = results.reduce((sum, result) => sum + Number(result.resolvedCount || 0), 0);
   const unresolved = results.reduce((sum, result) => sum + Number(result.unresolvedCount || 0), 0);
   const summary = { ok: failed === 0, total: results.length, failed, resolved, unresolved, results };
-  if (progress) await progress.finish(summary);
-  else if (chatId) await sendTestScanSummary(runtime.env, chatId, summary);
+  let progressReleaseState = null;
+  const kooResult = results.find((result) =>
+    isTarget(result, KOO_TARGET) && result.status === "resolved" && result.newestMatch
+  );
+  if (kooResult) {
+    try {
+      progressReleaseState = await preparePublicRelease(runtime, KOO_TARGET, kooResult.newestMatch, pipelineState, now);
+      if (progress && !kooResult.newestNotifiedAt) {
+        await repositoryFor(runtime).markNotified(
+          KOO_TARGET.model,
+          KOO_TARGET.csc,
+          kooResult.newestMatch.hash_type,
+          kooResult.newestMatch.hash_value,
+          scanNow(now).toISOString()
+        );
+      }
+    } catch (error) {
+      logger.warn?.(`[test-fw] public release state update deferred: ${String(error?.message || error).slice(0, 180)}`);
+    }
+  }
+  if (progress) await progress.finish(summary, { releaseState: progressReleaseState });
+  else if (chatId) await sendTestScanSummary(runtime, chatId, summary, pipelineState, progressReleaseState);
   return summary;
 }
 
@@ -525,6 +667,7 @@ function progressText(target, event = {}, index = 0, total = 1, summary = null, 
 async function createTestFirmwareProgress(env, chatId, items, options = {}) {
   const first = items[0] || {};
   const automatic = Boolean(options.automatic);
+  const pipelineState = options.pipelineState || null;
   const sent = await sendTelegramMessageResult(env, chatId, progressText(first, {}, 0, items.length, null, { automatic }));
   if (!sent.ok || !sent.messageId) return null;
   const state = {
@@ -534,6 +677,7 @@ async function createTestFirmwareProgress(env, chatId, items, options = {}) {
     index: 0,
     total: items.length,
     automatic,
+    pipelineState,
     lastAt: 0,
     lastText: "",
     pending: Promise.resolve(),
@@ -555,13 +699,23 @@ async function createTestFirmwareProgress(env, chatId, items, options = {}) {
         .then(() => editTelegramMessageResult(env, this.chatId, this.messageId, text))
         .catch(() => {});
     },
-    async finish(summary) {
+    async finish(summary, { releaseState = null } = {}) {
       this.update({ phase: "finalizing", candidates: 0, maxCandidates: 0, matched: summary.resolved }, true);
       const text = progressText(this.target, { phase: "finalizing", candidates: 0, maxCandidates: 0, matched: summary.resolved }, this.index, this.total, summary, { automatic: this.automatic });
+      const kooResolved = summary.results?.some((result) =>
+        isTarget(result, KOO_TARGET) && result.status === "resolved" && result.newestMatch
+      );
+      const replyMarkup = kooResolved
+        ? notificationKeyboard(KOO_TARGET, {
+          manager: true,
+          pipelineState: this.pipelineState,
+          releaseState
+        })
+        : undefined;
       if (this.messageId && text !== this.lastText) {
         this.lastText = text;
         this.pending = this.pending
-          .then(() => editTelegramMessageResult(env, this.chatId, this.messageId, text))
+          .then(() => editTelegramMessageResult(env, this.chatId, this.messageId, text, replyMarkup))
           .catch(() => {});
       }
       await this.pending;
@@ -720,7 +874,8 @@ export async function bootstrapTestFirmwarePipeline(runtime, logger = console) {
   }
 }
 
-async function sendTestScanSummary(env, chatId, summary) {
+async function sendTestScanSummary(runtime, chatId, summary, pipelineState = null, releaseState = null) {
+  const env = runtime.env;
   const lines = [
     summary.ok ? "✅ 测试固件扫描完成" : "⚠️ 测试固件扫描完成，但有目标失败",
     `目标：${summary.total}`,
@@ -737,7 +892,13 @@ async function sendTestScanSummary(env, chatId, summary) {
   }
   const failures = summary.results.filter((result) => result.status === "failed").slice(0, 8);
   for (const failure of failures) lines.push(`• ${failure.model}/${failure.csc}：${failure.error || "请求失败"}`);
-  await sendTelegramMessage(env, chatId, lines.join("\n"));
+  const kooResolved = summary.results.some((result) =>
+    isTarget(result, KOO_TARGET) && result.status === "resolved" && result.newestMatch
+  );
+  const replyMarkup = kooResolved
+    ? notificationKeyboard(KOO_TARGET, { manager: true, pipelineState, releaseState })
+    : undefined;
+  await sendTelegramMessage(env, chatId, lines.join("\n"), replyMarkup);
 }
 
 async function withScanLock(runtime, task, logger = console) {
@@ -866,7 +1027,8 @@ export async function processTestFirmwareMaintenanceJob(job, runtime, logger = c
 export async function handleTestFirmwareTelegramCallback(update, runtime, logger = console) {
   const callback = update?.callback_query;
   const data = String(callback?.data || "");
-  if (!["test-fw:menu", "test-fw:refresh", "test-fw:confirm-eux"].includes(data)) return false;
+  const isReleaseCallback = data.startsWith("test-fw:release:");
+  if (!["test-fw:menu", "test-fw:refresh", "test-fw:confirm-eux"].includes(data) && !isReleaseCallback) return false;
   const chatId = String(chatIdFromUpdate(update) || "").trim();
   if (!chatId) return true;
   if (!isTestFirmwareOwner(runtime.env, chatId)) {
@@ -876,6 +1038,26 @@ export async function handleTestFirmwareTelegramCallback(update, runtime, logger
   if (data === "test-fw:menu" || data === "test-fw:refresh") {
     await answerCallbackQuery(runtime.env, callback.id, data === "test-fw:refresh" ? "正在刷新…" : "正在打开…");
     await renderTestFirmwareStatusPanel(runtime, chatId, callback.message?.message_id);
+    return true;
+  }
+  if (isReleaseCallback) {
+    await answerCallbackQuery(runtime.env, callback.id, "正在通知普通用户…");
+    const releaseId = data.slice("test-fw:release:".length);
+    const result = await releasePublicTestFirmware(runtime, releaseId, chatId, logger);
+    const text = result.ok
+      ? `✅ 已通知普通用户\n版本：${result.version}\n发送人数：${result.recipients}`
+      : result.reason === "confirm_first"
+        ? "请先点击“确认解密结果，开启监控”，确认后再通知普通用户。"
+      : result.reason === "stale_or_missing"
+        ? "⏳ 当前没有等待发布的测试固件，或该版本已经处理。"
+        : result.reason === "enqueue_failed"
+          ? `⚠️ 普通用户通知未全部发送\n已进入队列：${result.deliveries || 0}/${result.recipients || 0}\n请稍后重试。`
+          : "❌ 普通用户通知暂时无法发送，请稍后重试。";
+    const messageId = callback.message?.message_id;
+    const edited = await editTelegramMessageResult(runtime.env, chatId, messageId, text, {
+      inline_keyboard: [[{ text: "查询详情", callback_data: `query:refresh:${KOO_TARGET.model}:${KOO_TARGET.csc}` }], [{ text: "首页", callback_data: "menu:home" }]]
+    });
+    if (!edited.ok) await sendTelegramMessage(runtime.env, chatId, text);
     return true;
   }
   await answerCallbackQuery(runtime.env, callback.id, "正在确认…");
@@ -959,7 +1141,9 @@ export {
   SCAN_LOCK_KEY,
   pipelineTargets,
   latestTestFirmwareMatch,
+  notificationKeyboard,
   progressText as testFirmwareProgressText,
+  releasePublicTestFirmware,
   resolvedVersionFromRows,
   startupScanIdFor,
   testBuildText
