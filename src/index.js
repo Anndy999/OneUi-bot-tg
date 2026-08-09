@@ -1086,8 +1086,8 @@ async function renderUserDevices(env, chatId, messageId = null) {
 }
 
 function queryHelpText(lang = "zh") {
-  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
-  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
+  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also use a short revision suffix.\nExample: 9110 TGY ZF5\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
+  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u4f7f\u7528\u4e09\u4f4d\u7248\u672c\u5c3e\u7801\uff0c\u4f8b\u5982\uff1a9110 TGY ZF5\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
   /* legacy copy retained below */
   if (lang === "en") {
     return [

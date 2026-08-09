@@ -745,6 +745,16 @@ test("firmware input parser preserves an optional exact version", () => {
   });
 });
 
+test("firmware input parser accepts a short revision suffix", () => {
+  assert.deepEqual(parseFirmwareInput("9110 tgy zf5"), {
+    matched: true,
+    model: "SM-S9110",
+    csc: "TGY",
+    sourceFormat: "short_model_space_csc",
+    version: "ZF5"
+  });
+});
+
 test("SmartHistory selects an exact historical firmware version when requested", () => {
   const oldVersion = "S9480ZCU1/S9480CHC1/S9480ZCU1";
   const latestVersion = "S9480ZCU2/S9480CHC2/S9480ZCU2";
@@ -760,6 +770,15 @@ test("SmartHistory selects an exact historical firmware version when requested",
     ]), "SM-S9480", "CHC", { requestedVersion: oldVersion }),
     (error) => error.code === "FUS_SMART_HISTORY_VERSION_NOT_FOUND"
   );
+});
+
+test("SmartHistory resolves a short revision suffix to the full firmware version", () => {
+  const selected = parseSmartHistory(historyDocument([
+    historyRow({ sequence: "1", localCsc: "TGY", model: "SM-S9110", version: "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5" }),
+    historyRow({ sequence: "2", localCsc: "TGY", model: "SM-S9110", version: "S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1" })
+  ]), "SM-S9110", "TGY", { requestedVersion: "ZF5" });
+  assert.equal(selected.latest, "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5");
+  assert.equal(selected.requestedVersion, "ZF5");
 });
 
 test("tablet and watch aliases resolve to exact Samsung models", () => {
@@ -3029,6 +3048,22 @@ test("exact firmware input returns the selected version and keeps it on the admi
     ?.flat()
     .find((button) => String(button.callback_data || "").startsWith("admin:download-exact:"));
   assert.ok(downloadButton);
+});
+
+test("short firmware suffix input returns the matching full version", async () => {
+  const selectedVersion = "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5";
+  const otherVersion = "S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1";
+  const result = await dispatchFirmwareQueryUpdate({
+    input: "9110 tgy zf5",
+    historyRows: [
+      historyRow({ sequence: "1", localCsc: "TGY", model: "SM-S9110", version: selectedVersion }),
+      historyRow({ sequence: "2", localCsc: "TGY", model: "SM-S9110", version: otherVersion })
+    ]
+  });
+  assert.equal(result.response.status, 200);
+  const response = result.telegram.find((entry) => entry.body.text?.includes("指定版本"));
+  assert.ok(response);
+  assert.match(response.body.text, new RegExp(selectedVersion.replaceAll("/", "\\/")));
 });
 
 test("query result is queued for retry when Telegram is temporarily unavailable", async () => {

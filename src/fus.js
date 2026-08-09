@@ -1001,9 +1001,15 @@ export function parseSmartHistory(xml, model, csc, options = {}) {
   const requestedVersion = normalizeFirmwareVersion(options.requestedVersion || "");
   if (requestedVersion) {
     const requestedParts = requestedVersion.split("/").filter(Boolean);
-    candidates = candidates.filter((row) => requestedParts.length === 1
-      ? row.pda === requestedParts[0]
-      : firmwareVersionFingerprint(row.latest) === firmwareVersionFingerprint(requestedVersion));
+    const isShortRevision = requestedParts.length === 1 && /^[A-Z]{2}\d$/.test(requestedParts[0]);
+    candidates = candidates.filter((row) => {
+      if (requestedParts.length > 1) {
+        return firmwareVersionFingerprint(row.latest) === firmwareVersionFingerprint(requestedVersion);
+      }
+      if (row.pda === requestedParts[0]) return true;
+      if (!isShortRevision) return false;
+      return row.latest.split("/").some((component) => component.endsWith(requestedParts[0]));
+    });
     if (!candidates.length) {
       const error = new Error(`Samsung SmartHistory has no matching firmware version for ${requestedVersion}`);
       error.code = "FUS_SMART_HISTORY_VERSION_NOT_FOUND";

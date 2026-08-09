@@ -11,6 +11,7 @@ function isFirmwareVersionToken(value) {
   const token = String(value || "").trim();
   if (!token) return false;
   if (/^[A-Z0-9]+(?:\/[A-Z0-9]+){2,}$/i.test(token)) return true;
+  if (/^[A-Z]{2}\d$/i.test(token)) return true;
   return /^[A-Z0-9]{10,}$/i.test(token) && /\d/.test(token);
 }
 
