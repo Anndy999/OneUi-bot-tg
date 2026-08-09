@@ -44,7 +44,7 @@ export function createVpsConfig(env = process.env) {
     testFirmwareScanTime: text(env.TEST_FIRMWARE_SCAN_TIME, "18:00"),
     // Code releases use this non-secret marker to run the KOO bootstrap once.
     // Operators normally leave it unset; the shipped default changes with the release.
-    testFirmwareReleaseId: text(env.TEST_FIRMWARE_RELEASE_ID, "2.22.0"),
+    testFirmwareReleaseId: text(env.TEST_FIRMWARE_RELEASE_ID, "2.22.1"),
     // Keep the scan window independent of the VPS system timezone.
     testFirmwareTimezone: "Asia/Shanghai",
     testFirmwarePythonBin: text(env.TEST_FIRMWARE_PYTHON_BIN),

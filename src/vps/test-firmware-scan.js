@@ -10,14 +10,10 @@ import {
 import { enqueueTelegramNotification } from "../notification-queue.js";
 import {
   forceMonitorDue,
-  getAdminChatIds,
-  getAllowedUsers,
   getFirmwareQueryCache,
   getMonitorItems,
   getMonitorRuntime,
-  getUserDevices,
   getUserLanguage,
-  getIdentity,
   upsertMonitorItem
 } from "../state.js";
 import { pauseAllRolloutChains } from "../rollout-chain.js";
@@ -30,7 +26,7 @@ const SCAN_LOCK_KEY = "test-firmware:scan";
 const DEFAULT_SCAN_LOCK_MS = 2 * 60 * 60 * 1000;
 const STARTUP_LOCK_RETRY_DELAY_MS = 30_000;
 const STARTUP_LOCK_RETRY_LIMIT = 3;
-const DEFAULT_PIPELINE_RELEASE_ID = "2.22.0";
+const DEFAULT_PIPELINE_RELEASE_ID = "2.22.1";
 const PIPELINE_STARTUP_SCAN_ID = `s948n-koo-eux:${DEFAULT_PIPELINE_RELEASE_ID}`;
 const KOO_TARGET = Object.freeze({ model: "SM-S948N", csc: "KOO" });
 const EUX_TARGET = Object.freeze({ model: "SM-S948B", csc: "EUX" });
@@ -102,12 +98,43 @@ function targetLabel(item) {
   return `${item.model} / ${item.csc}`;
 }
 
+function ownerChatId(env) {
+  return String(env?.TELEGRAM_CHAT_ID || "").trim();
+}
+
+function isTestFirmwareOwner(env, chatId) {
+  const owner = ownerChatId(env);
+  return Boolean(owner) && owner === String(chatId || "").trim();
+}
+
 function isTarget(item, target) {
   return item?.model === target.model && item?.csc === target.csc;
 }
 
 function fullVersion(match) {
   return String(match.version || [match.pda, match.csc_build, match.cp].filter(Boolean).join("/") || "未知");
+}
+
+// Samsung test XML can publish several unseen hashes at once. Persist every
+// verified resolution, but notify only the newest build so an administrator is
+// not flooded with historical test versions after a delayed scan.
+function compareTestFirmwareMatches(left, right) {
+  const leftYear = Math.max(0, Number(left?.year) || 0);
+  const rightYear = Math.max(0, Number(right?.year) || 0);
+  if (leftYear !== rightYear) return leftYear - rightYear;
+  const leftMonth = Math.max(0, Number(left?.month) || 0);
+  const rightMonth = Math.max(0, Number(right?.month) || 0);
+  if (leftMonth !== rightMonth) return leftMonth - rightMonth;
+  return fullVersion(left).localeCompare(fullVersion(right), "en", {
+    numeric: true,
+    sensitivity: "base"
+  });
+}
+
+function latestTestFirmwareMatch(matches = []) {
+  return matches.reduce((latest, candidate) => (
+    !latest || compareTestFirmwareMatches(candidate, latest) > 0 ? candidate : latest
+  ), null);
 }
 
 function testBuildText(item, match, at, lang = "zh") {
@@ -164,80 +191,57 @@ function notificationKeyboard(item, { manager = false, pipelineState = null } = 
   };
 }
 
-async function allowedRecipients(env, item) {
-  const adminIds = await getAdminChatIds(env);
-  const adminSet = new Set(adminIds.map((id) => String(id)));
-  const users = await getAllowedUsers(env);
-  const recipients = adminIds.map((chatId) => ({ chatId: String(chatId), manager: true }));
-  if (String(env.NOTIFY_ALLOWED_USERS_ON_UPDATE ?? "true").toLowerCase() === "false") return recipients;
-  for (const user of users) {
-    const chatId = String(user.chatId || "").trim();
-    if (!chatId || adminSet.has(chatId)) continue;
-    const devices = await getUserDevices(env, chatId);
-    if (!devices.length || devices.some((device) =>
-      String(device.model || "").toUpperCase() === item.model &&
-      String(device.csc || "").toUpperCase() === item.csc &&
-      device.notifyEnabled !== false
-    )) recipients.push({ chatId, manager: false });
-  }
-  return recipients;
-}
-
 async function broadcastResolved(runtime, item, match, at, pipelineState) {
   const env = runtime.env;
-  const recipients = await allowedRecipients(env, item);
+  const chatId = ownerChatId(env);
+  if (!chatId) return { attempted: 0, queued: 0 };
   let queued = 0;
-  let attempted = 0;
-  for (const recipient of recipients) {
-    attempted += 1;
-    try {
-      const lang = await getUserLanguage(env, recipient.chatId);
-      const delivery = await enqueueTelegramNotification(env, {
-        id: `test-firmware:${item.model}:${item.csc}:${match.hash_type}:${match.hash_value}:${recipient.chatId}`,
-        chatId: recipient.chatId,
-        text: testBuildText(item, match, at, lang),
-        replyMarkup: notificationKeyboard(item, { manager: recipient.manager, pipelineState }),
-        monitorEvent: {
-          type: "test_build_detected",
-          model: item.model,
-          csc: item.csc,
-          audience: recipient.manager ? "manager" : "allowed_user",
-          source: "Samsung version.test.xml"
-        }
-      });
-      if (delivery?.queued || delivery?.sent) queued += 1;
-    } catch (error) {
-      console.log(`[test-fw] broadcast failed for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
-    }
+  try {
+    const lang = await getUserLanguage(env, chatId);
+    const delivery = await enqueueTelegramNotification(env, {
+      id: `test-firmware:${item.model}:${item.csc}:${match.hash_type}:${match.hash_value}:${chatId}`,
+      chatId,
+      text: testBuildText(item, match, at, lang),
+      replyMarkup: notificationKeyboard(item, { manager: true, pipelineState }),
+      monitorEvent: {
+        type: "test_build_detected",
+        model: item.model,
+        csc: item.csc,
+        audience: "owner",
+        source: "Samsung version.test.xml"
+      }
+    });
+    if (delivery?.queued || delivery?.sent) queued = 1;
+  } catch (error) {
+    console.log(`[test-fw] owner notification failed for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
   }
-  return { attempted, queued };
+  return { attempted: 1, queued };
 }
 
-async function warnAdmins(runtime, item, hash, at) {
+async function warnOwner(runtime, item, hash, at) {
   const env = runtime.env;
-  const admins = await getAdminChatIds(env);
+  const chatId = ownerChatId(env);
+  if (!chatId) return { attempted: 0, queued: 0 };
   let queued = 0;
-  for (const chatId of admins) {
-    try {
-      const lang = await getUserLanguage(env, chatId);
-      const delivery = await enqueueTelegramNotification(env, {
-        id: `test-firmware-unresolved:${item.model}:${item.csc}:${hash.hash_type}:${hash.hash_value}:${chatId}`,
-        chatId,
-        text: unresolvedText(item, hash, at, lang),
-        monitorEvent: {
-          type: "test_build_unresolved",
-          model: item.model,
-          csc: item.csc,
-          audience: "manager",
-          source: "Samsung version.test.xml"
-        }
-      });
-      if (delivery?.queued || delivery?.sent) queued += 1;
-    } catch (error) {
-      console.log(`[test-fw] unresolved warning failed for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
-    }
+  try {
+    const lang = await getUserLanguage(env, chatId);
+    const delivery = await enqueueTelegramNotification(env, {
+      id: `test-firmware-unresolved:${item.model}:${item.csc}:${hash.hash_type}:${hash.hash_value}:${chatId}`,
+      chatId,
+      text: unresolvedText(item, hash, at, lang),
+      monitorEvent: {
+        type: "test_build_unresolved",
+        model: item.model,
+        csc: item.csc,
+        audience: "owner",
+        source: "Samsung version.test.xml"
+      }
+    });
+    if (delivery?.queued || delivery?.sent) queued = 1;
+  } catch (error) {
+    console.log(`[test-fw] owner unresolved warning failed for ${item.model}/${item.csc}: ${String(error?.message || error).slice(0, 180)}`);
   }
-  return { attempted: admins.length, queued };
+  return { attempted: 1, queued };
 }
 
 async function currentLatestVersion(env, item) {
@@ -337,6 +341,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
   const matchedKeys = new Set(matches.map((match) => stableHashKey(match.hash_type, match.hash_value)));
   let notified = 0;
   let warnings = 0;
+  const resolvedRows = [];
   for (const match of matches) {
     const row = await repository.upsertResolved({
       model: target.model,
@@ -348,12 +353,15 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
       cp: match.cp,
       source: match.source || "Samsung version.test.xml + verified MD5(build)"
     });
-    if (!row.notifiedAt) {
-      const delivery = await broadcastResolved(runtime, target, match, at, pipelineState);
-      if (delivery.queued > 0) {
-        await repository.markNotified(target.model, target.csc, match.hash_type, match.hash_value, at.toISOString());
-        notified += 1;
-      }
+    resolvedRows.push({ match, row });
+  }
+  const newestMatch = latestTestFirmwareMatch(matches);
+  const newestRow = resolvedRows.find(({ match }) => match === newestMatch);
+  if (newestMatch && newestRow && !newestRow.row.notifiedAt) {
+    const delivery = await broadcastResolved(runtime, target, newestMatch, at, pipelineState);
+    if (delivery.queued > 0) {
+      await repository.markNotified(target.model, target.csc, newestMatch.hash_type, newestMatch.hash_value, at.toISOString());
+      notified = 1;
     }
   }
   for (const hash of unresolved) {
@@ -368,7 +376,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
       source: "Samsung version.test.xml"
     });
     if (!row.adminWarningAt) {
-      const warning = await warnAdmins(runtime, target, hash, at);
+      const warning = await warnOwner(runtime, target, hash, at);
       if (warning.queued > 0) {
         await repository.markAdminWarning(target.model, target.csc, hash.hash_type, hash.hash_value, at.toISOString());
         warnings += 1;
@@ -392,7 +400,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
     newHashCount: selectedHashes.length,
     resolvedCount: matches.length,
     unresolvedCount: unresolved.length,
-    resolvedVersion: matches.map(fullVersion).filter(Boolean).join("、").slice(0, 360),
+    resolvedVersion: newestMatch ? fullVersion(newestMatch).slice(0, 360) : "",
     notified,
     warnings,
     candidateLimitReached: Boolean(result.candidateLimitReached),
@@ -801,8 +809,8 @@ export async function handleTestFirmwareTelegramCallback(update, runtime, logger
   if (!["test-fw:menu", "test-fw:refresh", "test-fw:confirm-eux"].includes(data)) return false;
   const chatId = String(chatIdFromUpdate(update) || "").trim();
   if (!chatId) return true;
-  if (await getIdentity(runtime.env, chatId) !== "admin") {
-    await answerCallbackQuery(runtime.env, callback.id, "无权限", { showAlert: true });
+  if (!isTestFirmwareOwner(runtime.env, chatId)) {
+    await answerCallbackQuery(runtime.env, callback.id, "测试阶段仅所有者可操作", { showAlert: true });
     return true;
   }
   if (data === "test-fw:menu" || data === "test-fw:refresh") {
@@ -833,8 +841,8 @@ export async function handleTestFirmwareTelegramCommand(update, runtime, logger 
   if (!["/testscan", "/testconfirm"].includes(command)) return false;
   const chatId = String(chatIdFromUpdate(update) || "").trim();
   if (!chatId) return true;
-  if (await getIdentity(runtime.env, chatId) !== "admin") {
-    await sendTelegramMessage(runtime.env, chatId, "你没有权限执行此操作。");
+  if (!isTestFirmwareOwner(runtime.env, chatId)) {
+    await sendTelegramMessage(runtime.env, chatId, "测试阶段仅所有者可操作。");
     return true;
   }
   if (command === "/testconfirm") {
@@ -887,6 +895,7 @@ export {
   PIPELINE_STARTUP_SCAN_ID,
   SCAN_LOCK_KEY,
   pipelineTargets,
+  latestTestFirmwareMatch,
   progressText as testFirmwareProgressText,
   resolvedVersionFromRows,
   startupScanIdFor,

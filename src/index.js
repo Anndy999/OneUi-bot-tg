@@ -178,7 +178,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.22.0";
+const APP_VERSION = "2.22.1";
 
 export default {
   async fetch(request, env, ctx) {

@@ -13,6 +13,7 @@ import {
   maybeScheduleTestFirmwareScan,
   processTestFirmwareMaintenanceJob
 } from "./test-firmware-scan.js";
+import { broadcastTestingApologyToAllowedUsers } from "./testing-notice.js";
 
 function retryableQueueMessage(data) {
   let action = "pending";
@@ -198,6 +199,9 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
   timer.unref?.();
   void bootstrapTestFirmwareWithRetry(runtime, logger).catch((error) => {
     logger.error?.(`VPS test firmware startup pipeline failed: ${error.message}`);
+  });
+  void broadcastTestingApologyToAllowedUsers(runtime, logger).catch((error) => {
+    logger.warn?.(`VPS testing apology notice failed: ${error.message}`);
   });
   void ensureTelegramCommands(runtime.env).catch((error) => {
     logger.warn?.(`VPS Telegram shortcut command sync failed: ${error.message}`);

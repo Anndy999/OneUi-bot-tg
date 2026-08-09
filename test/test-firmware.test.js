@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { InMemoryTestFirmwareHistoryRepository } from "../src/vps/test-firmware-history.js";
 import { runTestFirmwareDecryptor } from "../src/vps/test-firmware-decryptor.js";
 import {
@@ -19,7 +20,12 @@ import {
 } from "../src/vps/test-firmware-scan.js";
 import { MemoryLockService } from "../src/runtime/locks.js";
 import { MemoryStorage } from "../src/runtime/storage.js";
-import { getMonitorItems, resetStateMemoryCache } from "../src/state.js";
+import {
+  addAdditionalAdmin,
+  addAllowedUser,
+  getMonitorItems,
+  resetStateMemoryCache
+} from "../src/state.js";
 
 const MODEL = "SM-S9480";
 const CSC = "CHC";
@@ -27,6 +33,14 @@ const LATEST = "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1";
 const RESOLVED_HASH = "51d21620bea9bf325b9adb2c02ed1d0e";
 const TEST_XML = `<root><value>${RESOLVED_HASH}</value></root>`;
 const UNRESOLVED_SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const MULTI_TEST_VERSIONS = [
+  "S9480ZCU0AVA1/S9480CHC0AVA1/S9480ZCU0AVA1",
+  "S9480ZCU0AVA3/S9480CHC0AVA3/S9480ZCU0AVA3",
+  "S9480ZCU0AVB1/S9480CHC0AVB1/S9480ZCU0AVB1"
+];
+const MULTI_TEST_XML = `<root>${MULTI_TEST_VERSIONS
+  .map((version) => `<value>${createHash("md5").update(version).digest("hex")}</value>`)
+  .join("")}</root>`;
 
 function quietLogger() {
   return { info() {}, warn() {}, error() {} };
@@ -48,7 +62,7 @@ function runtime({ queue = [], history = new InMemoryTestFirmwareHistoryReposito
       testFirmwareScanLockMs: 30_000,
       testFirmwareScanEnabled: true,
       testFirmwareScanTime: "18:00",
-      testFirmwareReleaseId: "2.22.0"
+      testFirmwareReleaseId: "2.22.1"
     },
     context: { locks: new MemoryLockService() },
     queues: { maintenance: { async add(_name, data) { queue.push({ maintenance: true, data }); } } },
@@ -153,10 +167,39 @@ test("successful new build is persisted, broadcast once, and repeated scans stay
   assert.equal(queue.filter((entry) => entry.id?.startsWith("test-firmware:")).length, 1);
 });
 
+test("a multi-version test scan stores every result but pushes only the latest one to the owner", async () => {
+  resetStateMemoryCache();
+  const queue = [];
+  const history = new InMemoryTestFirmwareHistoryRepository();
+  const app = runtime({ queue, history });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  await addAllowedUser(app.env, "200", "Allowed user");
+  await addAdditionalAdmin(app.env, "300", "Additional admin", "100");
+
+  const result = await scanTestFirmwareTarget(app, { model: MODEL, csc: CSC }, {
+    testXml: MULTI_TEST_XML,
+    latestVersionOverride: LATEST,
+    logger: quietLogger()
+  });
+  assert.equal(result.resolvedCount, 3);
+  assert.equal(result.resolvedVersion, MULTI_TEST_VERSIONS[2]);
+  assert.equal(history.snapshot().history.filter((row) => row.decryptStatus === "resolved").length, 3);
+
+  const notifications = queue.filter((entry) => entry.id?.startsWith("test-firmware:"));
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].chatId, "100");
+  assert.match(notifications[0].text, /S9480ZCU0AVB1/);
+  assert.doesNotMatch(notifications[0].text, /S9480ZCU0AVA1/);
+});
+
 test("unresolved SHA-256 is preserved and never sent as a public build notification", async () => {
   const queue = [];
   const history = new InMemoryTestFirmwareHistoryRepository();
   const app = runtime({ queue, history });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  resetStateMemoryCache();
+  await addAllowedUser(app.env, "200", "Allowed user");
+  await addAdditionalAdmin(app.env, "300", "Additional admin", "100");
   const result = await scanTestFirmwareTarget(app, { model: MODEL, csc: CSC }, {
     testXml: `<root><value>${UNRESOLVED_SHA256}</value></root>`,
     latestVersionOverride: LATEST,
@@ -167,6 +210,7 @@ test("unresolved SHA-256 is preserved and never sent as a public build notificat
   assert.equal(history.snapshot().history[0].decryptStatus, "unresolved");
   assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware:") && !entry.id.startsWith("test-firmware-unresolved:")), false);
   assert.equal(queue.filter((entry) => entry.id?.startsWith("test-firmware-unresolved:")).length, 1);
+  assert.equal(queue.find((entry) => entry.id?.startsWith("test-firmware-unresolved:"))?.chatId, "100");
 });
 
 test("scheduled guard and midnight cleanup are persistent in the repository", async () => {
@@ -187,6 +231,19 @@ test("ordinary users cannot enqueue the admin-only test scan command", async () 
   const app = runtime({ queue });
   const handled = await handleTestFirmwareTelegramCommand({
     message: { chat: { id: "200" }, text: "/testscan" }
+  }, app, quietLogger());
+  assert.equal(handled, true);
+  assert.equal(queue.length, 0);
+});
+
+test("additional administrators cannot run owner-only test firmware commands during testing", async () => {
+  const queue = [];
+  const app = runtime({ queue });
+  app.env.FIRMWARE_KV = new MemoryStorage();
+  resetStateMemoryCache();
+  await addAdditionalAdmin(app.env, "300", "Additional admin", "100");
+  const handled = await handleTestFirmwareTelegramCommand({
+    message: { chat: { id: "300" }, text: "/testscan" }
   }, app, quietLogger());
   assert.equal(handled, true);
   assert.equal(queue.length, 0);
@@ -292,10 +349,10 @@ test("startup pipeline queues KOO once and retries are protected by a durable cl
   assert.equal(first.startupScanId, startupScanIdFor(app));
   assert.equal(second.reason, "already_claimed");
   assert.equal(queue.filter((entry) => entry.maintenance && entry.data.kind === "test-firmware-startup-scan").length, 1);
-  app.config.testFirmwareReleaseId = "2.22.1";
+  app.config.testFirmwareReleaseId = "2.22.2";
   const nextRelease = await bootstrapTestFirmwarePipeline(app, quietLogger());
   assert.equal(nextRelease.queued, true);
-  assert.equal(nextRelease.startupScanId, "s948n-koo-eux:2.22.1");
+  assert.equal(nextRelease.startupScanId, "s948n-koo-eux:2.22.2");
   assert.equal(queue.filter((entry) => entry.maintenance && entry.data.kind === "test-firmware-startup-scan").length, 2);
 });
 
