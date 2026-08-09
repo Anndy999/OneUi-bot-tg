@@ -6,8 +6,10 @@ decrypter10.py reference.  It deliberately contains no Telegram, FUS,
 firmware download, device identity, or user-interface code.
 
 The reference implementation provides a verifiable MD5(version) mapping.
-There is no complete SHA-256/HMAC-SHA256 algorithm and key in that source, so
-64-character hashes are reported as unresolved instead of being guessed.
+The supplied APK also contains a native brute-force bridge, but its native
+library is not present in the APK, so its private HMAC-SHA256 routine cannot
+be safely transplanted. 64-character hashes are therefore reported as
+unresolved instead of being guessed.
 """
 
 from __future__ import annotations
@@ -30,6 +32,12 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 DEFAULT_TIMEOUT_SECONDS = 12
 DEFAULT_MAX_CANDIDATES = 10_000_000
 PROGRESS_PREFIX = "ONEUI_TEST_FIRMWARE_PROGRESS "
+SAMSUNG_CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SAMSUNG_YEAR_CODES = "UVWXYZ"
+# HashFirm's recent public updates include T engineering builds. Keep E as
+# the existing mixed AP variant below, while adding T as a normal AP/CP
+# feature so the common candidate path remains bounded.
+SAMSUNG_FEATURE_CODES = "UST"
 
 
 def emit_progress(phase: str, candidates: int = 0, max_candidates: int = 0, matched: int = 0) -> None:
@@ -154,6 +162,26 @@ def letters_range(start: str, end: str) -> str:
     return "".join(chr(code) for code in range(ord(start), ord(end) + 1))
 
 
+def samsung_code_range(start: str, end: str) -> str:
+    """Return Samsung's 0-9,A-Z code range without punctuation characters."""
+    try:
+        first = SAMSUNG_CODE_ALPHABET.index(start)
+        last = SAMSUNG_CODE_ALPHABET.index(end)
+    except ValueError:
+        return ""
+    return SAMSUNG_CODE_ALPHABET[first:last + 1] if first <= last else ""
+
+
+def samsung_year_range(start: str, end: str) -> str:
+    """Return the supported Samsung year-code range (U through Z)."""
+    try:
+        first = SAMSUNG_YEAR_CODES.index(start)
+        last = SAMSUNG_YEAR_CODES.index(end)
+    except ValueError:
+        return ""
+    return SAMSUNG_YEAR_CODES[first:last + 1] if first <= last else ""
+
+
 def classify_build(version: str, latest_version: str) -> str:
     pda = version.split("/", 1)[0] if version else ""
     if latest_version and version == latest_version:
@@ -178,8 +206,17 @@ def derive_codes(model: str, csc: str, latest_version: str):
             second_code = parts[1][:-5]
             third_code = parts[2][:-6] if len(parts) > 2 else ""
             latest_year = parts[0][-3]
-            start_year = chr(ord("A") + max(0, ord(latest_year) - ord("A") - 4))
-            end_year = next_char(latest_year) if parts[0][-2] in "JKL" else latest_year
+            if latest_year in SAMSUNG_YEAR_CODES:
+                latest_year_index = SAMSUNG_YEAR_CODES.index(latest_year)
+                start_year = SAMSUNG_YEAR_CODES[max(0, latest_year_index - 5)]
+                end_year_index = min(
+                    len(SAMSUNG_YEAR_CODES) - 1,
+                    latest_year_index + (1 if parts[0][-2] in "JKL" else 0),
+                )
+                end_year = SAMSUNG_YEAR_CODES[end_year_index]
+            else:
+                start_year = latest_year
+                end_year = latest_year
             start_bl = "0"
             end_bl = next_char(parts[0][-5])
             start_update = "A"
@@ -201,7 +238,10 @@ def derive_codes(model: str, csc: str, latest_version: str):
     elif suffix == "W":
         ap_tag, csc_tag, cp_tag = "VL", "OYV", "VL"
     elif suffix == "N":
-        ap_tag, csc_tag, cp_tag = "NK", "OKR", "NK"
+        # The APK strips the regional suffix before joining its AP/CP tag.
+        # This worker keeps the suffix in model_code, so KS is the equivalent
+        # tag here and produces S948NKSU... rather than S948NNKU....
+        ap_tag, csc_tag, cp_tag = "KS", "OKR", "KS"
     elif suffix == "0":
         ap_tag = "ZH" if csc in ("TGY", "BRI") else "ZC"
         csc_tag = csc
@@ -214,11 +254,16 @@ def derive_codes(model: str, csc: str, latest_version: str):
         ap_tag, csc_tag, cp_tag = "XX", "OWO", "XX"
 
     current_year = datetime.now(timezone.utc).year
-    start_year = chr(max(ord("A"), current_year - 2001 + ord("A") - 3))
-    end_year = next_char(next_char(start_year))
+    current_year_index = min(
+        len(SAMSUNG_YEAR_CODES) - 1,
+        max(0, current_year - 2021),
+    )
+    current_year_code = SAMSUNG_YEAR_CODES[current_year_index]
+    start_year = SAMSUNG_YEAR_CODES[max(0, current_year_index - 5)]
+    end_year = current_year_code
     return (model_code + ap_tag, model_code + csc_tag,
             model_code + cp_tag if cp_tag else "", start_year, end_year,
-            "0", "9", "A", "Z")
+            "0", "C", "A", "Z")
 
 
 def decrypt_firmware(model: str, csc: str, target_hashes: set[str], latest_version: str,
@@ -227,8 +272,8 @@ def decrypt_firmware(model: str, csc: str, target_hashes: set[str], latest_versi
     if not target_hashes:
         return {}, False, 0
     first_code, second_code, third_code, start_year, end_year, start_bl, end_bl, start_update, end_update = derive_codes(model, csc, latest_version)
-    years = letters_range(start_year, end_year)
-    bootloaders = letters_range(start_bl, end_bl)
+    years = samsung_year_range(start_year, end_year)
+    bootloaders = samsung_code_range(start_bl, end_bl)
     updates = letters_range(start_update, end_update)
     if "Z" not in updates:
         updates += "Z"
@@ -258,6 +303,9 @@ def decrypt_firmware(model: str, csc: str, target_hashes: set[str], latest_versi
         if progress_every > 0 and candidates % progress_every == 0:
             emit_progress("decrypting", candidates, max_candidates, len(decrypted))
 
+    # Keep the historical U/S scan order so common builds resolve quickly.
+    # Add T beside the first pass instead of placing it after a full U/S
+    # sweep; this keeps an unresolved T build within the same bounded range.
     for flavor in "US":
         for bootloader in bootloaders:
             for update in updates:
@@ -271,7 +319,11 @@ def decrypt_firmware(model: str, csc: str, target_hashes: set[str], latest_versi
                                 seed = third_code + flavor + bootloader + update + year_char + month_char + str(index)
                                 if seed not in local_cp:
                                     local_cp.append(seed)
-                        for serial in "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                        # Samsung's build-code alphabet includes zero. The
+                        # previous resolver skipped it, which made valid
+                        # hashes impossible to resolve in the first build of
+                        # a sequence.
+                        for serial in SAMSUNG_CODE_ALPHABET:
                             random_part = bootloader + update + year_char + month_char + serial
                             beta_random = bootloader + "Z" + year_char + month_char + serial
                             tcode = third_code + flavor + random_part if third_code else ""
@@ -283,10 +335,23 @@ def decrypt_firmware(model: str, csc: str, target_hashes: set[str], latest_versi
                                         local_cp.append(cpv)
                             versions = (
                                 f"{first_code}{flavor}{random_part}/{second_code}{random_part}/{tcode}",
-                                f"{first_code}E{random_part}/{second_code}{random_part}/{tcode}",
                                 f"{first_code}{flavor}{beta_random}/{second_code}{beta_random}/{beta_tcode}",
-                                f"{first_code}E{beta_random}/{second_code}{beta_random}/{beta_tcode}",
                             )
+                            if flavor == "U" and "T" in SAMSUNG_FEATURE_CODES:
+                                t_random = third_code + "T" + random_part if third_code else ""
+                                t_beta = third_code + "T" + beta_random if third_code else ""
+                                versions += (
+                                    f"{first_code}T{random_part}/{second_code}{random_part}/{t_random}",
+                                    f"{first_code}T{beta_random}/{second_code}{beta_random}/{t_beta}",
+                                )
+                            if flavor in "US":
+                                # Preserve the existing engineering-AP
+                                # candidate while allowing the HashFirm-style
+                                # T feature to use the same AP/CP feature.
+                                versions += (
+                                    f"{first_code}E{random_part}/{second_code}{random_part}/{tcode}",
+                                    f"{first_code}E{beta_random}/{second_code}{beta_random}/{beta_tcode}",
+                                )
                             for version in versions:
                                 register(version, year_char, month_char)
                             for cpv in local_cp:

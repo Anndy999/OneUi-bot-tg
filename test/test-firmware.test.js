@@ -32,6 +32,10 @@ const CSC = "CHC";
 const LATEST = "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1";
 const RESOLVED_HASH = "51d21620bea9bf325b9adb2c02ed1d0e";
 const TEST_XML = `<root><value>${RESOLVED_HASH}</value></root>`;
+const KOO_VERSION_WITHOUT_LATEST = "S948NKSU0AVA1/S948NOKR0AVA1/S948NKSU0AVA1";
+const KOO_MD5_WITHOUT_LATEST = createHash("md5").update(KOO_VERSION_WITHOUT_LATEST).digest("hex");
+const KOO_HASHFIRM_RANGE_VERSION = "S948NKST0AUA0/S948NOKR0AUA0/S948NKST0AUA0";
+const KOO_HASHFIRM_RANGE_MD5 = createHash("md5").update(KOO_HASHFIRM_RANGE_VERSION).digest("hex");
 const UNRESOLVED_SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MULTI_TEST_VERSIONS = [
   "S9480ZCU0AVA1/S9480CHC0AVA1/S9480ZCU0AVA1",
@@ -93,6 +97,36 @@ test("version.test.xml parsing and verified MD5 matching work without network ac
   assert.equal(result.matches[0].cp, "S9480ZCU0AVA1");
   assert.equal(progress.some((event) => event.phase === "decrypting"), true);
   assert.equal(progress.some((event) => event.phase === "finalizing"), true);
+});
+
+test("KOO fallback ranges resolve the regional build when version.test.xml has no latest tag", async () => {
+  const result = await runTestFirmwareDecryptor({
+    model: "SM-S948N",
+    csc: "KOO",
+    testXml: `<root><value>${KOO_MD5_WITHOUT_LATEST}</value></root>`
+  }, {
+    env: { TEST_FIRMWARE_PYTHON_BIN: process.platform === "win32" ? "python" : "python3" },
+    timeoutMs: 120_000,
+    logger: quietLogger()
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].version, KOO_VERSION_WITHOUT_LATEST);
+});
+
+test("Samsung candidate ranges include zero builds, six year codes, and T engineering builds", async () => {
+  const result = await runTestFirmwareDecryptor({
+    model: "SM-S948N",
+    csc: "KOO",
+    testXml: `<root><value>${KOO_HASHFIRM_RANGE_MD5}</value></root>`
+  }, {
+    env: { TEST_FIRMWARE_PYTHON_BIN: process.platform === "win32" ? "python" : "python3" },
+    timeoutMs: 120_000,
+    logger: quietLogger()
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].version, KOO_HASHFIRM_RANGE_VERSION);
 });
 
 test("resolved test-build notification uses the compact full-version wording", () => {
@@ -165,6 +199,45 @@ test("successful new build is persisted, broadcast once, and repeated scans stay
   assert.equal(second.status, "unchanged");
   assert.equal(second.newHashCount, 0);
   assert.equal(queue.filter((entry) => entry.id?.startsWith("test-firmware:")).length, 1);
+});
+
+test("progress mode edits one Telegram message and suppresses duplicate result notices", async () => {
+  const queue = [];
+  const app = runtime({ queue });
+  app.env.TELEGRAM_BOT_TOKEN = "unit-test-token";
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const method = String(url).split("/").pop();
+    calls.push(method);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return method === "sendMessage"
+          ? { ok: true, result: { message_id: 701 } }
+          : { ok: true, result: true };
+      }
+    };
+  };
+  try {
+    const result = await executeTestFirmwareScan(app, {
+      target: { model: MODEL, csc: CSC },
+      progressChatId: "100",
+      chatId: "100",
+      testXml: TEST_XML,
+      latestVersionOverride: LATEST,
+      logger: quietLogger()
+    });
+    assert.equal(result.failed, 0);
+    assert.equal(result.resolved, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(calls.filter((method) => method === "sendMessage").length, 1);
+  assert.equal(calls.filter((method) => method === "editMessageText").length > 0, true);
+  assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware:")), false);
+  assert.equal(queue.some((entry) => entry.id?.startsWith("test-firmware-unresolved:")), false);
 });
 
 test("a multi-version test scan stores every result but pushes only the latest one to the owner", async () => {

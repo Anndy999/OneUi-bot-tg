@@ -278,7 +278,16 @@ async function activateOfficialEuxMonitor(runtime, target, at, logger = console)
   }
 }
 
-export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = false, now = new Date(), logger = console, testXml = null, latestVersionOverride = "", onProgress = null } = {}) {
+export async function scanTestFirmwareTarget(runtime, item, {
+  retryUnresolved = false,
+  now = new Date(),
+  logger = console,
+  testXml = null,
+  latestVersionOverride = "",
+  onProgress = null,
+  notifyResults = true,
+  notifyUnresolved = true
+} = {}) {
   const target = validateModelCsc(item.model, item.csc);
   const repository = repositoryFor(runtime);
   const at = scanNow(now);
@@ -357,7 +366,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
   }
   const newestMatch = latestTestFirmwareMatch(matches);
   const newestRow = resolvedRows.find(({ match }) => match === newestMatch);
-  if (newestMatch && newestRow && !newestRow.row.notifiedAt) {
+  if (notifyResults && newestMatch && newestRow && !newestRow.row.notifiedAt) {
     const delivery = await broadcastResolved(runtime, target, newestMatch, at, pipelineState);
     if (delivery.queued > 0) {
       await repository.markNotified(target.model, target.csc, newestMatch.hash_type, newestMatch.hash_value, at.toISOString());
@@ -375,7 +384,7 @@ export async function scanTestFirmwareTarget(runtime, item, { retryUnresolved = 
       reason: hash.reason || "no_verified_candidate_match",
       source: "Samsung version.test.xml"
     });
-    if (!row.adminWarningAt) {
+    if (notifyUnresolved && !row.adminWarningAt) {
       const warning = await warnOwner(runtime, target, hash, at);
       if (warning.queued > 0) {
         await repository.markAdminWarning(target.model, target.csc, hash.hash_type, hash.hash_value, at.toISOString());
@@ -429,6 +438,8 @@ export async function executeTestFirmwareScan(runtime, { target = null, retryUnr
         logger,
         testXml,
         latestVersionOverride,
+        notifyResults: !progress,
+        notifyUnresolved: !progress,
         onProgress: (event) => progress?.update(event)
       }));
     } catch (error) {
@@ -881,7 +892,6 @@ export async function handleTestFirmwareTelegramCommand(update, runtime, logger 
       chatId,
       createdAt: new Date().toISOString()
     }, { attempts: 1, removeOnComplete: { age: 24 * 60 * 60, count: 100 } });
-    await sendTelegramMessage(runtime.env, chatId, `✅ 已加入测试固件扫描：${target.model} / ${target.csc}\n扫描完成后只向你返回结果。`);
   } catch (error) {
     logger.error?.(`[test-fw] manual scan enqueue failed: ${String(error?.message || error).slice(0, 180)}`);
     await sendTelegramMessage(runtime.env, chatId, "❌ 测试固件扫描暂时无法启动。");
