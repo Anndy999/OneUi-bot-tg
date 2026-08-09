@@ -15,6 +15,10 @@ function isFirmwareVersionToken(value) {
   return /^[A-Z0-9]{10,}$/i.test(token) && /\d/.test(token);
 }
 
+export function isShortFirmwareSuffix(value) {
+  return /^[A-Z]{2}\d$/i.test(String(value || "").trim());
+}
+
 function splitRequestedVersion(raw) {
   const normalized = String(raw || "").trim().replace(/[,]+/g, " ");
   const parts = normalized.split(/\s+/).filter(Boolean);
@@ -60,7 +64,10 @@ export function parseFirmwareInput(text, defaultCsc = "CHC") {
       csc: target.csc,
       sourceFormat: sourceFormat(requested.targetText)
     };
-    if (requested.version) result.version = requested.version;
+    if (requested.version) {
+      result.version = requested.version;
+      if (isShortFirmwareSuffix(requested.version)) result.versionKind = "short_suffix";
+    }
     return result;
   } catch (error) {
     return {

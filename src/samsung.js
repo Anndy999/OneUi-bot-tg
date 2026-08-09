@@ -184,7 +184,7 @@ export async function queryFirmwareHybrid(env, model, csc, options = {}) {
         env,
         normalized.model,
         normalized.csc,
-        "",
+        options.requestedVersion || "",
         options
       );
       return officialMetadataResult(normalized.model, normalized.csc, version, null, {
@@ -214,7 +214,7 @@ export async function queryFirmwareHybrid(env, model, csc, options = {}) {
       env,
       normalized.model,
       normalized.csc,
-      "",
+      options.requestedVersion || "",
       options
     );
     return officialMetadataResult(normalized.model, normalized.csc, version, historyError, {

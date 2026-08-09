@@ -429,11 +429,12 @@ function fourPartFirmwareVersion(value) {
  * SmartHistory can return only the PDA/build code for some newer models.
  * Samsung's public version.xml remains the authoritative source for the
  * complete FUS PDA/CSC/CP/PDA tuple needed by BinaryInform.
+ *
+ * Bifrost also reads the historical <upgrade><value> entries from version.xml.
+ * Keep those entries available so a short suffix such as ZF5 can be resolved
+ * even when SmartHistory temporarily returns S02 or has no usable rows.
  */
-export async function resolveOfficialFirmwareVersion(env, model, csc, version, options = {}) {
-  const direct = fourPartFirmwareVersion(version);
-  if (direct) return direct;
-
+export async function resolveOfficialFirmwareVersionCandidates(env, model, csc, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const metadataUrl = `https://fota-cloud-dn.ospserver.net/firmware/${encodeURIComponent(normalizedCsc)}/${encodeURIComponent(normalizedModel)}/version.xml`;
   const response = await fetch(metadataUrl, {
@@ -444,12 +445,35 @@ export async function resolveOfficialFirmwareVersion(env, model, csc, version, o
     throw new Error(`Samsung firmware metadata HTTP ${response.status}`);
   }
   const xml = await response.text();
-  const latest = tagValue(xml, "latest");
-  const resolved = fourPartFirmwareVersion(latest);
-  if (!resolved) {
+  const rawVersions = [
+    tagValue(xml, "latest"),
+    ...collectTags(xml, "upgrade").flatMap((upgrade) => collectTags(upgrade, "value").map((value) => tagValue(value, "value")))
+  ];
+  const versions = [];
+  const seen = new Set();
+  for (const rawVersion of rawVersions) {
+    const version = fourPartFirmwareVersion(rawVersion);
+    if (!version || seen.has(version)) continue;
+    seen.add(version);
+    versions.push(version);
+  }
+  if (!versions.length) {
     throw new Error("Samsung official metadata did not return a complete firmware version");
   }
-  return resolved;
+  return {
+    model: normalizedModel,
+    csc: normalizedCsc,
+    latest: versions[0],
+    versions,
+    rawOutput: xml
+  };
+}
+
+export async function resolveOfficialFirmwareVersion(env, model, csc, version, options = {}) {
+  const direct = fourPartFirmwareVersion(version);
+  if (direct) return direct;
+  const candidates = await resolveOfficialFirmwareVersionCandidates(env, model, csc, options);
+  return candidates.latest;
 }
 
 function md5(input) {

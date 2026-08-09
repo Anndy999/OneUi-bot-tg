@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareDownload, resolveOfficialFirmwareVersion } from "../src/fus.js";
+import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareDownload, resolveOfficialFirmwareVersion, resolveOfficialFirmwareVersionCandidates } from "../src/fus.js";
 import { rankOfficialCscOptions } from "../src/csc-suggestions.js";
 import {
   clearFirmwareMemoryCaches,
@@ -778,7 +778,8 @@ test("firmware input parser accepts a short revision suffix", () => {
     model: "SM-S9110",
     csc: "TGY",
     sourceFormat: "short_model_space_csc",
-    version: "ZF5"
+    version: "ZF5",
+    versionKind: "short_suffix"
   });
 });
 
@@ -1695,6 +1696,21 @@ test("compact SmartHistory versions resolve through official Samsung metadata", 
   };
   const resolved = await resolveOfficialFirmwareVersion({}, "SM-S9480", "TGY", "S9480ZCS4AZG1");
   assert.equal(resolved, "S9480ZCS4AZG1/S9480OZS4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1");
+});
+
+test("official version.xml candidates include historical upgrade versions", async () => {
+  globalThis.fetch = async (url) => {
+    assert.match(String(url), /fota-cloud-dn\.ospserver\.net\/firmware\/TGY\/SM-S9110\/version\.xml/);
+    return new Response([
+      "<firmware><version><latest>S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1</latest></version>",
+      "<upgrade><value>S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5</value></upgrade></firmware>"
+    ].join(""));
+  };
+  const result = await resolveOfficialFirmwareVersionCandidates({}, "SM-S9110", "TGY");
+  assert.deepEqual(result.versions, [
+    "S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1/S9110ZHS7IZG1",
+    "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5/S9110ZHS6IZF5"
+  ]);
 });
 
 test("FUS circuit breaker stops repeated upstream failures during cooldown", async () => {
@@ -2947,7 +2963,7 @@ async function dispatchTelegramTestUpdate(env, update, payloads) {
   for (let round = 0; round < 3; round += 1) await Promise.all([...waits]);
 }
 
-async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvRejectsWrites = false, historyRows = null, telegramUnavailable = false }) {
+async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvRejectsWrites = false, historyRows = null, officialXml = null, telegramUnavailable = false }) {
   const kv = memoryKv();
   const queuedNotifications = [];
   let kvWrites = 0;
@@ -3016,6 +3032,9 @@ async function dispatchFirmwareQueryUpdate({ input, historyDelayMs = 0, kvReject
         version: "S9480NEW1/S9480CSC1/S9480MODEM1"
       })]));
     }
+    if (officialXml !== null && value.includes("version.xml")) {
+      return new Response(officialXml || "<firmware><version><latest>S9480ZCS4AZG1/S9480OZS4AZG1/S9480ZCS4AZG1</latest></version></firmware>");
+    }
     throw new Error(`Unexpected URL: ${value}`);
   };
 
@@ -3077,7 +3096,7 @@ test("exact firmware input returns the selected version and keeps it on the admi
   assert.ok(downloadButton);
 });
 
-test("short firmware suffix input returns the matching full version", async () => {
+test("short firmware suffix input asks for confirmation before the exact query", async () => {
   const selectedVersion = "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5";
   const otherVersion = "S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1";
   const result = await dispatchFirmwareQueryUpdate({
@@ -3088,7 +3107,52 @@ test("short firmware suffix input returns the matching full version", async () =
     ]
   });
   assert.equal(result.response.status, 200);
-  const response = result.telegram.find((entry) => entry.body.text?.includes("指定版本"));
+  const response = result.telegram.find((entry) => entry.body.reply_markup?.inline_keyboard
+    ?.flat()
+    .some((button) => String(button.callback_data || "").startsWith("query:short-confirm:")));
+  assert.ok(response);
+  assert.match(response.body.text, new RegExp(selectedVersion.replaceAll("/", "\\/")));
+
+  const confirmButton = response.body.reply_markup?.inline_keyboard
+    ?.flat()
+    .find((button) => String(button.callback_data || "").startsWith("query:short-confirm:"));
+  assert.ok(confirmButton);
+  const callbackWaits = [];
+  const callbackResponse = await worker.fetch(new Request("https://worker.example/telegram", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": result.workerEnv.WEBHOOK_SECRET
+    },
+    body: JSON.stringify({
+      update_id: Math.floor(Math.random() * 1_000_000_000),
+      callback_query: {
+        id: "short-version-confirm",
+        data: confirmButton.callback_data,
+        message: { message_id: 1, chat: { id: 997 } }
+      }
+    })
+  }), result.workerEnv, { waitUntil(promise) { callbackWaits.push(promise); } });
+  for (let round = 0; round < 5; round += 1) await Promise.allSettled(callbackWaits);
+  assert.equal(callbackResponse.status, 200);
+  const exactResult = result.telegram.find((entry) => entry.body.text?.includes("指定版本"));
+  assert.ok(exactResult);
+  assert.match(exactResult.body.text, new RegExp(selectedVersion.replaceAll("/", "\\/")));
+});
+
+test("short firmware suffix falls back to official version.xml history after empty SmartHistory", async () => {
+  const selectedVersion = "S9110ZHS6IZF5/S9110OZS6IZF5/S9110ZCS6IZF5";
+  const result = await dispatchFirmwareQueryUpdate({
+    input: "9110 tgy zf5",
+    historyRows: [],
+    officialXml: [
+      "<firmware><version><latest>S9110ZHS7IZG1/S9110OZS7IZG1/S9110ZCS7IZG1</latest></version>",
+      `<upgrade><value>${selectedVersion}</value></upgrade></firmware>`
+    ].join("")
+  });
+  const response = result.telegram.find((entry) => entry.body.reply_markup?.inline_keyboard
+    ?.flat()
+    .some((button) => String(button.callback_data || "").startsWith("query:short-confirm:")));
   assert.ok(response);
   assert.match(response.body.text, new RegExp(selectedVersion.replaceAll("/", "\\/")));
 });

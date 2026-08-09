@@ -15,7 +15,7 @@ import {
 import { adminHelpParts, guideText } from "./guides.js";
 import { formatSchedule, processMonitorQueueMessage, runMonitor, runScheduledTasks } from "./monitor.js";
 import { coordinatedFirmwareQuery } from "./firmware-query-coordinator.js";
-import { queryFirmwareHistory } from "./samsung.js";
+import { queryFirmwareHistory, queryFirmwareHybrid } from "./samsung.js";
 import { applyFlagshipProposalDecision } from "./flagship-priority.js";
 import {
   addRolloutTarget,
@@ -26,7 +26,11 @@ import {
   setRolloutChainSettings,
   setRolloutChainStage
 } from "./rollout-chain.js";
-import { querySmartHistory, resolveOfficialFirmwareVersion } from "./fus.js";
+import {
+  querySmartHistory,
+  resolveOfficialFirmwareVersion,
+  resolveOfficialFirmwareVersionCandidates
+} from "./fus.js";
 import {
   cancelFirmwareDownload,
   createFirmwareDownload,
@@ -46,7 +50,7 @@ import {
   performancePanel
 } from "./messages/admin-messages.js";
 import { loadDiagnosticsReport, loadPerformanceSnapshot, maybeSendDiagnosticsAlert } from "./services/system-observability.js";
-import { firmwareInputHelp, parseFirmwareInput } from "./firmware-input-parser.js";
+import { firmwareInputHelp, isShortFirmwareSuffix, parseFirmwareInput } from "./firmware-input-parser.js";
 import {
   cacheOfficialCscSuggestions,
   formatCscOptionLabel,
@@ -593,6 +597,19 @@ export async function processTelegramUpdate(update, env, origin = "", ctx = null
     return jsonResponse({ ok: true, limited: true });
   }
 
+  if (input.versionKind === "short_suffix" && isShortFirmwareSuffix(input.version)) {
+    const placeholder = queryLang === "en"
+      ? `Looking up the full version…\n\n${input.model} · ${input.csc}\nSuffix: ${input.version}`
+      : `正在查找完整版本…\n\n${input.model} · ${input.csc}\n尾码：${input.version}`;
+    const sent = await sendTelegramMessageResult(env, chatId, placeholder);
+    runBackground(ctx, handleShortVersionSelection(env, chatId, input, {
+      identity,
+      ctx,
+      targetMessageId: sent.messageId || null
+    }));
+    return jsonResponse({ ok: true, processing: true, awaitingConfirmation: true });
+  }
+
   runBackground(ctx, handleManualQuery(env, chatId, `${input.model} ${input.csc}${input.version ? ` ${input.version}` : ""}`, {
     identity,
     ctx,
@@ -801,6 +818,152 @@ async function saveExactDownloadCandidate(env, chatId, token, request) {
 
 async function getExactDownloadCandidate(env, chatId, token) {
   return kvGetJson(env, exactDownloadCandidateKey(chatId, token), null);
+}
+
+function shortVersionCandidateKey(chatId, token) {
+  return `query:short-version:${String(chatId || "")}:${String(token || "")}`;
+}
+
+function createShortVersionToken() {
+  return randomId().replace(/[^a-z0-9]/gi, "").slice(0, 12).toLowerCase();
+}
+
+async function saveShortVersionCandidate(env, chatId, token, request) {
+  if (!env.FIRMWARE_KV || !token || !request?.version) return false;
+  await kvPutJson(env, shortVersionCandidateKey(chatId, token), {
+    model: request.model,
+    csc: request.csc,
+    shortVersion: request.version,
+    version: request.fullVersion
+  }, { expirationTtl: ADMIN_DOWNLOAD_SESSION_TTL_SECONDS });
+  return true;
+}
+
+async function getShortVersionCandidate(env, chatId, token) {
+  return kvGetJson(env, shortVersionCandidateKey(chatId, token), null);
+}
+
+async function clearShortVersionCandidate(env, chatId, token) {
+  if (!env.FIRMWARE_KV?.delete) return;
+  await env.FIRMWARE_KV.delete(shortVersionCandidateKey(chatId, token));
+}
+
+function firmwareVersionMatchesSuffix(version, suffix) {
+  const normalizedSuffix = String(suffix || "").trim().toUpperCase();
+  if (!isShortFirmwareSuffix(normalizedSuffix)) return false;
+  return normalizeFirmwareVersion(version)
+    .split("/")
+    .map((part) => part.trim().toUpperCase())
+    .some((part) => part.endsWith(normalizedSuffix));
+}
+
+function shortVersionPromptText(model, csc, shortVersion, fullVersion, lang = "zh") {
+  if (lang === "en") {
+    return [
+      "Matching firmware found",
+      "",
+      `${model} · ${csc}`,
+      `Input suffix: ${shortVersion}`,
+      `Full version: ${fullVersion}`,
+      "",
+      "Query this exact version?"
+    ].join("\n");
+  }
+  return [
+    "找到匹配版本",
+    "",
+    `${model} · ${csc}`,
+    `输入尾码：${shortVersion}`,
+    `完整版本：${fullVersion}`,
+    "",
+    "是否查询这个版本？"
+  ].join("\n");
+}
+
+function shortVersionPromptKeyboard(token, lang = "zh") {
+  return {
+    inline_keyboard: [
+      [
+        { text: lang === "en" ? "Confirm query" : "确认查询", callback_data: `query:short-confirm:${token}` },
+        { text: lang === "en" ? "Cancel" : "取消", callback_data: `query:short-cancel:${token}` }
+      ],
+      [{ text: lang === "en" ? "Home" : "首页", callback_data: "menu:home" }]
+    ]
+  };
+}
+
+async function resolveShortFirmwareVersion(env, input, identity) {
+  const role = identity === "admin" ? "admin" : "interactive";
+  let historyError = null;
+  try {
+    const history = await queryFirmwareHistory(env, input.model, input.csc, {
+      role,
+      requestedVersion: input.version
+    });
+    if (firmwareVersionMatchesSuffix(history.latest, input.version)) {
+      return resolveOfficialFirmwareVersion(env, input.model, input.csc, history.latest, { role });
+    }
+  } catch (error) {
+    historyError = error;
+  }
+
+  const metadata = await resolveOfficialFirmwareVersionCandidates(env, input.model, input.csc, {
+    role,
+    timeoutMs: 5000
+  });
+  const matched = metadata.versions.find((version) => firmwareVersionMatchesSuffix(version, input.version));
+  if (matched) return matched;
+
+  const error = new Error(`Samsung official firmware suffix ${input.version} was not found`);
+  error.code = "FIRMWARE_SHORT_VERSION_NOT_FOUND";
+  error.requestedVersion = input.version;
+  error.availableVersions = metadata.versions.slice(0, 10);
+  if (historyError) error.historyError = historyError;
+  throw error;
+}
+
+async function handleShortVersionSelection(env, chatId, input, options = {}) {
+  const lang = await getUserLanguage(env, chatId);
+  let fullVersion;
+  try {
+    fullVersion = await resolveShortFirmwareVersion(env, input, options.identity);
+  } catch (error) {
+    console.log(`Short firmware version resolution failed: ${error.message}`);
+    const text = error.code === "FIRMWARE_SHORT_VERSION_NOT_FOUND"
+      ? (lang === "en"
+        ? `No official firmware matched suffix ${input.version} for ${input.model} / ${input.csc}.\n\nSend the full version to query it directly.`
+        : `三星官方版本列表中没有找到 ${input.model} / ${input.csc} 的 ${input.version}。\n\n请直接输入完整版本号查询。`)
+      : (lang === "en"
+        ? "Samsung did not return a usable firmware version. Please try again later or enter the full version."
+        : "三星暂时没有返回可用的固件版本，请稍后重试，或直接输入完整版本号。\n\n建议格式：型号 CSC 完整版本号");
+    if (options.targetMessageId) await safeEditOrSend(env, chatId, options.targetMessageId, text, mainMenuKeyboard(options.identity, lang));
+    else await sendTelegramMessage(env, chatId, text, mainMenuKeyboard(options.identity, lang));
+    return;
+  }
+
+  const token = createShortVersionToken();
+  try {
+    const saved = await saveShortVersionCandidate(env, chatId, token, {
+      model: input.model,
+      csc: input.csc,
+      version: input.version,
+      fullVersion
+    });
+    if (!saved) throw new Error("FIRMWARE_KV is not configured");
+  } catch (error) {
+    console.log(`Short firmware candidate was not persisted: ${error.message}`);
+    const text = lang === "en"
+      ? `The official full version is:\n${fullVersion}\n\nSend this full version to continue.`
+      : `三星官方完整版本号为：\n${fullVersion}\n\n请复制完整版本号后重新发送。`;
+    if (options.targetMessageId) await safeEditOrSend(env, chatId, options.targetMessageId, text, mainMenuKeyboard(options.identity, lang));
+    else await sendTelegramMessage(env, chatId, text, mainMenuKeyboard(options.identity, lang));
+    return;
+  }
+
+  const text = shortVersionPromptText(input.model, input.csc, input.version, fullVersion, lang);
+  const markup = shortVersionPromptKeyboard(token, lang);
+  if (options.targetMessageId) await safeEditOrSend(env, chatId, options.targetMessageId, text, markup);
+  else await sendTelegramMessage(env, chatId, text, markup);
 }
 
 function legacyFormatDownloadJob(job, lang = "zh") {
@@ -1086,8 +1249,8 @@ async function renderUserDevices(env, chatId, messageId = null) {
 }
 
 function queryHelpText(lang = "zh") {
-  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also use a short revision suffix.\nExample: 9110 TGY ZF5\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
-  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u4f7f\u7528\u4e09\u4f4d\u7248\u672c\u5c3e\u7801\uff0c\u4f8b\u5982\uff1a9110 TGY ZF5\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
+  if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also enter a short revision suffix.\nExample: 9110 TGY ZF5\nThe bot will show the full official version first and ask for confirmation.\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
+  return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u4f7f\u7528\u4e09\u4f4d\u7248\u672c\u5c3e\u7801\uff0c\u4f8b\u5982\uff1a9110 TGY ZF5\u3002\n\u673a\u5668\u4eba\u4f1a\u5148\u663e\u793a\u5b8c\u6574\u5b98\u65b9\u7248\u672c\u53f7\u5e76\u8bf7\u4f60\u786e\u8ba4\u3002\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
   /* legacy copy retained below */
   if (lang === "en") {
     return [
@@ -1953,6 +2116,7 @@ function beginCallback(callbackId) {
 }
 
 function callbackProgressText(data) {
+  if (data.startsWith("query:short-confirm:") || data.startsWith("query:short-cancel:")) return "正在处理版本选择… / Processing…";
   if (data.startsWith("query:refresh:") || data.startsWith("csc:query:")) return "正在实时查询… / Querying…";
   if (data.startsWith("csc:more:")) return "正在读取官方 CSC… / Loading…";
   if (data.startsWith("device:query:")) return "正在查询… / Querying…";
@@ -2211,6 +2375,61 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       cscSuggestionText(model, requestedCsc, ranked, lang, { expanded: true, page: safePage }),
       cscSuggestionKeyboard(model, requestedCsc, ranked, lang, { expanded: true, page: safePage })
     );
+    return;
+  }
+
+  if (data.startsWith("query:short-cancel:")) {
+    const identity = await getIdentity(env, chatId);
+    if (identity !== "admin" && identity !== "allowed") {
+      await safeEditOrSend(env, chatId, messageId, "你没有权限执行此操作。", mainMenuKeyboard(identity, await getUserLanguage(env, chatId)));
+      return;
+    }
+    const token = data.slice("query:short-cancel:".length);
+    await clearShortVersionCandidate(env, chatId, token);
+    const lang = await getUserLanguage(env, chatId);
+    await safeEditOrSend(
+      env,
+      chatId,
+      messageId,
+      lang === "en" ? "Version query cancelled." : "已取消版本查询。",
+      mainMenuKeyboard(identity, lang)
+    );
+    return;
+  }
+
+  if (data.startsWith("query:short-confirm:")) {
+    const identity = await getIdentity(env, chatId);
+    if (identity !== "admin" && identity !== "allowed") {
+      await safeEditOrSend(env, chatId, messageId, "你没有权限执行此操作。", mainMenuKeyboard(identity, await getUserLanguage(env, chatId)));
+      return;
+    }
+    const token = data.slice("query:short-confirm:".length);
+    const request = await getShortVersionCandidate(env, chatId, token);
+    const lang = await getUserLanguage(env, chatId);
+    if (!request?.model || !request?.csc || !request?.version) {
+      await safeEditOrSend(
+        env,
+        chatId,
+        messageId,
+        lang === "en"
+          ? "This version selection has expired. Send the short suffix again."
+          : "这次版本选择已过期，请重新发送型号、CSC 和版本尾码。",
+        mainMenuKeyboard(identity, lang)
+      );
+      return;
+    }
+    await clearShortVersionCandidate(env, chatId, token);
+    const progress = lang === "en"
+      ? `Querying the selected official version…\n\n${request.model} · ${request.csc}\n${request.version}`
+      : `正在查询选定的三星官方版本…\n\n${request.model} · ${request.csc}\n${request.version}`;
+    await safeEditOrSend(env, chatId, messageId, progress);
+    runBackground(ctx, handleManualQuery(env, chatId, `${request.model} ${request.csc} ${request.version}`, {
+      identity,
+      ctx,
+      query: { model: request.model, csc: request.csc, version: request.version },
+      targetMessageId: messageId,
+      silentPlaceholder: true
+    }));
     return;
   }
 
@@ -4064,9 +4283,10 @@ async function handleManualQuery(env, chatId, text, options = {}) {
   const fetchLive = async () => {
     const coordinatorStartedAt = Date.now();
     const result = query.version
-      ? await queryFirmwareHistory(env, query.model, query.csc, {
+      ? await queryFirmwareHybrid(env, query.model, query.csc, {
           role: identity === "admin" ? "admin" : "interactive",
-          requestedVersion: query.version
+          requestedVersion: query.version,
+          allowOfficialMetadataFallback: true
         })
       : await singleFlightFirmware(query.model, query.csc, () => coordinatedFirmwareQuery(
           env,
