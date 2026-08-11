@@ -40,8 +40,7 @@ chat. Logs should contain error categories, not Tokens or passwords.
 ## Firmware download speed, pause, and resume
 
 Large Samsung files use bounded, staggered HTTP Range connections. The default
-starts at eight and can grow to twelve only after a sustained low-rate sample;
-the recommended high-throughput profile sets both values to twelve. This follows
+starts and stays at eight lanes in the stable-120 profile. This follows
 Bifrost's long-lived segmented-download design while avoiding the old 16/24
 connection burst that could lower total speed through per-IP throttling or
 random concurrent disk writes. It cannot guarantee a speed higher than
@@ -63,13 +62,12 @@ sudo systemctl restart oneui-download.service
 sudo systemctl status oneui-download.service --no-pager -l
 ```
 
-Use `DOWNLOAD_PARALLEL_SEGMENTS=12` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=12`
-for the recommended high-throughput profile. The downloader assigns twelve equal,
-long-lived Range work blocks, commits 4 MiB positional-write batches, and
+Use `DOWNLOAD_PARALLEL_SEGMENTS=8` and `DOWNLOAD_PARALLEL_MAX_SEGMENTS=8`
+for the stable-120 profile. The downloader assigns eight equal, long-lived
+Range work blocks, commits 4 MiB positional-write batches, and
 records progress only after a batch reaches disk. This reduces reconnection
 waves and filesystem overhead without allowing an interrupted batch to create
-a checksum hole. If the VPS route is throttled, lower both values to 8. The
-hard cap is 12; values above it are clamped safely.
+a checksum hole. The hard cap remains 12; values above it are clamped safely.
 
 If a task reports HTTP 401 from the official source, the downloader refreshes
 one shared FUS session without stopping already-authorized healthy lanes, then
@@ -101,9 +99,9 @@ environment lines. Keep the task index out of the public firmware directory:
 [Service]
 Environment=APP_VERSION=2.21.0
 Environment=DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
-Environment=DOWNLOAD_PARALLEL_SEGMENTS=12
-Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=12
-Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=136314880
+Environment=DOWNLOAD_PARALLEL_SEGMENTS=8
+Environment=DOWNLOAD_PARALLEL_MAX_SEGMENTS=8
+Environment=DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND=125829120
 Environment=DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS=8000
 Environment=DOWNLOAD_PARALLEL_SCALE_STEP=2
 Environment=DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304

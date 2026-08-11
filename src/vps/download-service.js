@@ -18,17 +18,19 @@ const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.ne
 const MAX_REDIRECTS = 5;
 const FREE_SPACE_CHECK_INTERVAL_BYTES = 64 * 1024 * 1024;
 const IO_BUFFER_BYTES = 4 * 1024 * 1024;
-const SPEED_WINDOW_MS = 10 * 1000;
-const SPEED_SAMPLE_MS = 1000;
+// Telegram progress cards should reflect the live transfer rate rather than a
+// delayed ten-second average. Keep a short one-second window with sub-second
+// samples so the displayed value reacts quickly without using a single chunk.
+const SPEED_WINDOW_MS = 1000;
+const SPEED_SAMPLE_MS = 250;
 const MAX_PARALLEL_RANGE_COUNT = 512;
 // Samsung FUS can throttle a single client when it opens a large burst of
-// Range requests. Bifrost's public baseline is eight connections; this worker
-// starts there and can add up to twelve only when the measured rate is below
-// the configured target. This keeps the tail responsive without returning to
-// the old 16/24-connection burst profile.
+// Range requests. The stable VPS profile uses eight persistent lanes, started
+// with a small stagger so the connection setup is not a burst. Twelve remains
+// a bounded operator override; the old 16/24-connection profile is not allowed.
 const MAX_PARALLEL_LANE_COUNT = 12;
 const DEFAULT_PARALLEL_LANES = 8;
-const DEFAULT_PARALLEL_MAX_LANES = 12;
+const DEFAULT_PARALLEL_MAX_LANES = 8;
 // Bifrost keeps one native AES-ECB cipher alive and feeds it bounded blocks.
 // Node's native stream performs better with a 4 MiB high-water mark on the
 // VPS profile, while the cipher and output ordering remain Bifrost-compatible.
@@ -105,13 +107,12 @@ export function createDownloadConfig(env = process.env) {
     bodyIdleTimeoutMs,
     jobStaleMs: integer(env.DOWNLOAD_JOB_STALE_MS || Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), Math.max(5 * 60_000, bodyIdleTimeoutMs * 2), 60_000, 60 * 60_000),
     apiRequestTimeoutMs: integer(env.DOWNLOAD_API_REQUEST_TIMEOUT_MS || 30_000, 30_000, 5_000, 5 * 60_000),
-    // Samsung's CDN can limit each TCP connection independently.  These are
+    // Samsung's CDN can limit each TCP connection independently. These are
     // worker lanes, not an unbounded number of requests: a lane receives the
     // next unfinished byte range only after it completes its current range.
-    // Start with a conservative number of persistent Range lanes, then add
-    // small groups only when Samsung's aggregate rate stays below the target.
-    // This avoids turning a temporary authorization refresh into a burst of
-    // new requests while still allowing a rate-limited route to scale up.
+    // The VPS profile starts and stays at eight bounded lanes. Operators can
+    // explicitly opt into up to twelve, while the stagger prevents a
+    // synchronized connection burst.
     parallelSegments,
     parallelMaxSegments,
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
@@ -127,10 +128,14 @@ export function createDownloadConfig(env = process.env) {
     )),
     parallelScaleTargetBytesPerSecond: Math.max(1 * 1024 * 1024, Math.min(
       1024 * 1024 * 1024,
-      bytes(env.DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND, 150 * 1024 * 1024)
+      // Stable-120 profile: target 120 MiB/s before considering another lane.
+      // This is a scaling threshold, not a speed cap.
+      bytes(env.DOWNLOAD_PARALLEL_TARGET_BYTES_PER_SECOND, 120 * 1024 * 1024)
     )),
     parallelScaleIntervalMs: integer(env.DOWNLOAD_PARALLEL_SCALE_INTERVAL_MS || 8_000, 8_000, 1_000, 60_000),
-    parallelScaleStep: integer(env.DOWNLOAD_PARALLEL_SCALE_STEP || 4, 4, 1, 16),
+    // Add lanes in small steps so a route that is already being throttled does
+    // not receive another burst of parallel Range requests.
+    parallelScaleStep: integer(env.DOWNLOAD_PARALLEL_SCALE_STEP || 2, 2, 1, 16),
     decryptMode,
     decryptStreamChunkBytes: integer(
       env.DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES || DEFAULT_DECRYPT_STREAM_CHUNK_BYTES,
@@ -1142,8 +1147,7 @@ export class FirmwareDownloadService {
     // Match Bifrost's layout: one long-lived Range request per lane for the
     // whole transfer. Samsung FUS can sharply throttle a client that keeps
     // opening fresh 256 MiB requests. Equal, persistent ranges avoid that
-    // mid-download collapse while the bounded lane scaler can grow the
-    // conservative eight-lane baseline to the configured twelve-lane ceiling.
+    // mid-download collapse while the eight-lane profile keeps the tail stable.
     const requestedSegmentCount = Math.min(
       MAX_PARALLEL_RANGE_COUNT,
       total,
