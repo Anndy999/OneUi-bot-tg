@@ -105,7 +105,6 @@ import {
   getMonitorSchedule,
   getMonitorSummarySettings,
   getPendingUpdate,
-  getUserDevices,
   getUserLanguage,
   hasCompletedOnboarding,
   identityLabel,
@@ -116,7 +115,6 @@ import {
   removeAdditionalAdmin,
   removeAccessRequest,
   removeMonitorItem,
-  removeUserDevice,
   restoreMonitorOriginalPlan,
   putAckedUpdate,
   recordFirmwareQueryDemand,
@@ -128,11 +126,9 @@ import {
   setCacheSettings,
   setFirmwareQueryCache,
   setUserLanguage,
-  setUserDeviceNotification,
   snoozeMonitorItem,
   tryClaimAllowedUserDailyModelQuery,
   tryStartQueryRateLimit,
-  upsertUserDevice,
   markOnboardingCompleted,
   upsertAccessRequest,
   upsertMonitorItem
@@ -1249,112 +1245,11 @@ function onboardingText(identity, lang = "zh") {
         "致谢",
         "感谢 @Dalee1ee 提供 VPS 支持，感谢 @fahadalijaved 提供固件研究支持。"
       ].join("\n");
-  if (lang === "en") {
-    return [
-      "Welcome to OneUI Firmware Center 👋",
-      "",
-      "1. Send Model + CSC, for example: SM-S948B EUX",
-      "2. Use the result card to refresh, open Samsung notes, or save the device",
-      "3. Open My Devices to query saved devices and manage new-version notifications",
-      "",
-      "Acknowledgements",
-      "Special thanks to @Dalee1ee for providing the VPS server and @fahadalijaved for providing the firmware decryption method.",
-      "",
-      identity === "allowed"
-        ? "You can start querying now. Notifications are sent only when a monitored target has a new version."
-        : "Request access first to query firmware."
-    ].join("\n");
-  }
-  return [
-    "欢迎使用 OneUI 固件中心 👋",
-    "",
-    "1. 发送 Model + CSC，例如：SM-S948B EUX",
-    "2. 在结果卡片中实时刷新、查看三星说明，或保存设备",
-    "3. 打开“我的设备”快捷查询，并管理新版本通知",
-    "",
-    "Acknowledgements",
-    "Special thanks to @Dalee1ee for providing the VPS server and @fahadalijaved for providing the firmware decryption method.",
-    "",
-    identity === "allowed"
-      ? "你现在可以开始查询。只有监控到新版本时才会推送通知。"
-      : "请先申请查询权限，授权后即可查询固件。"
-  ].join("\n");
-}
-
-function userDevicesKeyboard(devices, lang = "zh") {
-  const en = lang === "en";
-  return { inline_keyboard: [
-    ...devices.flatMap((device) => [[
-      { text: en ? "Query" : "\u67e5\u8be2", callback_data: `device:query:${device.model}:${device.csc}` },
-      { text: device.notifyEnabled !== false ? (en ? "Notifications on" : "\u901a\u77e5\u5f00") : (en ? "Notifications off" : "\u901a\u77e5\u5173"), callback_data: `device:toggle:${device.model}:${device.csc}` },
-      { text: en ? "Remove" : "\u79fb\u9664", callback_data: `device:remove:${device.model}:${device.csc}` }
-    ]]),
-    [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
-  ] };
-  /* legacy keyboard retained below */
-  const rows = [];
-  for (const device of devices) {
-    rows.push([
-      { text: `${en ? "🔎 Query" : "🔎 查询"} ${device.name}`.slice(0, 64), callback_data: `device:query:${device.model}:${device.csc}` },
-      { text: device.notifyEnabled !== false ? (en ? "🔔 ON" : "🔔 开启") : (en ? "🔕 OFF" : "🔕 关闭"), callback_data: `device:toggle:${device.model}:${device.csc}` }
-    ]);
-    rows.push([{ text: en ? "Remove" : "移除", callback_data: `device:remove:${device.model}:${device.csc}` }]);
-  }
-  rows.push([{ text: en ? "Back to home" : "返回首页", callback_data: "menu:home" }]);
-  return { inline_keyboard: rows };
-}
-
-async function renderUserDevices(env, chatId, messageId = null) {
-  {
-    const lang = await getUserLanguage(env, chatId);
-    const devices = await getUserDevices(env, chatId);
-    const en = lang === "en";
-    const text = devices.length
-      ? [en ? "📱 My Devices" : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} · ${device.csc}\n   ${en ? "Notifications" : "\u65b0\u7248\u672c\u901a\u77e5"}：${device.notifyEnabled !== false ? (en ? "ON" : "\u5f00") : (en ? "OFF" : "\u5173")}`)].join("\n")
-      : (en ? "📱 My Devices\n\nSave a device from a firmware result." : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907\n\n\u67e5\u8be2\u56fa\u4ef6\u540e\u53ef\u70b9\u201c\u4fdd\u5b58\u8bbe\u5907\u201d\u6dfb\u52a0\u3002");
-    const markup = userDevicesKeyboard(devices, lang);
-    if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
-    return sendTelegramMessage(env, chatId, text, markup);
-  }
-  /* legacy rendering retained below */
-  const lang = await getUserLanguage(env, chatId);
-  const devices = await getUserDevices(env, chatId);
-  const text = devices.length
-    ? (lang === "en"
-      ? ["📱 My Devices", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} / ${device.csc}\n   New-version notifications: ${device.notifyEnabled !== false ? "ON" : "OFF"}`), "", "Use the buttons below to query or manage subscriptions."].join("\n")
-      : ["📱 我的设备", "", ...devices.map((device, index) => `${index + 1}. ${device.name}\n   ${device.model} / ${device.csc}\n   新版本通知：${device.notifyEnabled !== false ? "开启" : "关闭"}`), "", "可使用下方按钮查询或管理订阅。"].join("\n"))
-    : (lang === "en"
-      ? "📱 My Devices\n\nNo devices saved yet. Add one from a firmware result card."
-      : "📱 我的设备\n\n还没有保存设备。完成一次固件查询后，可在结果卡片中添加。")
-  const markup = userDevicesKeyboard(devices, lang);
-  if (messageId) return safeEditOrSend(env, chatId, messageId, text, markup);
-  return sendTelegramMessage(env, chatId, text, markup);
 }
 
 function queryHelpText(lang = "zh") {
   if (lang === "en") return "Firmware query\n\nSend: Model CSC\nExample: SM-S948B EUX\n\nFor a specific version, append the full version after CSC.\nExample: SM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\nYou can also enter a short revision suffix.\nExample: 9110 TGY ZF5\nThe bot will show the full official version first and ask for confirmation.\n\nYou can also send a model only: 9480\n\nIf the CSC is not exact, official Samsung options are shown.";
   return "\u67e5\u8be2\u56fa\u4ef6\n\n\u53d1\u9001\uff1a\u578b\u53f7 CSC\n\u4f8b\u5982\uff1aSM-S948B EUX\n\n\u67e5\u8be2\u6307\u5b9a\u7248\u672c\uff1a\u5728 CSC \u540e\u8ffd\u52a0\u5b8c\u6574\u7248\u672c\u53f7\u3002\n\u4f8b\u5982\uff1aSM-S9480 CHC S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1\n\n\u4e5f\u53ef\u4f7f\u7528\u4e09\u4f4d\u7248\u672c\u5c3e\u7801\uff0c\u4f8b\u5982\uff1a9110 TGY ZF5\u3002\n\u673a\u5668\u4eba\u4f1a\u5148\u663e\u793a\u5b8c\u6574\u5b98\u65b9\u7248\u672c\u53f7\u5e76\u8bf7\u4f60\u786e\u8ba4\u3002\n\n\u4e5f\u53ef\u53ea\u53d1\u9001\u578b\u53f7\uff1a9480\n\nCSC \u4e0d\u7cbe\u786e\u65f6\uff0c\u4f1a\u663e\u793a\u4e09\u661f\u5b98\u65b9\u53ef\u7528\u9009\u9879\u3002";
-  /* legacy copy retained below */
-  if (lang === "en") {
-    return [
-      "Firmware query",
-      "",
-      "Send a model directly: 9480",
-      "Send an exact Model / CSC: SM-S948B EUX",
-      "",
-      "Use Realtime refresh below a result to bypass cache.",
-      "If the CSC is wrong, Samsung-confirmed alternatives will be shown."
-    ].join("\n");
-  }
-  return [
-    "固件查询说明",
-    "",
-    "直接发送型号：9480",
-    "精确指定 Model / CSC：SM-S948B EUX",
-    "",
-    "查询结果下方可点击“实时刷新”跳过缓存。",
-    "CSC 不匹配时会显示三星官方返回的有效候选。"
-  ].join("\n");
 }
 
 
