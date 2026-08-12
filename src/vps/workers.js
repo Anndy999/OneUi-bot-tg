@@ -6,14 +6,6 @@ import { processNotificationQueue } from "../notification-queue.js";
 import { chatIdFromUpdate } from "../telegram.js";
 import { createVpsProductionRuntime } from "./production.js";
 import { startTelegramPolling } from "./telegram-polling.js";
-import {
-  bootstrapTestFirmwarePipeline,
-  handleTestFirmwareTelegramCallback,
-  handleTestFirmwareTelegramCommand,
-  maybeScheduleTestFirmwareScan,
-  processTestFirmwareMaintenanceJob
-} from "./test-firmware-scan.js";
-import { broadcastTestingApologyToAllowedUsers } from "./testing-notice.js";
 
 function retryableQueueMessage(data) {
   let action = "pending";
@@ -30,22 +22,6 @@ function retryableQueueMessage(data) {
     get action() { return action; },
     get delaySeconds() { return delaySeconds; }
   };
-}
-
-async function bootstrapTestFirmwareWithRetry(runtime, logger) {
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const result = await bootstrapTestFirmwarePipeline(runtime, logger);
-      if (result.queued || !["enqueue_failed"].includes(result.reason)) return result;
-      if (attempt === 3) return result;
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    } catch (error) {
-      logger.warn?.(`VPS test firmware startup attempt ${attempt}/3 failed: ${error.message}`);
-      if (attempt === 3) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    }
-  }
-  return { queued: false, reason: "startup_retry_exhausted" };
 }
 
 async function processNotificationJob(job, runtime) {
@@ -83,12 +59,6 @@ async function processTelegramJob(job, runtime, origin) {
   const update = data.update || data;
   const chatId = String(chatIdFromUpdate(update) || `update:${update?.update_id || job.id}`);
   return withTelegramChatOrder(chatId, async () => {
-    if (await handleTestFirmwareTelegramCallback(update, runtime)) {
-      return { ok: true, handled: "test-firmware-callback" };
-    }
-    if (await handleTestFirmwareTelegramCommand(update, runtime)) {
-      return { ok: true, handled: "test-firmware-command" };
-    }
     const pendingBefore = runtime.context.pendingBackground?.() || new Set();
     await processTelegramUpdate(update, runtime.env, origin, runtime.context);
     await runtime.context.waitForBackground({ exclude: pendingBefore });
@@ -97,8 +67,6 @@ async function processTelegramJob(job, runtime, origin) {
 }
 
 async function processMaintenanceJob(job, runtime) {
-  const testFirmwareResult = await processTestFirmwareMaintenanceJob(job, runtime);
-  if (testFirmwareResult) return testFirmwareResult;
   return runtime.runAlarms();
 }
 
@@ -166,21 +134,6 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
         scheduleLastError = String(error?.message || error || "scheduled task failed").slice(0, 240);
         logger.error?.(`VPS scheduled task failed: ${error.message}`);
       }
-      // Keep the fixed-time test-build scan independent from the legacy alarm
-      // path. A transient monitor/alarm error must not make the 18:00 claim
-      // disappear for the entire day.
-      try {
-        await maybeScheduleTestFirmwareScan(runtime);
-      } catch (error) {
-        if (!tickError) {
-          tickError = error;
-          scheduleLastFailureAt = Date.now();
-          scheduleLastError = String(error?.message || error || "test firmware schedule failed").slice(0, 240);
-          logger.error?.(`VPS test firmware schedule failed: ${error.message}`);
-        } else {
-          logger.warn?.(`VPS test firmware schedule skipped after scheduler error: ${error.message}`);
-        }
-      }
       if (!tickError) {
         scheduleLastSuccessAt = Date.now();
         scheduleLastError = "";
@@ -197,12 +150,6 @@ export function startVpsWorkers({ runtime, origin = "", logger = console } = {})
   };
   const timer = setInterval(tick, runtime.config.scheduleIntervalMs);
   timer.unref?.();
-  void bootstrapTestFirmwareWithRetry(runtime, logger).catch((error) => {
-    logger.error?.(`VPS test firmware startup pipeline failed: ${error.message}`);
-  });
-  void broadcastTestingApologyToAllowedUsers(runtime, logger).catch((error) => {
-    logger.warn?.(`VPS testing apology notice failed: ${error.message}`);
-  });
   void ensureTelegramCommands(runtime.env).catch((error) => {
     logger.warn?.(`VPS Telegram shortcut command sync failed: ${error.message}`);
   });

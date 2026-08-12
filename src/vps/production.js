@@ -10,7 +10,6 @@ import { createVpsQueues } from "../runtime/queue.js";
 import { MonitorScheduler } from "../monitor-scheduler.js";
 import { FirmwareQueryCoordinator } from "../firmware-query-coordinator.js";
 import { createVpsConfig, telegramSendAllowed } from "./config.js";
-import { createTestFirmwareHistoryRepository } from "./test-firmware-history.js";
 
 function required(value, name) {
   const result = String(value || "").trim();
@@ -161,7 +160,6 @@ export async function createVpsProductionRuntime({ env = process.env, logger = c
     config,
     env: workerEnv,
     context,
-    testFirmwareHistory: createTestFirmwareHistoryRepository(pool),
     pool,
     redis,
     queues,

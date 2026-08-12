@@ -43,13 +43,11 @@ import {
 } from "./vps/download-client.js";
 import { logQueryMetric } from "./metrics.js";
 import {
-  diagnosticsPanel,
   monitorIntervalPresetPanel,
   monitorIntervalsPanel,
-  monitorEventsPanel,
-  performancePanel
+  monitorEventsPanel
 } from "./messages/admin-messages.js";
-import { loadDiagnosticsReport, loadPerformanceSnapshot, maybeSendDiagnosticsAlert } from "./services/system-observability.js";
+import { maybeSendDiagnosticsAlert } from "./services/system-observability.js";
 import { firmwareInputHelp, isShortFirmwareSuffix, parseFirmwareInput } from "./firmware-input-parser.js";
 import {
   cacheOfficialCscSuggestions,
@@ -329,7 +327,6 @@ const UNAUTHORIZED_TELEGRAM_COMMANDS = [
 
 const ALLOWED_TELEGRAM_COMMANDS = [
   { command: "start", description: "打开主菜单" },
-  { command: "devices", description: "我的设备" },
   { command: "help", description: "使用说明" }
 ];
 
@@ -415,7 +412,7 @@ async function clearTelegramCommandsForChat(env, chatId) {
 function telegramCommandsSyncKey() {
   // Bump this when the command list changes. A shared VPS/Cloudflare KV may
   // already contain the application-version marker from an older command set.
-  return `telegram:commands:${APP_VERSION}:compact-v1`;
+  return `telegram:commands:${APP_VERSION}:compact-v2`;
 }
 
 export async function ensureTelegramCommands(env) {
@@ -754,6 +751,21 @@ function languageModeKeyboard(identity = "unauthorized", lang = "zh") {
 }
 
 async function mainMenuText(env, identity, lang = "zh") {
+  if (identity === "admin") {
+    return lang === "en"
+      ? "Administrator\n\nChoose Query firmware, Firmware download, or Rollout chain."
+      : "\u7ba1\u7406\u5458\n\n\u8bf7\u9009\u62e9\uff1a\u67e5\u8be2\u56fa\u4ef6\u3001\u4e0b\u8f7d\u56fa\u4ef6\u6216\u67e5\u770b\u53d1\u5e03\u94fe\u3002";
+  }
+  if (identity === "allowed") {
+    return lang === "en"
+      ? "Samsung Firmware\n\nSend Model + CSC, for example: SM-S948B EUX."
+      : "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u53d1\u9001\u201c\u578b\u53f7 CSC\u201d\u5373\u53ef\u67e5\u8be2\u3002\n\u4f8b\u5982\uff1aSM-S948B EUX";
+  }
+  if (identity === "unauthorized") {
+    return lang === "en"
+      ? "Samsung Firmware\n\nRequest access to query firmware."
+      : "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u7533\u8bf7\u6743\u9650\u540e\u5373\u53ef\u67e5\u8be2\u56fa\u4ef6\u3002";
+  }
   if (lang === "en") {
     if (identity === "admin") {
       const [items, requests, chains] = await Promise.all([getMonitorItems(env), getAccessRequests(env), getRolloutChains(env)]);
@@ -764,7 +776,6 @@ async function mainMenuText(env, identity, lang = "zh") {
       return [
         "Admin",
         `Monitoring: ${regular.length} · paused ${paused} · pending ${requests.length}`,
-        "Test firmware: runs automatically after deployment",
         `Rollout: S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`,
       ].join("\n");
     }
@@ -780,7 +791,6 @@ async function mainMenuText(env, identity, lang = "zh") {
     return [
       "管理员",
       `监控：${regular.length} 个 · 暂停 ${paused} · 待审批 ${requests.length}`,
-      "测试固件：机器人更新后自动解密",
       `发布链：S26 ${rolloutMenuStatus(s26, chains.chains, lang)} · S25 ${rolloutMenuStatus(s25, chains.chains, lang)}`
     ].join("\n");
   }
@@ -788,17 +798,19 @@ async function mainMenuText(env, identity, lang = "zh") {
   return "Samsung \u56fa\u4ef6\u67e5\u8be2\n\n\u7533\u8bf7\u6743\u9650\u540e\u5373\u53ef\u67e5\u8be2\u56fa\u4ef6\u3002";
 }
 
-function mainMenuKeyboard(identity, lang = "zh") {
+function mainMenuKeyboard(identity, lang = "zh", owner = false) {
   const en = lang === "en";
   if (identity === "admin") {
-    return { inline_keyboard: [
-      [{ text: en ? "Monitoring" : "\ud83d\udce1 监控管理", callback_data: "admin:monitor-menu" }, { text: en ? "Firmware tasks" : "📦 固件任务", callback_data: "admin:firmware-menu" }],
-      [{ text: en ? "Permissions" : "\ud83d\udc65 权限管理", callback_data: "admin:access-menu" }, { text: en ? "System" : "\u2699\ufe0f 系统", callback_data: "admin:system-menu" }]
-    ] };
+    const rows = [
+      [{ text: en ? "Query firmware" : "\ud83d\udd0d 查询固件", callback_data: "menu:query-help" }, { text: en ? "Firmware download" : "📥 下载", callback_data: "admin:download-menu" }],
+      [{ text: en ? "Rollout chain" : "📣 发布链", callback_data: "admin:rollout-menu" }]
+    ];
+    if (owner) rows.push([{ text: en ? "Users & admins" : "\ud83d\udc65 用户与管理员", callback_data: "admin:access-menu" }]);
+    return { inline_keyboard: rows };
   }
   if (identity === "allowed") {
     return { inline_keyboard: [
-      [{ text: en ? "Query firmware" : "\ud83d\udd0d \u67e5\u8be2\u56fa\u4ef6", callback_data: "menu:query-help" }, { text: en ? "My Devices" : "\ud83d\udcf1 \u6211\u7684\u8bbe\u5907", callback_data: "device:list" }],
+      [{ text: en ? "Query firmware" : "\ud83d\udd0d \u67e5\u8be2\u56fa\u4ef6", callback_data: "menu:query-help" }],
       [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
     ] };
   }
@@ -816,42 +828,6 @@ function adminMoreKeyboard(lang = "zh") {
     [{ text: en ? "Language" : "语言", callback_data: "menu:language" }],
     [{ text: en ? "Back" : "返回", callback_data: "menu:home" }]
   ] };
-}
-
-function firmwareTasksText(lang = "zh") {
-  if (lang === "en") {
-    return [
-      "📦 Firmware tasks",
-      "",
-      "Downloads: Samsung verification first, then administrator confirmation.",
-      "Test firmware: SM-S948N / KOO starts automatically after each deployed release. Confirm KOO only after reviewing its result; SM-S948B / EUX official monitoring starts only after its decryption succeeds."
-    ].join("\n");
-  }
-  return [
-    "📦 固件任务",
-    "",
-    "下载：先验证三星官方固件，确认后才开始下载。",
-    "测试固件：每次发布更新后自动解密 SM-S948N / KOO；确认 KOO 结果后才解密 SM-S948B / EUX，且仅在 EUX 解密成功后开启其正式监控。"
-  ].join("\n");
-}
-
-function firmwareTasksKeyboard(lang = "zh") {
-  const en = lang === "en";
-  return {
-    inline_keyboard: [
-      [
-        { text: en ? "Firmware download" : "📥 固件下载", callback_data: "admin:download-menu" },
-        { text: en ? "Test firmware" : "🧪 测试固件", callback_data: "test-fw:menu" }
-      ],
-      [{ text: en ? "Back" : "返回主菜单", callback_data: "menu:home" }]
-    ]
-  };
-}
-
-async function renderFirmwareTasksMenu(env, chatId, messageId = null) {
-  const lang = await getUserLanguage(env, chatId);
-  if (messageId) return safeEditOrSend(env, chatId, messageId, firmwareTasksText(lang), firmwareTasksKeyboard(lang));
-  return sendTelegramMessage(env, chatId, firmwareTasksText(lang), firmwareTasksKeyboard(lang));
 }
 
 const ADMIN_DOWNLOAD_SESSION_TTL_SECONDS = 10 * 60;
@@ -1230,7 +1206,7 @@ function adminMoreText(lang = "zh") {
 async function showMainMenu(env, chatId, identity, messageId = null) {
   const lang = await getUserLanguage(env, chatId);
   const text = await mainMenuText(env, identity, lang);
-  const keyboard = mainMenuKeyboard(identity, lang);
+  const keyboard = mainMenuKeyboard(identity, lang, isOwnerChatId(env, chatId));
   if (messageId) return safeEditOrSend(env, chatId, messageId, text, keyboard);
   return sendTelegramMessage(env, chatId, text, keyboard);
 }
@@ -1238,17 +1214,41 @@ async function showMainMenu(env, chatId, identity, messageId = null) {
 function userSettingsKeyboard(identity, lang = "zh") {
   const en = lang === "en";
   return { inline_keyboard: [
-    [{ text: en ? "My info" : "\u6211\u7684\u4fe1\u606f", callback_data: "user:whoami" }, { text: en ? "Status" : "\u670d\u52a1\u72b6\u6001", callback_data: "user:status" }],
+    [{ text: en ? "My info" : "\u6211\u7684\u4fe1\u606f", callback_data: "user:whoami" }],
     [{ text: en ? "Language" : "\u8bed\u8a00", callback_data: "menu:language" }],
     [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
   ] };
 }
 
 function userSettingsText(lang = "zh") {
-  return lang === "en" ? "Settings\n\nManage language and view account or service status." : "\u8bbe\u7f6e\n\n\u8bbe\u7f6e\u8bed\u8a00\uff0c\u6216\u67e5\u770b\u8d26\u53f7\u4e0e\u670d\u52a1\u72b6\u6001\u3002";
+  return lang === "en" ? "Settings\n\nManage language and view your account information." : "\u8bbe\u7f6e\n\n\u8bbe\u7f6e\u8bed\u8a00\u6216\u67e5\u770b\u8d26\u53f7\u4fe1\u606f\u3002";
 }
 
 function onboardingText(identity, lang = "zh") {
+  const canQuery = identity === "admin" || identity === "allowed";
+  return lang === "en"
+    ? [
+        "Welcome to OneUI Firmware Center",
+        "",
+        "Send Model + CSC, for example: SM-S948B EUX.",
+        "Use Refresh to obtain the latest result.",
+        canQuery
+          ? "New monitored firmware is sent once to every authorized user."
+          : "Request access first to query firmware.",
+        "",
+        "Acknowledgements",
+        "Special thanks to @Dalee1ee for VPS support and @fahadalijaved for firmware research."
+      ].join("\n")
+    : [
+        "欢迎使用 OneUI 固件中心",
+        "",
+        "发送“型号 CSC”，例如：SM-S948B EUX。",
+        "查询结果可随时刷新。",
+        canQuery ? "监控到新固件后，所有已授权用户都会收到一次通知。" : "请先申请权限后再查询固件。",
+        "",
+        "致谢",
+        "感谢 @Dalee1ee 提供 VPS 支持，感谢 @fahadalijaved 提供固件研究支持。"
+      ].join("\n");
   if (lang === "en") {
     return [
       "Welcome to OneUI Firmware Center 👋",
@@ -1361,59 +1361,13 @@ function queryHelpText(lang = "zh") {
 function firmwareResultKeyboard(model, csc, lang = "zh", identity = "allowed", options = {}) {
   const normalizedModel = String(model || "").toUpperCase();
   const normalizedCsc = String(csc || "").toUpperCase();
-  {
   const en = lang === "en";
-  const rows = [[
-    { text: en ? "Refresh" : "\u5237\u65b0", callback_data: `query:refresh:${normalizedModel}:${normalizedCsc}` },
-    { text: en ? "Samsung official" : "\u4e09\u661f\u5b98\u65b9", url: `https://doc.samsungmobile.com/${normalizedModel}/${normalizedCsc}/doc.html` }
-  ]];
-  if (identity === "admin" || identity === "allowed") rows.push([{ text: en ? "Save device" : "\u4fdd\u5b58\u8bbe\u5907", callback_data: `device:add:${normalizedModel}:${normalizedCsc}` }]);
-  if (identity === "admin") rows.push([
-    { text: en ? "Monitor" : "\u52a0\u5165\u76d1\u63a7", callback_data: `monitor-item:add:${normalizedModel}:${normalizedCsc}` },
-    { text: en ? "Clear cache" : "\u6e05\u7f13\u5b58", callback_data: `admin:cache-target:${normalizedModel}:${normalizedCsc}` }
-  ]);
+  const rows = [[{ text: en ? "Refresh" : "\u5237\u65b0", callback_data: `query:refresh:${normalizedModel}:${normalizedCsc}` }]];
   if (identity === "admin" && (!options.requestedVersion || options.downloadToken)) rows.push([{ text: en ? "Download firmware" : "\u4e0b\u8f7d\u56fa\u4ef6", callback_data: options.downloadToken
     ? `admin:download-exact:${options.downloadToken}`
     : `admin:download-start:${normalizedModel}:${normalizedCsc}` }]);
   rows.push([{ text: en ? "Home" : "\u9996\u9875", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
-  }
-  /* legacy keyboard retained below */
-  const rows = [[
-    {
-      text: lang === "en" ? "🔄 Realtime refresh" : "🔄 实时刷新",
-      callback_data: `query:refresh:${normalizedModel}:${normalizedCsc}`
-    },
-    {
-      text: lang === "en" ? "📄 Official notes" : "📄 官方说明",
-      url: `https://doc.samsungmobile.com/${normalizedModel}/${normalizedCsc}/doc.html`
-    }
-  ]];
-  if (identity === "admin" || identity === "allowed") {
-    rows.push([{
-      text: lang === "en" ? "📱 Add to My Devices" : "📱 添加到我的设备",
-      callback_data: `device:add:${normalizedModel}:${normalizedCsc}`
-    }]);
-  }
-  if (identity === "admin") {
-    rows.push([
-      {
-        text: lang === "en" ? "Monitor target" : "加入 / 查看监控",
-        callback_data: `monitor-item:add:${normalizedModel}:${normalizedCsc}`
-      },
-      {
-        text: lang === "en" ? "Clear cache" : "清理此缓存",
-        callback_data: `admin:cache-target:${normalizedModel}:${normalizedCsc}`
-      }
-    ]);
-  }
-  rows.push([{
-    text: lang === "en" ? "Back to home" : "返回首页",
-    callback_data: "menu:home"
-  }]);
-  return {
-    inline_keyboard: rows
-  };
 }
 
 
@@ -2284,8 +2238,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity === "admin") {
-      const settings = await getCacheSettings(env);
-      await safeEditOrSend(env, chatId, messageId, systemMenuText(settings, env, lang), systemMenuKeyboard(settings, lang));
+      await showMainMenu(env, chatId, identity, messageId);
     } else {
       await safeEditOrSend(env, chatId, messageId, userSettingsText(lang), userSettingsKeyboard(identity, lang));
     }
@@ -2303,8 +2256,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
     if (identity === "admin") {
-      const settings = await getCacheSettings(env);
-      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), systemMenuKeyboard(settings, lang));
+      await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang, isOwnerChatId(env, chatId)));
     } else {
       await safeEditOrSend(env, chatId, messageId, guideText(identity, lang), mainMenuKeyboard(identity, lang));
     }
@@ -2327,10 +2279,13 @@ async function handleCallback(callbackQuery, env, ctx = null) {
   if (data === "user:whoami" || data === "user:status") {
     const identity = await getIdentity(env, chatId);
     const lang = await getUserLanguage(env, chatId);
-    const text = data === "user:whoami"
-      ? formatWhoami(chatId, identity, lang)
-      : await formatStatus(env, chatId, identity, lang);
-    await safeEditOrSend(env, chatId, messageId, text, userSettingsKeyboard(identity, lang));
+    await safeEditOrSend(env, chatId, messageId, formatWhoami(chatId, identity, lang), userSettingsKeyboard(identity, lang));
+    return;
+  }
+
+  if (data === "device:list" || data.startsWith("device:")) {
+    const identity = await getIdentity(env, chatId);
+    await showMainMenu(env, chatId, identity, messageId);
     return;
   }
 
@@ -2724,7 +2679,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     return;
   }
   if (data === "admin:firmware-menu") {
-    await renderFirmwareTasksMenu(env, chatId, messageId);
+    await renderDownloadMenu(env, chatId, messageId);
     return;
   }
   if (data === "admin:download-menu") {
@@ -2996,6 +2951,11 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
   }
 
   if (data === "admin:access-menu") {
+    if (!isOwnerChatId(env, chatId)) {
+      const identity = await getIdentity(env, chatId);
+      await showMainMenu(env, chatId, identity, messageId);
+      return;
+    }
     const [settings, requests, users] = await Promise.all([
       getAccessSettings(env),
       getAccessRequests(env),
@@ -3019,31 +2979,9 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     return;
   }
 
-  if (data === "admin:performance") {
-    const snapshot = await loadPerformanceSnapshot(env, 24);
-    await safeEditOrSend(env, chatId, messageId, performancePanel(snapshot.summary, snapshot.budget, lang), {
-      inline_keyboard: [
-        [{ text: lang === "en" ? "Refresh" : "刷新", callback_data: "admin:performance" }],
-        [{ text: lang === "en" ? "Back" : "返回系统设置", callback_data: "admin:system-menu" }]
-      ]
-    });
-    return;
-  }
-
-  if (data === "admin:diagnostics") {
-    const report = await loadDiagnosticsReport(env);
-    await safeEditOrSend(env, chatId, messageId, diagnosticsPanel(report, lang), {
-      inline_keyboard: [
-        [{ text: lang === "en" ? "Run again" : "重新诊断", callback_data: "admin:diagnostics" }],
-        [{ text: lang === "en" ? "Back" : "返回系统设置", callback_data: "admin:system-menu" }]
-      ]
-    });
-    return;
-  }
-
-  if (data === "admin:system-menu") {
-    const settings = await getCacheSettings(env);
-    await safeEditOrSend(env, chatId, messageId, systemMenuText(settings, env, lang), systemMenuKeyboard(settings, lang));
+  if (data === "admin:performance" || data === "admin:diagnostics" || data === "admin:system-menu") {
+    const identity = await getIdentity(env, chatId);
+    await showMainMenu(env, chatId, identity, messageId);
     return;
   }
 
@@ -4036,20 +3974,8 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     return;
   }
 
-  if (command === "/status") {
-    await sendTelegramMessage(env, chatId, await formatStatus(env, chatId, identity, await getUserLanguage(env, chatId)));
-    return;
-  }
-
   if (command === "/devices" || command === "/mydevices" || command === "/subscriptions") {
-    if (!(await isAuthorizedForQuery(env, chatId))) {
-      const lang = await getUserLanguage(env, chatId);
-      await sendTelegramMessage(env, chatId, lang === "en"
-        ? "Query access is required before using My Devices."
-        : "获得查询权限后才能使用“我的设备”。", mainMenuKeyboard(identity, lang));
-      return;
-    }
-    await renderUserDevices(env, chatId);
+    await showMainMenu(env, chatId, identity);
     return;
   }
 

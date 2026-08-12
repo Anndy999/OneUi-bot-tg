@@ -65,7 +65,6 @@ import {
   getMonitorLastCheck,
   getMonitorRuntime,
   getMonitorSchedule,
-  getUserDevices,
   getUserLanguage,
   listPendingUpdates,
   deletePendingUpdate,
@@ -901,26 +900,11 @@ async function notifyFlagshipPriorityPrompts(env, item, parsed, now, adminId) {
 async function notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adminIds = []) {
   const users = await getAllowedUsers(env);
   const managerIds = new Set((Array.isArray(adminIds) ? adminIds : [adminIds]).map((id) => String(id || "")));
-  const candidates = users.filter((user) => {
+  const recipients = users.filter((user) => {
     const chatId = String(user.chatId || "").trim();
     return chatId && !managerIds.has(chatId);
   });
   const fingerprint = firmwareVersionFingerprint(parsed.latest);
-  const recipients = [];
-  for (const user of candidates) {
-    const chatId = String(user.chatId || "").trim();
-    // Preserve the historical broadcast behavior for users who have not yet
-    // configured My Devices. Once a user saves a device, the center becomes
-    // their opt-in subscription list for matching targets only.
-    const devices = await getUserDevices(env, chatId);
-    if (!devices.length || devices.some((device) =>
-      device.model === String(item.model || "").toUpperCase() &&
-      device.csc === String(item.csc || "").toUpperCase() &&
-      device.notifyEnabled !== false
-    )) {
-      recipients.push(user);
-    }
-  }
   const results = await mapLimited(recipients, telegramNotifyConcurrency(env), async (user) => {
     const chatId = String(user.chatId || "").trim();
     try {
@@ -950,15 +934,11 @@ async function notifyAllowedUsersOfUpdate(env, item, oldLatest, parsed, now, adm
   };
 }
 
-function updateUserKeyboard(model, csc, lang = "zh") {
+function updateUserKeyboard(_model, _csc, lang = "zh") {
   const en = lang === "en";
   return {
     inline_keyboard: [
-      [
-        { text: en ? "🔎 Query details" : "🔎 查询详情", callback_data: `query:refresh:${model}:${csc}` },
-        { text: en ? "📄 Official notes" : "📄 官方说明", url: docUrl(model, csc) }
-      ],
-      [{ text: en ? "Home" : "返回首页", callback_data: "menu:home" }]
+      [{ text: en ? "Open menu" : "打开菜单", callback_data: "menu:home" }]
     ]
   };
 }

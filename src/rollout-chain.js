@@ -331,52 +331,6 @@ export async function setRolloutChainStage(env, chainId, stageId) {
   return saveChains(env, chains);
 }
 
-// The test-build pipeline uses the same persisted rollout chain as ordinary
-// monitoring. This is the single gate that opens S26 Korea after the owner or
-// an administrator confirms the verified KOO test build. EUX/TGY/CHC remain
-// prepared-only until the currently active region produces an official update.
-export async function activateTestFirmwareRolloutStage(env, chainId = "s26", stageId = "kr") {
-  const chains = await getRolloutChains(env);
-  const chain = findChain(chains, chainId);
-  const stage = findStage(chain, stageId);
-  if (!chain || !stage) throw new Error("测试固件发布链或地区不存在");
-  if (!stage.targets.length) throw new Error("测试固件发布链韩版没有可监控的官方型号");
-  chain.enabled = true;
-  chain.status = "active";
-  chain.activeStageId = stage.id;
-  chain.pendingProposalId = "";
-  await activateOnlyStage(env, chain, stage);
-  return saveChains(env, chains);
-}
-
-// Recover an already-confirmed pipeline after a restart or an older release
-// that had temporarily paused the legacy rollout state. Never reset a chain
-// that is already progressing through a later region.
-export async function ensureTestFirmwareRolloutStage(env, chainId = "s26", stageId = "kr") {
-  const chains = await getRolloutChains(env);
-  const chain = findChain(chains, chainId);
-  if (!chain) throw new Error("测试固件发布链不存在");
-  if (chain.enabled && ["active", "awaiting_confirmation"].includes(chain.status)) return chains;
-  if (chain.status === "completed") return chains;
-  return activateTestFirmwareRolloutStage(env, chainId, stageId);
-}
-
-// Pause both legacy rollout chains without deleting their targets or history.
-// Test-build confirmation owns the temporary EUX activation while this gate is
-// paused, so the existing rollout state remains recoverable.
-export async function pauseAllRolloutChains(env) {
-  const chains = await getRolloutChains(env);
-  let changed = false;
-  for (const chain of chains.chains) {
-    if (!chain.enabled && !chain.pendingProposalId && chain.status === "needs_configuration") continue;
-    chain.enabled = false;
-    chain.status = "needs_configuration";
-    chain.pendingProposalId = "";
-    changed = true;
-  }
-  return changed ? saveChains(env, chains) : chains;
-}
-
 function nextBeijingMonthStart(now = new Date()) {
   const parts = beijingParts(now);
   return new Date(Date.UTC(Number(parts.year), Number(parts.month), 1, -8, 0, 0));
@@ -456,7 +410,6 @@ export async function isRolloutItemWithinSchedule(env, item, now = new Date()) {
   const chainId = cleanText(item?.rolloutChainId, 48);
   const stageId = cleanText(item?.rolloutStageId, 48);
   if (!chainId || !stageId) return true;
-  if (item?.testFirmwareMonitorOverride === true) return item.enabled !== false;
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
   if (!chain || !chain.enabled) return false;

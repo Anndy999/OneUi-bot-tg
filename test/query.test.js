@@ -962,13 +962,13 @@ test("a single administrator interval value creates one uniform default monitor 
   assert.equal(uniformMonitorIntervalSettings(1441), null);
 });
 
-test("administrator help is newline-formatted, bilingual, and documents monitor interval", () => {
+test("administrator help is newline-formatted and keeps only the compact fallback commands", () => {
   const zh = adminHelpParts("zh");
   const en = adminHelpParts("en");
   assert.ok(zh.every((part) => typeof part === "string"));
   assert.ok(en.every((part) => typeof part === "string"));
-  assert.match(zh.join("\n"), /\/moninterval 15/);
-  assert.match(en.join("\n"), /Set one default monitoring interval/);
+  assert.match(zh.join("\n"), /\/download/);
+  assert.match(en.join("\n"), /download official firmware/);
   assert.doesNotMatch(en.join("\n"), /管理员备用命令/);
 });
 
@@ -1090,8 +1090,7 @@ test("compact firmware and update cards keep only the canonical full version", (
   assert.match(queryCard, /S9480NEW\/S9480CSC\/S9480MODEM/);
   assert.doesNotMatch(queryCard, /S9480MODEM\/S9480NEW/);
   assert.doesNotMatch(queryCard, /PDA：|CSC 版本：|MODEM：|版本解析：/);
-  assert.match(queryCard, /Android：16/);
-  assert.doesNotMatch(queryCard, /B\(Android 16\)/);
+  assert.doesNotMatch(queryCard, /Android|安卓|B\(Android 16\)/);
 
   const updateCard = formatMonitorNotification(
     { model: "SM-S9480", csc: "TGY", name: "S26 Ultra Hong Kong" },
@@ -3222,10 +3221,9 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   assert.ok(payloads.some((entry) => entry.url.includes("/setMyCommands")));
   const callbacks = sent.body.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
   assert.deepEqual(callbacks, [
-    "admin:monitor-menu",
-    "admin:firmware-menu",
-    "admin:access-menu",
-    "admin:system-menu"
+    "menu:query-help",
+    "admin:download-menu",
+    "admin:rollout-menu"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
@@ -3395,9 +3393,9 @@ test("S25 waits for S26 Korea and only the recovery path can start it manually",
 
 test("administrator help explains role boundaries and administrator setup", () => {
   const text = adminHelpParts("zh").join("\n");
-  assert.match(text, /权限：所有者由 TELEGRAM_CHAT_ID 确定/);
-  assert.match(text, /对方先私聊机器人发送 \/whoami/);
-  assert.match(text, /仅所有者：\/admins/);
+  assert.match(text, /仅所有者/);
+  assert.match(text, /先私聊机器人发送 \/whoami/);
+  assert.match(text, /\/admins/);
 });
 
 test("rollout chains require exact configured targets and create one approval proposal", async () => {
@@ -3476,11 +3474,9 @@ test("Telegram command sync clears inherited scopes and publishes the compact co
   const adminSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.chat_id === "992");
   assert.ok(adminSync);
   assert.deepEqual(adminSync.body.commands.map((item) => item.command), ["start", "admin", "download", "help"]);
-  assert.equal(adminSync.body.commands.some((item) => item.command === "testscan"), false);
-  assert.equal(adminSync.body.commands.some((item) => item.command === "testconfirm"), false);
   const allowedSync = payloads.find((entry) => entry.url.includes("/setMyCommands") && entry.body.scope?.chat_id === "993");
   assert.ok(allowedSync);
-  assert.deepEqual(allowedSync.body.commands.map((item) => item.command), ["start", "devices", "help"]);
+  assert.deepEqual(allowedSync.body.commands.map((item) => item.command), ["start", "help"]);
 });
 
 test("My Devices persists shortcuts, deduplicates targets, and toggles subscriptions", async () => {
@@ -3507,7 +3503,7 @@ test("My Devices persists shortcuts, deduplicates targets, and toggles subscript
   assert.deepEqual(await getUserDevices(env, "device-user"), []);
 });
 
-test("first /start shows onboarding once and My Devices is available to the owner", async () => {
+test("first /start shows onboarding once and retired device commands return to the main menu", async () => {
   resetStateMemoryCache();
   const payloads = [];
   const env = {
@@ -3524,7 +3520,7 @@ test("first /start shows onboarding once and My Devices is available to the owne
   assert.equal(await hasCompletedOnboarding(env, "9911"), true);
   assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")));
   const onboarding = payloads.find((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心"));
-  assert.match(String(onboarding.body.text || ""), /Acknowledgements/);
+  assert.match(String(onboarding.body.text || ""), /致谢/);
   assert.match(String(onboarding.body.text || ""), /@Dalee1ee/);
   assert.match(String(onboarding.body.text || ""), /@fahadalijaved/);
   const secondPayloads = [];
@@ -3533,13 +3529,12 @@ test("first /start shows onboarding once and My Devices is available to the owne
     message: { message_id: 2, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
   }, secondPayloads);
   assert.equal(secondPayloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")), false);
-  await upsertUserDevice(env, "9911", { model: "SM-S948B", csc: "EUX" });
   const devicePayloads = [];
   await dispatchTelegramTestUpdate(env, {
     update_id: 700012,
     message: { message_id: 3, chat: { id: 9911 }, from: { id: 9911 }, text: "/devices" }
   }, devicePayloads);
-  assert.ok(devicePayloads.some((entry) => String(entry.body.text || "").includes("我的设备")));
+  assert.ok(devicePayloads.some((entry) => String(entry.body.text || "").includes("查询固件")));
 });
 
 test("monitor target buttons change priority and require delete confirmation", async () => {

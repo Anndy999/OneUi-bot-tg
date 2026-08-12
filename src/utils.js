@@ -409,8 +409,6 @@ export function formatFirmwareResult(result, options = {}) {
   const versionLabel = result.requestedVersion
     ? (lang === "en" ? "Selected version" : "指定版本")
     : (lang === "en" ? "Latest version" : "最新版本");
-  const android = displayAndroidVersion(result.android, lang);
-  const hasAndroid = android && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(android);
   const hasBuildDate = buildDate && !/^(未知|unknown|n\/a|none|null|\?+)$/i.test(buildDate);
 
   if (lang === "en") {
@@ -421,7 +419,6 @@ export function formatFirmwareResult(result, options = {}) {
       "",
       versionLabel,
       latest,
-      ...(hasAndroid ? ["", `Android: ${android}`] : []),
       ...(hasBuildDate ? ["", `Build: ${buildDate}`] : [])
     ];
     if (result.degraded && result.sourceType !== "version_xml") {
@@ -437,7 +434,6 @@ export function formatFirmwareResult(result, options = {}) {
     "",
     versionLabel,
     latest,
-    ...(hasAndroid ? ["", `Android：${android}`] : []),
     ...(hasBuildDate ? ["", `构建：${buildDate}`] : [])
   ];
   if (result.degraded && result.sourceType !== "version_xml") {

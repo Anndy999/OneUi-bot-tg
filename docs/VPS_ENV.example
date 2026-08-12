@@ -10,20 +10,6 @@ TELEGRAM_SEND_ENABLED=false
 MONITOR_NOTIFICATIONS_ENABLED=false
 VPS_SCHEDULE_INTERVAL_MS=60000
 
-# Samsung test-build decrypter (VPS-only, no firmware download)
-TEST_FIRMWARE_SCAN_ENABLED=true
-TEST_FIRMWARE_SCAN_TIME=18:00
-TEST_FIRMWARE_TIMEZONE=Asia/Shanghai
-# Each shipped release runs SM-S948N/KOO once after the VPS bot starts:
-# startup -> SM-S948N/KOO -> administrator confirmation -> SM-S948B/EUX.
-# TEST_FIRMWARE_RELEASE_ID is optional and non-secret; leave it unset unless
-# a deliberate one-time re-run of the current release is required.
-# TEST_FIRMWARE_RELEASE_ID=2.22.1
-# TEST_FIRMWARE_PYTHON_BIN=python3
-# TEST_FIRMWARE_REQUEST_TIMEOUT_MS=12000
-# TEST_FIRMWARE_DECRYPT_TIMEOUT_MS=120000
-# TEST_FIRMWARE_MAX_CANDIDATES=10000000
-
 # Optional bounded runtime protection; the defaults are safe for most VPSs.
 # VPS_REQUEST_TIMEOUT_MS=30000
 # VPS_HEALTH_TIMEOUT_MS=5000
