@@ -344,6 +344,7 @@ export class MonitorScheduler {
 
   async updateAdaptiveBudget(status, error, now = Date.now()) {
     const current = await this.ctx.storage.get(BUDGET_STATE_KEY) || { factor: 1, successStreak: 0 };
+    if (status === "skipped") return current;
     const message = String(error || "");
     const upstreamLimited = status === "failed" && /(?:HTTP\s*(?:403|429|5\d\d)|timeout|timed out|network|upstream)/i.test(message);
     let factor = Math.max(1, Number(current.factor || 1));
@@ -730,6 +731,9 @@ export class MonitorScheduler {
       failureCount += 1;
       monitorMode = "NORMAL";
       modeUntil = 0;
+    } else if (status === "skipped") {
+      // A release-chain time window or weekend pause is intentional: retain
+      // the existing runtime and the caller-provided next permitted time.
     } else {
       failureCount = 0;
       if (versionChanged || status === "updated") {
@@ -776,10 +780,10 @@ export class MonitorScheduler {
       lastCheckedAt: now,
       failureCount,
       lastAttemptAt: now,
-      lastSuccessAt: status === "failed" ? Number(current.lastSuccessAt || 0) : now,
+      lastSuccessAt: status === "failed" || status === "skipped" ? Number(current.lastSuccessAt || 0) : now,
       nextAttemptAt: status === "failed" ? nextCheckAt : 0,
-      lastError: status === "failed" ? String(body.error || "").slice(0, 500) : "",
-      errorClass: status === "failed" ? String(body.errorClass || "transient") : "",
+      lastError: status === "failed" ? String(body.error || "").slice(0, 500) : (status === "skipped" ? String(current.lastError || "") : ""),
+      errorClass: status === "failed" ? String(body.errorClass || "transient") : (status === "skipped" ? String(current.errorClass || "") : ""),
       lastVersionChangedAt: versionChanged ? now : Number(current.lastVersionChangedAt || 0),
       lastOfficialUpdateAt: body.officialUpdateAt
         ? (Date.parse(body.officialUpdateAt) || Number(current.lastOfficialUpdateAt || 0))
@@ -792,15 +796,17 @@ export class MonitorScheduler {
     };
     await this.ctx.storage.put(storageKey, record);
     await this.ctx.storage.put(scheduleKey, { key: current.key });
-    await this.metricRecord({ metric: {
-      type: "monitor",
-      timestamp: now,
-      ok: status !== "failed",
-      updated: versionChanged || status === "updated",
-      errorClass: status === "failed" ? String(body.errorClass || "transient") : "",
-      model: target.model,
-      csc: target.csc
-    } });
+    if (status !== "skipped") {
+      await this.metricRecord({ metric: {
+        type: "monitor",
+        timestamp: now,
+        ok: status !== "failed",
+        updated: versionChanged || status === "updated",
+        errorClass: status === "failed" ? String(body.errorClass || "transient") : "",
+        model: target.model,
+        csc: target.csc
+      } });
+    }
     await this.scheduleNextAlarm();
     return { ok: true, nextCheckAt, monitorMode, modeUntil, versionChanged, previousVersion, adaptiveFactor: adaptive.factor };
   }

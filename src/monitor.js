@@ -36,6 +36,7 @@ import {
 } from "./flagship-priority.js";
 import {
   createRolloutProposalForUpdate,
+  getRolloutItemScheduleDecision,
   isRolloutItemWithinSchedule,
   rolloutProposalKeyboard,
   rolloutProposalText
@@ -376,6 +377,25 @@ export async function runMonitor(env, options = {}) {
   await emitProgress(true);
   await runLimited(selected, concurrency, async (entry) => {
     const item = entry.item;
+    const rolloutSchedule = scheduled
+      ? await getRolloutItemScheduleDecision(env, item, now)
+      : { allowed: true };
+    if (!rolloutSchedule.allowed) {
+      summary.skippedNotDue += 1;
+      if (entry.schedulerClaim) {
+        const nextCheckAt = Math.max(now.getTime() + 60_000, Number(rolloutSchedule.nextCheckAt || 0));
+        const completion = await completeMonitorTarget(env, item, {
+          lock: entry.lock,
+          nextCheckAt,
+          lastVersion: entry.lastVersion || "",
+          priorityScore: entry.priorityScore || 0,
+          status: "skipped",
+          completedAt: now.getTime()
+        });
+        if (completion?.ok === false) summary.schedulerConflicts += 1;
+      }
+      return;
+    }
     summary.started += 1;
     const { outcome, shared } = await runMonitorTargetSingleFlight(item, () =>
       executeMonitorTarget(env, item, items, now, adminId, entry)
@@ -441,6 +461,21 @@ export async function processMonitorQueueMessage(env, payload) {
       completedAt: now.getTime()
     });
     return { ok: true, skipped: true };
+  }
+
+  const rolloutSchedule = await getRolloutItemScheduleDecision(env, current, now);
+  if (!rolloutSchedule.allowed) {
+    const nextCheckAt = Math.max(now.getTime() + 60_000, Number(rolloutSchedule.nextCheckAt || 0));
+    const completion = await completeMonitorTarget(env, entry.item, {
+      lock: entry.lock,
+      nextCheckAt,
+      lastVersion: entry.lastVersion || "",
+      priorityScore: entry.priorityScore || 0,
+      status: "skipped",
+      completedAt: now.getTime()
+    });
+    if (!completion?.ok) throw new Error("Skipped rollout monitor completion was rejected");
+    return { ok: true, skipped: true, reason: rolloutSchedule.reason };
   }
 
   const adminId = adminIdForMessages(env);

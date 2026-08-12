@@ -145,6 +145,9 @@ function normalizeChain(raw = {}, fallback) {
       : 15,
     startTime: normalizeClockTime(raw.startTime || "08:00") || "08:00",
     endTime: normalizeClockTime(raw.endTime || "23:00") || "23:00",
+    // Release-chain monitoring normally continues on weekends. The owner can
+    // opt in to this narrow pause without changing ordinary monitor targets.
+    skipWeekends: raw.skipWeekends === true,
     startChainOnFirstStage: fallback.startChainOnFirstStage,
     pendingProposalId: cleanText(raw.pendingProposalId, 64),
     updatedAt: cleanText(raw.updatedAt, 40),
@@ -267,6 +270,9 @@ export async function setRolloutChainSettings(env, chainId, patch = {}) {
     const time = normalizeClockTime(patch.endTime);
     if (!time) throw new Error("结束时间无效");
     chain.endTime = time;
+  }
+  if (patch.skipWeekends !== undefined) {
+    chain.skipWeekends = patch.skipWeekends === true;
   }
   if (patch.enabled !== undefined) {
     if (patch.enabled === true && isDependentChain(chains, chain) && patch.allowDependentStart !== true) {
@@ -406,22 +412,59 @@ export async function createRolloutProposalForUpdate(env, item, parsed, now = ne
   return { proposal, chain, stage, next, startChain };
 }
 
-export async function isRolloutItemWithinSchedule(env, item, now = new Date()) {
+function beijingDateAt(parts, clockTime, dayOffset = 0) {
+  const minutes = timeToMinutes(clockTime);
+  if (minutes === null) return 0;
+  return Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day) + dayOffset,
+    Math.floor(minutes / 60) - 8,
+    minutes % 60,
+    0,
+    0
+  );
+}
+
+function nextRolloutWindowStart(chain, now, parts = beijingParts(now)) {
+  const nowMs = now.getTime();
+  for (let dayOffset = 0; dayOffset <= 8; dayOffset += 1) {
+    const candidate = beijingDateAt(parts, chain.startTime, dayOffset);
+    if (!candidate || candidate <= nowMs) continue;
+    const weekday = beijingParts(new Date(candidate)).weekday;
+    if (!chain.skipWeekends || (weekday !== "Sat" && weekday !== "Sun")) return candidate;
+  }
+  return nowMs + 24 * 60 * 60 * 1000;
+}
+
+export async function getRolloutItemScheduleDecision(env, item, now = new Date()) {
   const chainId = cleanText(item?.rolloutChainId, 48);
   const stageId = cleanText(item?.rolloutStageId, 48);
-  if (!chainId || !stageId) return true;
+  if (!chainId || !stageId) return { allowed: true, reason: "not_rollout" };
   const chains = await getRolloutChains(env);
   const chain = findChain(chains, chainId);
-  if (!chain || !chain.enabled) return false;
+  if (!chain || !chain.enabled) return { allowed: false, reason: "chain_inactive" };
   // A finished region may resume at the next month boundary. It then returns
   // to ordinary monitoring without moving the rollout chain backward.
-  if (chain.activeStageId !== stageId || chain.status !== "active") return item.enabled !== false;
+  if (chain.activeStageId !== stageId || chain.status !== "active") {
+    return { allowed: item.enabled !== false, reason: item.enabled !== false ? "inactive_stage" : "stage_paused" };
+  }
   const parts = beijingParts(now);
+  if (chain.skipWeekends && (parts.weekday === "Sat" || parts.weekday === "Sun")) {
+    return { allowed: false, reason: "weekend", nextCheckAt: nextRolloutWindowStart(chain, now, parts) };
+  }
   const current = Number(parts.hour) * 60 + Number(parts.minute);
   const start = timeToMinutes(chain.startTime);
   const end = timeToMinutes(chain.endTime);
-  if (start === null || end === null) return false;
-  return start <= end ? current >= start && current <= end : current >= start || current <= end;
+  if (start === null || end === null) return { allowed: false, reason: "invalid_schedule" };
+  const allowed = start <= end ? current >= start && current <= end : current >= start || current <= end;
+  return allowed
+    ? { allowed: true, reason: "within_window" }
+    : { allowed: false, reason: "outside_window", nextCheckAt: nextRolloutWindowStart(chain, now, parts) };
+}
+
+export async function isRolloutItemWithinSchedule(env, item, now = new Date()) {
+  return (await getRolloutItemScheduleDecision(env, item, now)).allowed;
 }
 
 export function rolloutProposalText(proposal, lang = "zh") {
@@ -593,6 +636,7 @@ export function rolloutChainPanelText(chain, lang = "zh") {
       `Next: ${next?.name || "complete"}`,
       `Trigger: any preset model`,
       `Schedule: ${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} min`,
+      `Weekend: ${chain.skipWeekends ? "off" : "on"}`,
       "",
       ...stageLines
     ].join("\n");
@@ -604,6 +648,7 @@ export function rolloutChainPanelText(chain, lang = "zh") {
     `下一步：${next?.name || "本轮完成"}`,
     "触发：任一预设机型",
     `时间：${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} 分钟`,
+    `周末监控：${chain.skipWeekends ? "关闭" : "开启"}`,
     "",
     ...stageLines
   ].join("\n");

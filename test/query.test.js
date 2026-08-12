@@ -17,8 +17,11 @@ import { sharedMonitorIntervalMinutes, uniformMonitorIntervalSettings } from "..
 import { classifySamsungSourceHealth, summarizeSamsungSourceHealth } from "../src/monitor-observability.js";
 import {
   MonitorScheduler,
+  claimDueMonitorTargets,
+  completeMonitorTarget,
   getMonitorIntervalSettings,
-  setMonitorIntervalSettings
+  setMonitorIntervalSettings,
+  syncMonitorScheduler
 } from "../src/monitor-scheduler.js";
 import { FirmwareQueryCoordinator } from "../src/firmware-query-coordinator.js";
 import { enqueueTelegramNotification, processNotificationQueue } from "../src/notification-queue.js";
@@ -74,6 +77,7 @@ import {
   addRolloutTarget,
   applyRolloutProposalDecision,
   createRolloutProposalForUpdate,
+  getRolloutItemScheduleDecision,
   getRolloutChains,
   restartDependentRolloutChain,
   setRolloutChainSettings
@@ -3310,12 +3314,55 @@ test("rollout chains include disabled Samsung regional retail presets", async ()
   const s25 = chains.chains.find((chain) => chain.id === "s25");
   assert.equal(s26.enabled, false);
   assert.equal(s25.enabled, false);
+  assert.equal(s26.skipWeekends, false);
   assert.deepEqual(s26.stages.find((stage) => stage.id === "kr").targets.map((target) => `${target.model}:${target.csc}`), [
     "SM-S942N:KOO", "SM-S947N:KOO", "SM-S948N:KOO"
   ]);
   assert.deepEqual(s25.stages.find((stage) => stage.id === "hk").targets.map((target) => `${target.model}:${target.csc}`), [
     "SM-S9310:TGY", "SM-S9360:TGY", "SM-S9370:TGY", "SM-S9380:TGY"
   ]);
+});
+
+test("owner rollout weekend pause skips only release-chain targets until the next Beijing workday", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await setRolloutChainSettings(env, "s26", {
+    enabled: true,
+    startTime: "08:00",
+    endTime: "23:00",
+    skipWeekends: true
+  });
+  const item = { model: "SM-S948N", csc: "KOO", rolloutChainId: "s26", rolloutStageId: "kr", enabled: true };
+  const saturday = new Date("2026-08-15T01:00:00.000Z");
+  const blocked = await getRolloutItemScheduleDecision(env, item, saturday);
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.reason, "weekend");
+  assert.equal(blocked.nextCheckAt, Date.parse("2026-08-17T00:00:00.000Z"));
+
+  const monday = new Date("2026-08-17T01:00:00.000Z");
+  const allowed = await getRolloutItemScheduleDecision(env, item, monday);
+  assert.equal(allowed.allowed, true);
+});
+
+test("a skipped rollout claim is released until the next permitted window", async () => {
+  const scheduler = new MonitorScheduler({ storage: memoryDoStorage() }, {});
+  const env = { MONITOR_SCHEDULER: schedulerNamespace(scheduler), MONITOR_SCHEDULER_ENABLED: "true" };
+  const item = { model: "SM-S948N", csc: "KOO", priority: "high", intervalMinutes: 15 };
+  const saturday = new Date("2026-08-15T01:00:00.000Z");
+  const mondayStart = Date.parse("2026-08-17T00:00:00.000Z");
+  await syncMonitorScheduler(env, [item], saturday);
+  const first = await claimDueMonitorTargets(env, saturday, 1);
+  assert.equal(first.entries.length, 1);
+  const completed = await completeMonitorTarget(env, item, {
+    lock: first.entries[0].lock,
+    nextCheckAt: mondayStart,
+    lastVersion: "S948NKSU1A",
+    priorityScore: 80,
+    status: "skipped",
+    completedAt: saturday.getTime()
+  });
+  assert.equal(completed.ok, true);
+  assert.equal((await claimDueMonitorTargets(env, new Date(saturday.getTime() + 60_000), 1)).entries.length, 0);
+  assert.equal((await claimDueMonitorTargets(env, new Date(mondayStart), 1)).entries.length, 1);
 });
 
 test("S25 waits for S26 Korea and only the recovery path can start it manually", async () => {

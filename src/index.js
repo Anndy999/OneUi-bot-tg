@@ -2618,6 +2618,16 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     await renderRolloutChain(env, chatId, messageId, chainId);
     return;
   }
+  if (data.startsWith("admin:rollout-weekends:")) {
+    if (!isOwnerChatId(env, chatId)) {
+      await sendTelegramMessage(env, chatId, lang === "en" ? "Only the owner can change weekend monitoring." : "仅所有者可更改周末监控。" );
+      return;
+    }
+    const [, , chainId, value] = data.split(":");
+    await setRolloutChainSettings(env, chainId, { skipWeekends: value === "off" });
+    await renderRolloutChain(env, chatId, messageId, chainId);
+    return;
+  }
   if (data.startsWith("admin:rollout-enable:")) {
     const [, , chainId, value] = data.split(":");
     try {
@@ -4708,6 +4718,11 @@ async function renderRolloutChain(env, chatId, messageId, chainId) {
     [10, 15, 30, 60].map((minutes) => ({ text: `${minutes}m`, callback_data: `admin:rollout-interval:${chain.id}:${minutes}` })),
     [{ text: en ? "Daytime" : "\u767d\u5929", callback_data: `admin:rollout-time:${chain.id}:08:00:23:00` }, { text: en ? "All day" : "\u5168\u5929", callback_data: `admin:rollout-time:${chain.id}:00:00:23:59` }]
   ];
+  if (owner) {
+    rows.push([{ text: chain.skipWeekends
+      ? (en ? "Weekend: enable" : "周末：开启监控")
+      : (en ? "Weekend: pause" : "周末：暂停监控"), callback_data: `admin:rollout-weekends:${chain.id}:${chain.skipWeekends ? "on" : "off"}` }]);
+  }
   if (!dependent) rows.push([{ text: chain.enabled ? (en ? "Pause S26" : "暂停 S26") : (en ? "Start S26" : "启动 S26"), callback_data: `admin:rollout-enable:${chain.id}:${chain.enabled ? "off" : "on"}` }]);
   if (dependent && chain.enabled) rows.push([{ text: en ? "Pause S25" : "暂停 S25", callback_data: `admin:rollout-enable:${chain.id}:off` }]);
   if (dependent && !chain.enabled && owner) rows.push([{ text: en ? "Owner: restart S25" : "所有者：重新启动 S25", callback_data: `admin:rollout-restart:${chain.id}` }]);
