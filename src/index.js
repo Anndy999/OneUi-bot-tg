@@ -47,7 +47,6 @@ import {
   monitorIntervalsPanel,
   monitorEventsPanel
 } from "./messages/admin-messages.js";
-import { maybeSendDiagnosticsAlert } from "./services/system-observability.js";
 import { firmwareInputHelp, isShortFirmwareSuffix, parseFirmwareInput } from "./firmware-input-parser.js";
 import {
   cacheOfficialCscSuggestions,
@@ -262,9 +261,6 @@ export default {
       runScheduledTasks(env),
       ensureTelegramCommands(env).catch((error) => {
         console.log(`Telegram command sync failed: ${error.message}`);
-      }),
-      maybeSendDiagnosticsAlert(env).catch((error) => {
-        console.log(`Diagnostics alert failed: ${error.message}`);
       })
     ]));
   },
@@ -552,9 +548,6 @@ export async function processTelegramUpdate(update, env, origin = "", ctx = null
       }),
       ensureTelegramCommands(env).catch((error) => {
         console.log(`Telegram command sync failed: ${error.message}`);
-      }),
-      maybeSendDiagnosticsAlert(env).catch((error) => {
-        console.log(`Diagnostics alert failed: ${error.message}`);
       })
     ]));
   }

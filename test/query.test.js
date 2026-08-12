@@ -93,7 +93,6 @@ import {
   formatMonitorNotification,
   normalizeFirmwareVersion
 } from "../src/utils.js";
-import { diagnosticsAlertReasons } from "../src/services/system-observability.js";
 import { adminHelpParts } from "../src/guides.js";
 
 const realFetch = globalThis.fetch;
@@ -293,63 +292,6 @@ const env = {
   FUS_CIRCUIT_FAILURE_THRESHOLD: "3",
   FUS_CIRCUIT_COOLDOWN_MS: "30000"
 };
-
-function healthyBindings() {
-  return {
-    monitorScheduler: true,
-    queryCoordinator: true,
-    notificationQueue: true,
-    kv: true
-  };
-}
-
-test("diagnostics alert ignores one transient SmartHistory 521", () => {
-  const report = {
-    scheduler: {
-      initialized: true,
-      targets: 3,
-      overdue: [],
-      failing: [{ model: "SM-S9380", csc: "TGY", failureCount: 1, lastError: "SmartHistory HTTP 521" }],
-      mirrorBacklog: 0,
-      budget: { adaptiveFactor: 2 },
-      alarmSupported: true
-    },
-    bindings: healthyBindings()
-  };
-  assert.deepEqual(diagnosticsAlertReasons(report, {}), []);
-});
-
-test("diagnostics alert reports repeated monitor failures", () => {
-  const report = {
-    scheduler: {
-      initialized: true,
-      targets: 3,
-      overdue: [],
-      failing: [{ model: "SM-S9380", csc: "TGY", failureCount: 3, lastError: "SmartHistory HTTP 521" }],
-      mirrorBacklog: 0,
-      budget: { adaptiveFactor: 2 },
-      alarmSupported: true
-    },
-    bindings: healthyBindings()
-  };
-  assert.deepEqual(diagnosticsAlertReasons(report, {}), ["repeated_failures"]);
-});
-
-test("diagnostics alert reports severe adaptive throttling", () => {
-  const report = {
-    scheduler: {
-      initialized: true,
-      targets: 3,
-      overdue: [],
-      failing: [{ model: "SM-S9380", csc: "TGY", failureCount: 2, lastError: "SmartHistory HTTP 521" }],
-      mirrorBacklog: 0,
-      budget: { adaptiveFactor: 4 },
-      alarmSupported: true
-    },
-    bindings: healthyBindings()
-  };
-  assert.deepEqual(diagnosticsAlertReasons(report, {}), ["adaptive:4.00"]);
-});
 
 test("Samsung source health distinguishes retryable upstream errors from model or CSC configuration errors", () => {
   const retrying = classifySamsungSourceHealth({

@@ -1,11 +1,8 @@
 import { adminChatId } from "../config.js";
-import { diagnosticsPanel } from "../messages/admin-messages.js";
 import {
   getSchedulerBudgetStatus,
-  getSchedulerControlState,
   getSchedulerDiagnostics,
   getSchedulerMetricsSummary,
-  putSchedulerControlState,
   claimSchedulerDailySummary,
   completeSchedulerDailySummary
 } from "../monitor-scheduler.js";
@@ -44,69 +41,6 @@ export async function loadDiagnosticsReport(env) {
       kv: Boolean(env.FIRMWARE_KV)
     }
   };
-}
-
-function envNumber(env, key, fallback, min, max) {
-  const value = Number(env?.[key] ?? fallback);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, value));
-}
-
-function diagnosticsMinFailureCount(env) {
-  return Math.floor(envNumber(env, "DIAGNOSTICS_ALERT_MIN_FAILURE_COUNT", 3, 1, 20));
-}
-
-function diagnosticsAdaptiveAlertFactor(env) {
-  return envNumber(env, "DIAGNOSTICS_ALERT_ADAPTIVE_FACTOR", 4, 2, 16);
-}
-
-function formatAlertReason(reason) {
-  if (reason.startsWith("overdue:")) return `超时未执行设备：${reason.split(":")[1]}`;
-  if (reason === "repeated_failures") return "监控设备连续失败达到阈值";
-  if (reason.startsWith("mirror_backlog:")) return `KV 镜像积压：${reason.split(":")[1]}`;
-  if (reason.startsWith("adaptive:")) return `自适应限流升高：x${reason.split(":")[1]}`;
-  if (reason === "binding_missing") return "Cloudflare 绑定缺失";
-  return reason;
-}
-
-export function diagnosticsAlertReasons(report, env = {}) {
-  const scheduler = report.scheduler || {};
-  const bindings = report.bindings || {};
-  const reasons = [];
-  const minFailures = diagnosticsMinFailureCount(env);
-  const adaptiveThreshold = diagnosticsAdaptiveAlertFactor(env);
-  const adaptiveFactor = Number(scheduler.budget?.adaptiveFactor || 1);
-  if ((scheduler.overdue || []).length) reasons.push(`overdue:${scheduler.overdue.length}`);
-  if ((scheduler.failing || []).some((item) => Number(item.failureCount || 0) >= minFailures)) reasons.push("repeated_failures");
-  if (Number(scheduler.mirrorBacklog || 0) > 0) reasons.push(`mirror_backlog:${scheduler.mirrorBacklog}`);
-  if (adaptiveFactor >= adaptiveThreshold) reasons.push(`adaptive:${adaptiveFactor.toFixed(2)}`);
-  if (!bindings.monitorScheduler || !bindings.queryCoordinator || !bindings.notificationQueue) reasons.push("binding_missing");
-  return reasons;
-}
-
-export async function maybeSendDiagnosticsAlert(env, now = Date.now()) {
-  const chatId = adminChatId(env);
-  if (!chatId || !env.MONITOR_SCHEDULER) return { sent: false, reason: "unavailable" };
-  const report = await loadDiagnosticsReport(env);
-  const reasons = diagnosticsAlertReasons(report, env);
-  if (!reasons.length) return { sent: false, reason: "healthy" };
-
-  const signature = reasons.join("|");
-  const previous = await getSchedulerControlState(env, "diagnostics:last-alert");
-  const previousAt = Number(previous?.value?.sentAt || 0);
-  if (previous?.found && previous.value?.signature === signature && now - previousAt < 60 * 60 * 1000) {
-    return { sent: false, reason: "deduped" };
-  }
-
-  const sent = await sendTelegramMessage(
-    env,
-    chatId,
-    `⚠️ 自动监控异常提醒\n\n触发原因：\n${reasons.map((reason) => `- ${formatAlertReason(reason)}`).join("\n")}\n\n${diagnosticsPanel(report, "zh")}`
-  );
-  if (sent) {
-    await putSchedulerControlState(env, "diagnostics:last-alert", { signature, reasons, sentAt: now });
-  }
-  return { sent, reasons };
 }
 
 export async function maybeSendDailyMonitorSummary(env, now = new Date()) {
