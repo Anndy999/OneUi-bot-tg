@@ -220,12 +220,14 @@ test("download health and journal warning expose a breached disk reserve without
     }).init({ startQueue: false });
     service.config.minFreeBytes = Number.MAX_SAFE_INTEGER;
     const warning = await service.reportCapacityWarning();
+    await service.reportCapacityWarning();
     const health = await service.health();
+    const capacityWarnings = warnings.filter((message) => /Download capacity warning/.test(message));
     assert.equal(warning.lowDisk, true);
     assert.equal(health.lowDisk, true);
     assert.equal(health.ok, false);
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /capacity warning/);
+    assert.equal(capacityWarnings.length, 1);
+    assert.match(capacityWarnings[0], /capacity warning/);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
