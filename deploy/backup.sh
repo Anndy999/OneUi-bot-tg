@@ -3,8 +3,16 @@ set -euo pipefail
 umask 077
 
 project_dir="${PROJECT_DIR:-/opt/oneui-bot}"
-backup_dir="${BACKUP_DIR:-$project_dir/backups}"
+backup_dir="${BACKUP_DIR:-/opt/oneui-backups}"
+env_file="${ONEUI_ENV_FILE:-/etc/oneui-bot/oneui-bot.env}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+if [[ -z "${DATABASE_URL:-}" && -f "${env_file}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+fi
 
 if [[ -z "${DATABASE_URL:-}" ]]; then
   echo "DATABASE_URL must be provided through the protected environment" >&2
@@ -28,8 +36,10 @@ tar --directory="$project_dir" \
   --exclude='./node_modules' \
   --exclude='./.npm-cache' \
   --exclude='./backups' \
+  --exclude='./data/firmware' \
   --exclude='./.env*' \
   --exclude='./*.log' \
   --create --gzip --file="$project_archive" .
 
 printf 'PostgreSQL backup: %s\nProject backup: %s\n' "$database_dump" "$project_archive"
+printf 'Firmware payloads are intentionally excluded; the download-state index is retained.\n'

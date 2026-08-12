@@ -47,6 +47,7 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.decryptChunkBytes, 16 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
   assert.equal(config.jobStaleMs, 5 * 60_000);
+  assert.equal(config.capacityWarningIntervalMs, 60 * 60_000);
   assert.equal(createDownloadConfig({ DOWNLOAD_PARALLEL_SEGMENTS: "100" }).parallelSegments, 12);
   const staleHighConcurrency = createDownloadConfig({
     DOWNLOAD_PARALLEL_SEGMENTS: "24",
@@ -202,6 +203,29 @@ test("download health ignores an ordinary queue backlog but detects a stalled ac
     const health = await service.health();
     assert.equal(health.ok, false);
     assert.equal(health.active.stalled, true);
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download health and journal warning expose a breached disk reserve without deleting files", async () => {
+  const dir = await tempDir();
+  const warnings = [];
+  try {
+    const config = createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" });
+    const service = await new FirmwareDownloadService({
+      config,
+      logger: { warn: (message) => warnings.push(message) }
+    }).init({ startQueue: false });
+    service.config.minFreeBytes = Number.MAX_SAFE_INTEGER;
+    const warning = await service.reportCapacityWarning();
+    const health = await service.health();
+    assert.equal(warning.lowDisk, true);
+    assert.equal(health.lowDisk, true);
+    assert.equal(health.ok, false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /capacity warning/);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });

@@ -9,6 +9,7 @@ DOWNLOAD_SERVICE="oneui-download.service"
 DOWNLOAD_HEALTH_URL="http://127.0.0.1:8788/health"
 NPM_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/npm"
 NODE_BIN="/home/oneui/.nvm/versions/node/v22.23.2/bin/node"
+PREFLIGHT_SCRIPT="${PROJECT_DIR}/deploy/preflight-vps.sh"
 download_was_active=false
 
 log() { printf "[oneui-update] %s\n" "$*"; }
@@ -20,6 +21,15 @@ git_cmd() { git -c "safe.directory=${PROJECT_DIR}" "$@"; }
 [[ -d "${PROJECT_DIR}/.git" ]] || die "项目尚未配置 Git 仓库。"
 [[ -f "${ENV_FILE}" ]] || die "缺少运行时环境文件：${ENV_FILE}"
 [[ -x "${NPM_BIN}" ]] || die "未找到 OneUI Node.js/npm：${NPM_BIN}"
+
+[[ -f "${PREFLIGHT_SCRIPT}" ]] || die "Missing pre-update preflight script: ${PREFLIGHT_SCRIPT}"
+log "Running pre-update checks."
+PROJECT_DIR="${PROJECT_DIR}" \
+BOT_SERVICE="${SERVICE}" \
+DOWNLOAD_SERVICE="${DOWNLOAD_SERVICE}" \
+NODE_BIN="${NODE_BIN}" \
+NPM_BIN="${NPM_BIN}" \
+bash "${PREFLIGHT_SCRIPT}"
 
 cd "${PROJECT_DIR}"
 branch="$(git_cmd branch --show-current)"

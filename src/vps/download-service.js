@@ -101,6 +101,7 @@ export function createDownloadConfig(env = process.env) {
     queuePrefix: text(env.DOWNLOAD_QUEUE_PREFIX, "oneui-download"),
     maxBytes: bytes(env.DOWNLOAD_MAX_BYTES, 20 * 1024 ** 3),
     minFreeBytes: bytes(env.DOWNLOAD_MIN_FREE_BYTES, 40 * 1024 ** 3),
+    capacityWarningIntervalMs: integer(env.DOWNLOAD_CAPACITY_WARNING_INTERVAL_MS || 60 * 60 * 1000, 60 * 60 * 1000, 5 * 60_000, 24 * 60 * 60 * 1000),
     completedTtlMs: integer(env.DOWNLOAD_COMPLETED_TTL_MS || 7 * 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 0, 365 * 24 * 60 * 60 * 1000),
     partTtlMs: integer(env.DOWNLOAD_PART_TTL_MS || 6 * 60 * 60 * 1000, 6 * 60 * 60 * 1000, 60_000, 30 * 24 * 60 * 60 * 1000),
     responseHeaderTimeoutMs: integer(env.DOWNLOAD_RESPONSE_HEADER_TIMEOUT_MS || env.DOWNLOAD_REQUEST_TIMEOUT_MS || 60_000, 60_000, 5_000, 10 * 60_000),
@@ -660,6 +661,8 @@ export class FirmwareDownloadService {
     this.worker = null;
     this.redis = null;
     this.cleanupTimer = null;
+    this.capacityWarningTimer = null;
+    this.lastCapacityWarningAt = 0;
     this.createInFlight = false;
     this.persistPromise = Promise.resolve();
     this.ready = false;
@@ -697,6 +700,11 @@ export class FirmwareDownloadService {
       this.cleanupFiles().catch((error) => this.logger.warn?.(`Download cleanup failed: ${error.message}`));
     }, 6 * 60 * 60 * 1000);
     this.cleanupTimer.unref?.();
+    await this.reportCapacityWarning();
+    this.capacityWarningTimer = setInterval(() => {
+      this.reportCapacityWarning().catch((error) => this.logger.warn?.(`Download capacity check failed: ${error.message}`));
+    }, this.config.capacityWarningIntervalMs);
+    this.capacityWarningTimer.unref?.();
     this.ready = true;
     return this;
   }
@@ -782,6 +790,20 @@ export class FirmwareDownloadService {
     return Number(info.bavail) * Number(info.bsize);
   }
 
+  async reportCapacityWarning() {
+    const free = await this.freeBytes();
+    if (free >= this.config.minFreeBytes) {
+      this.lastCapacityWarningAt = 0;
+      return { lowDisk: false, freeBytes: free };
+    }
+    const now = this.now();
+    if (!this.lastCapacityWarningAt || now - this.lastCapacityWarningAt >= this.config.capacityWarningIntervalMs) {
+      this.lastCapacityWarningAt = now;
+      this.logger.warn?.(`Download capacity warning: ${free} free bytes remain; reserve is ${this.config.minFreeBytes} bytes. New downloads are blocked until space is available.`);
+    }
+    return { lowDisk: true, freeBytes: free };
+  }
+
   async health() {
     const free = await this.freeBytes();
     const active = [...this.jobs.values()].find((job) => ["downloading", "verifying", "decrypting"].includes(job.state));
@@ -795,6 +817,7 @@ export class FirmwareDownloadService {
       ready: this.ready,
       freeBytes: free,
       minFreeBytes: this.config.minFreeBytes,
+      lowDisk: free < this.config.minFreeBytes,
       jobs: this.jobs.size,
       queued,
       redis: this.redis?.status || "disabled",
@@ -1717,6 +1740,7 @@ export class FirmwareDownloadService {
     this.closing = true;
     this.ready = false;
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
+    if (this.capacityWarningTimer) clearInterval(this.capacityWarningTimer);
     for (const [id, controller] of this.controllers) {
       const job = this.jobs.get(id);
       if (job && ["downloading", "verifying", "decrypting"].includes(job.state)) {

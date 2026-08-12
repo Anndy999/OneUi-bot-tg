@@ -6,6 +6,11 @@ After the initial deployment, update the OneUI application with:
 sudo /opt/oneui-bot/deploy/update-vps.sh
 ```
 
+Before updating, the script verifies protected environment-file permissions,
+the OneUI PostgreSQL and Redis dependencies, the clean `main` checkout, Node,
+npm, and available project-disk space. A stopped bot or download service is
+reported as a warning so an update can still be used as a repair deployment.
+
 The script is intentionally limited to the OneUI application. It verifies the
 checkout is on `main` and clean, fast-forwards from `origin/main`, then always
 installs the locked Node dependencies without lifecycle scripts, runs tests,
@@ -70,3 +75,5 @@ outside the application directory. Keep the previous Git commit identified in
 the update log. For user-impacting changes, stop and choose between a code-only
 revert and a coordinated database restore; do not make that choice
 automatically.
+
+For routine maintenance, see [VPS_MAINTENANCE.md](VPS_MAINTENANCE.md).
