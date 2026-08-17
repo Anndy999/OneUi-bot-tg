@@ -36,9 +36,10 @@ DOWNLOAD_PARALLEL_SCALE_STEP=2
 # explicit experiment only; do not use the old 16/24 burst profile.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
-# 256 MiB reclaimable ranges keep all eight lanes balanced when one Samsung
-# connection slows down, while remaining safe to pause and resume.
-DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+# One GiB long-lived ranges avoid repeated late-stage Samsung FUS Range
+# authorization/throttling. A 17 GiB file still has more ranges than the eight
+# lanes, so pause/resume and work stealing remain available.
+DOWNLOAD_PARALLEL_CHUNK_BYTES=1073741824
 # Commit 4 MiB at a time to reduce filesystem overhead without ever marking
 # bytes complete before their positional write succeeds. Valid range: 64 KiB-16 MiB.
 DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
