@@ -1100,14 +1100,7 @@ function downloadProgressBar(percent) {
   return `${"█".repeat(filled)}${"░".repeat(10 - filled)} ${safePercent}%`;
 }
 
-export function displayFirmwareFileName(job = {}) {
-  const model = String(job.model || "").trim().toUpperCase();
-  const csc = String(job.csc || "").trim().toUpperCase();
-  if (!model || !csc) return "firmware.zip";
-  return `${model}_${csc}.zip`;
-}
-
-function formatDownloadJob(job, lang = "zh") {
+function formatDownloadJob(job, lang = "zh", detailed = false) {
   if (!job) return lang === "en" ? "No download task." : "暂无下载任务。";
   const active = ["queued", "downloading", "verifying", "decrypting", "paused"].includes(job.state);
   const lines = [
@@ -1142,8 +1135,9 @@ function formatDownloadJob(job, lang = "zh") {
       lines.push(`${speedLabel}: ${formatBytes(job.speedBytesPerSecond)}/s · ${lang === "en" ? "ETA" : "剩余"}: ${formatDuration(job.etaSeconds)}`);
     }
   }
-  if (job.state === "completed") lines.push(`${lang === "en" ? "File" : "文件"}: ${displayFirmwareFileName(job)}`);
+  if (job.state === "completed") lines.push(`${lang === "en" ? "File" : "文件"}: ${job.originalName || job.fileName || "firmware"}`);
   if (job.state === "failed" && job.error) lines.push(`${lang === "en" ? "Reason" : "原因"}: ${String(job.error).slice(0, 220)}`);
+  if (detailed) lines.push(`${lang === "en" ? "Task" : "任务"}: ${job.id}`);
   return lines.join("\n");
 }
 
@@ -1930,7 +1924,7 @@ async function renderDownloadDetails(env, chatId, messageId, id) {
   }
   const job = result.download;
   const title = lang === "en" ? "Firmware download" : "固件下载";
-  const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang)}`, downloadTaskKeyboard(job, lang, env));
+  const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang, env));
   if (["queued", "downloading", "verifying", "decrypting"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
   return response;
 }
@@ -1958,7 +1952,7 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
         return;
       }
       const lang = await getUserLanguage(env, chatId);
-      await safeEditOrSend(env, chatId, messageId, `${lang === "en" ? "Firmware download" : "固件下载"}\n\n${formatDownloadJob(job, lang)}`, downloadTaskKeyboard(job, lang, env));
+      await safeEditOrSend(env, chatId, messageId, `${lang === "en" ? "Firmware download" : "固件下载"}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang, env));
     } catch {
       // A later refresh or the next poll can recover from transient errors.
     } finally {
