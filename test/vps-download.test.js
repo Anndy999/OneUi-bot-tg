@@ -40,9 +40,9 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 120 * 1024 * 1024);
-  assert.equal(config.decryptMode, "stream");
-  assert.equal(config.decryptStreamChunkBytes, 4 * 1024 * 1024);
-  assert.equal(config.decryptWorkerCount, 1);
+  assert.equal(config.decryptMode, "parallel");
+  assert.equal(config.decryptStreamChunkBytes, 16 * 1024 * 1024);
+  assert.equal(config.decryptWorkerCount, 3);
   assert.equal(config.decryptWorkerMinBytes, 128 * 1024 * 1024);
   assert.equal(config.decryptChunkBytes, 16 * 1024 * 1024);
   assert.equal(config.bodyIdleTimeoutMs, 120_000);
@@ -141,6 +141,20 @@ test("download speed uses a phase-local rolling window", () => {
   assert.equal(job.speedBytesPerSecond, 100);
   updateRollingSpeed(job, "decrypt", 0, 6000);
   assert.equal(job.speedBytesPerSecond, 0);
+});
+
+test("download API exposes the real current-phase progress during decryption", () => {
+  const service = new FirmwareDownloadService({ config: createDownloadConfig({}) });
+  service.jobs.set("decrypt-progress", {
+    id: "decrypt-progress",
+    state: "decrypting",
+    totalBytes: 17 * 1024,
+    decryptBytes: Math.floor(7.1 * 1024),
+    bytes: 16 * 1024
+  });
+  const job = service.get("decrypt-progress");
+  assert.equal(job.percent, 94);
+  assert.equal(job.phasePercent, 41);
 });
 
 test("download response-header deadline does not abort an active body stream", async () => {
@@ -404,7 +418,7 @@ test("parallel CRC verification reads the assembled file with its own live speed
   }
 });
 
-test("parallel Range uses one long-lived fixed range per configured connection", async () => {
+test("parallel Range keeps connections bounded while reclaiming completed ranges", async () => {
   const dir = await tempDir();
   try {
     const fixture = Buffer.alloc(32 * 1024 * 1024, 0x61);
@@ -454,7 +468,9 @@ test("parallel Range uses one long-lived fixed range per configured connection",
     const completed = service.get(job.id);
     assert.equal(completed.state, "completed");
     assert.equal(maximumActiveRanges, 3);
-    assert.equal(dataRangeCalls, 3);
+    // Four 8 MiB ranges are completed by three bounded lanes. This prevents a
+    // slow initial connection from owning the final third of the firmware.
+    assert.equal(dataRangeCalls, 4);
     assert.deepEqual(await readFile(join(dir, completed.fileName)), fixture);
     await service.close();
   } finally {

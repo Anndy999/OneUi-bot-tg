@@ -1109,7 +1109,7 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
     `${lang === "en" ? "Status" : "状态"}: ${downloadStateLabel(job.state, lang)}`
   ];
   if (active) {
-    lines.push(`${lang === "en" ? "Progress" : "进度"}: ${downloadProgressBar(job.percent)}`);
+    lines.push(`${lang === "en" ? "Progress" : "进度"}: ${downloadProgressBar(job.phasePercent ?? job.percent)}`);
     const phaseBytes = job.state === "verifying"
       ? Number(job.verifyBytes || 0)
       : job.state === "decrypting"

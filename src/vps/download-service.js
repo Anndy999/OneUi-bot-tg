@@ -31,11 +31,13 @@ const MAX_PARALLEL_RANGE_COUNT = 512;
 const MAX_PARALLEL_LANE_COUNT = 12;
 const DEFAULT_PARALLEL_LANES = 8;
 const DEFAULT_PARALLEL_MAX_LANES = 8;
-// Bifrost keeps one native AES-ECB cipher alive and feeds it bounded blocks.
-// Node's native stream performs better with a 4 MiB high-water mark on the
-// VPS profile, while the cipher and output ordering remain Bifrost-compatible.
-const DEFAULT_DECRYPT_MODE = "stream";
-const DEFAULT_DECRYPT_STREAM_CHUNK_BYTES = 4 * 1024 * 1024;
+// Samsung firmware AES-ECB blocks are independent. A bounded three-worker
+// pipeline lets a four-core VPS use native OpenSSL without taking every core
+// away from the download service. The stream mode remains available for
+// constrained hosts or diagnostics.
+const DEFAULT_DECRYPT_MODE = "parallel";
+const DEFAULT_DECRYPT_WORKER_COUNT = 3;
+const DEFAULT_DECRYPT_STREAM_CHUNK_BYTES = 16 * 1024 * 1024;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -142,11 +144,14 @@ export function createDownloadConfig(env = process.env) {
       env.DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES || DEFAULT_DECRYPT_STREAM_CHUNK_BYTES,
       DEFAULT_DECRYPT_STREAM_CHUNK_BYTES,
       64 * 1024,
-      4 * 1024 * 1024
+      16 * 1024 * 1024
     ),
-    // Retain the legacy values for configuration compatibility. They are
-    // consulted only when an operator explicitly opts into parallel mode.
-    decryptWorkerCount: integer(env.DOWNLOAD_DECRYPT_WORKERS || 1, 1, 1, 8),
+    decryptWorkerCount: integer(
+      env.DOWNLOAD_DECRYPT_WORKERS || DEFAULT_DECRYPT_WORKER_COUNT,
+      DEFAULT_DECRYPT_WORKER_COUNT,
+      1,
+      8
+    ),
     decryptWorkerMinBytes: bytes(env.DOWNLOAD_DECRYPT_WORKER_MIN_BYTES, 128 * 1024 * 1024),
     decryptChunkBytes: Math.max(16 * 1024, Math.min(
       64 * 1024 * 1024,
@@ -238,6 +243,12 @@ function publicJob(job) {
         ? Math.min(90, 85 + Math.floor((progressBytes / safe.totalBytes) * 5))
         : Math.min(85, Math.floor((progressBytes / safe.totalBytes) * 85)))
     : null;
+  // The overall percentage is useful for APIs, but Telegram shows the amount
+  // processed in the current phase. Expose that real phase percentage so a
+  // card cannot claim 94% decrypted while only 7.1 GiB of 17 GiB is written.
+  const phasePercent = safe.state === "completed" ? 100 : safe.totalBytes
+    ? Math.min(99, Math.floor((progressBytes / safe.totalBytes) * 100))
+    : null;
   const speedBytesPerSecond = Math.max(0, Number(safe.speedBytesPerSecond || 0));
   const etaSeconds = safe.totalBytes && speedBytesPerSecond > 0
     ? Math.max(0, Math.ceil((safe.totalBytes - progressBytes) / speedBytesPerSecond))
@@ -248,7 +259,7 @@ function publicJob(job) {
     completedRanges: Math.max(0, Number(parallel.completedRanges || 0)),
     totalRanges: Array.isArray(parallel.segments) ? parallel.segments.length : 0
   } : null;
-  return { ...safe, percent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
+  return { ...safe, percent, phasePercent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
 }
 
 function resetSpeedTracking(job, phase, bytesAtStart, timestamp) {
@@ -573,7 +584,10 @@ class AesDecryptWorkerPool {
     if (!pending || pending.worker !== worker) return;
     this.pending.delete(message.id);
     if (message.error) pending.reject(new Error(String(message.error)));
-    else pending.resolve(Buffer.from(message.data));
+    else if (message.data instanceof ArrayBuffer) pending.resolve(Buffer.from(message.data));
+    else if (ArrayBuffer.isView(message.data)) {
+      pending.resolve(Buffer.from(message.data.buffer, message.data.byteOffset, message.data.byteLength));
+    } else pending.reject(new Error("decrypt worker returned an invalid payload"));
   }
 
   failWorker(worker, error) {
@@ -1167,14 +1181,13 @@ export class FirmwareDownloadService {
     if (!Number.isSafeInteger(total) || total < this.config.parallelMinBytes) return false;
     if (total > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
     job.totalBytes = total;
-    // Match Bifrost's layout: one long-lived Range request per lane for the
-    // whole transfer. Samsung FUS can sharply throttle a client that keeps
-    // opening fresh 256 MiB requests. Equal, persistent ranges avoid that
-    // mid-download collapse while the eight-lane profile keeps the tail stable.
+    // Keep the eight network lanes bounded, but split a large file into
+    // reclaimable 256 MiB ranges. A slow Samsung connection then holds only
+    // one range instead of becoming the sole remaining 1/8th of a file. The
+    // claimed ranges and their durable offsets still make pause/resume safe.
     const requestedSegmentCount = Math.min(
       MAX_PARALLEL_RANGE_COUNT,
-      total,
-      Math.max(2, this.config.parallelMaxSegments)
+      Math.max(2, Math.ceil(total / this.config.parallelChunkBytes))
     );
     const savedSegments = Array.isArray(job.parallel?.segments) ? job.parallel.segments : null;
     const savedFile = await stat(partPath).catch(() => null);
