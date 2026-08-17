@@ -37,6 +37,23 @@ The health endpoint must report `ok: true`. It checks PostgreSQL and Redis
 connectivity, long-polling liveness, and queue counts without exposing
 credentials.
 
+## Optional OpenList button for completed firmware
+
+The bot keeps firmware files private by default. To show administrators an
+**Open in OpenList** button after a task completes, add these non-secret values
+to `/etc/oneui-bot/oneui-bot.env` using the address and folder that already
+exist in your OpenList installation:
+
+```ini
+OPENLIST_BASE_URL=https://openlist.example.com
+OPENLIST_FIRMWARE_PATH=/firmware
+```
+
+The button is hidden until both values are valid. It contains no API key,
+temporary bypass, or file-server credential; OpenList must be configured to
+require login before it permits access to that folder. Restart `oneui-bot.service`
+after changing this optional setting.
+
 If the independent download interface has been installed:
 
 ```bash

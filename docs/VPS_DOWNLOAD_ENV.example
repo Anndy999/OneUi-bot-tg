@@ -40,6 +40,11 @@ DOWNLOAD_PARALLEL_STAGGER_MS=100
 # authorization/throttling. A 17 GiB file still has more ranges than the eight
 # lanes, so pause/resume and work stealing remain available.
 DOWNLOAD_PARALLEL_CHUNK_BYTES=1073741824
+# Only the final two GiB uses smaller ranges, so the eight connections can
+# keep taking work near completion instead of one slow Range owning the tail.
+# This stays far below the request volume of an all-256-MiB profile.
+DOWNLOAD_PARALLEL_TAIL_BYTES=2147483648
+DOWNLOAD_PARALLEL_TAIL_CHUNK_BYTES=134217728
 # Commit 4 MiB at a time to reduce filesystem overhead without ever marking
 # bytes complete before their positional write succeeds. Valid range: 64 KiB-16 MiB.
 DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
@@ -51,6 +56,12 @@ DOWNLOAD_PARALLEL_RETRIES=3
 # writes. This is the recommended VPS profile and uses 16 MiB sequential I/O.
 DOWNLOAD_DECRYPT_MODE=stream
 DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES=16777216
+# Optional: add these to /etc/oneui-bot/oneui-bot.env, not this download
+# service file. When configured, only completed administrator tasks show an
+# OpenList button. OpenList itself must require login; the bot never generates
+# a public, passwordless, or signed file URL.
+# OPENLIST_BASE_URL=https://openlist.example.com
+# OPENLIST_FIRMWARE_PATH=/firmware
 # A paused Range-capable download resumes its saved byte ranges after restart.
 # Do not manually delete *.part files; use the Telegram Delete button instead.
 DOWNLOAD_QUEUE_PREFIX=oneui-download

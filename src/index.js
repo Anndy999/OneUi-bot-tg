@@ -1141,6 +1141,29 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
   return lines.join("\n");
 }
 
+// This is deliberately just an OpenList navigation URL.  The bot never adds
+// a bypass token or a direct file API key: OpenList remains responsible for
+// requiring its normal login before the file can be opened or downloaded.
+export function openListFirmwareUrl(env = {}, job = {}) {
+  if (job?.state !== "completed") return "";
+  const fileName = String(job.originalName || job.fileName || "").trim();
+  if (!fileName || fileName === "." || fileName === ".." || fileName.includes("/") || fileName.includes("\\") || fileName.includes("\0")) return "";
+  try {
+    const base = new URL(String(env.OPENLIST_BASE_URL || "").trim());
+    if (base.protocol !== "https:" || base.username || base.password || base.search || base.hash) return "";
+    const configuredPath = String(env.OPENLIST_FIRMWARE_PATH || "").trim();
+    const pathParts = configuredPath.split("/").filter(Boolean);
+    if (pathParts.some((part) => part === "." || part === ".." || part.includes("\\") || part.includes("\0"))) return "";
+    const directory = [base.pathname.replace(/\/+$/, ""), ...pathParts.map(encodeURIComponent)]
+      .filter(Boolean)
+      .join("/");
+    base.pathname = `${directory}/${encodeURIComponent(fileName)}`;
+    return base.toString();
+  } catch {
+    return "";
+  }
+}
+
 function downloadMenuKeyboard(jobs = [], lang = "zh") {
   const en = lang === "en";
   const rows = [[
@@ -1154,7 +1177,7 @@ function downloadMenuKeyboard(jobs = [], lang = "zh") {
   return { inline_keyboard: rows };
 }
 
-function downloadTaskKeyboard(job, lang = "zh") {
+function downloadTaskKeyboard(job, lang = "zh", env = {}) {
   const en = lang === "en";
   const rows = [[{ text: en ? "Refresh" : "刷新", callback_data: `admin:dl:refresh:${job.id}` }]];
   if (["queued", "downloading"].includes(job.state)) rows.push([
@@ -1166,7 +1189,11 @@ function downloadTaskKeyboard(job, lang = "zh") {
     { text: en ? "Resume" : "继续下载", callback_data: `admin:dl:resume:${job.id}` },
     { text: en ? "Delete" : "删除", callback_data: `admin:dl:delete:${job.id}` }
   ]);
-  else rows.push([{ text: en ? "Delete" : "删除任务与文件", callback_data: `admin:dl:delete:${job.id}` }]);
+  else {
+    const openListUrl = openListFirmwareUrl(env, job);
+    if (openListUrl) rows.push([{ text: en ? "Open in OpenList" : "在 OpenList 打开", url: openListUrl }]);
+    rows.push([{ text: en ? "Delete" : "删除任务与文件", callback_data: `admin:dl:delete:${job.id}` }]);
+  }
   rows.push([{ text: en ? "Downloads" : "下载列表", callback_data: "admin:download-menu" }]);
   return { inline_keyboard: rows };
 }
@@ -1897,7 +1924,7 @@ async function renderDownloadDetails(env, chatId, messageId, id) {
   }
   const job = result.download;
   const title = lang === "en" ? "Firmware download" : "固件下载";
-  const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang));
+  const response = await safeEditOrSend(env, chatId, messageId, `${title}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang, env));
   if (["queued", "downloading", "verifying", "decrypting"].includes(job.state) && messageId) startDownloadProgressWatch(env, chatId, messageId, job.id);
   return response;
 }
@@ -1925,7 +1952,7 @@ function startDownloadProgressWatch(env, chatId, messageId, id) {
         return;
       }
       const lang = await getUserLanguage(env, chatId);
-      await safeEditOrSend(env, chatId, messageId, `${lang === "en" ? "Firmware download" : "固件下载"}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang));
+      await safeEditOrSend(env, chatId, messageId, `${lang === "en" ? "Firmware download" : "固件下载"}\n\n${formatDownloadJob(job, lang, true)}`, downloadTaskKeyboard(job, lang, env));
     } catch {
       // A later refresh or the next poll can recover from transient errors.
     } finally {

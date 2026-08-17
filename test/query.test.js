@@ -26,7 +26,7 @@ import {
 import { FirmwareQueryCoordinator } from "../src/firmware-query-coordinator.js";
 import { enqueueTelegramNotification, processNotificationQueue } from "../src/notification-queue.js";
 import { queryFirmwareHybrid } from "../src/samsung.js";
-import worker from "../src/index.js";
+import worker, { openListFirmwareUrl } from "../src/index.js";
 import { buildFirmwareCacheRecord } from "../src/firmware-cache.js";
 import { defaultSchedule, normalizeMonitorItems, notifyAllowedUsersOnUpdate } from "../src/config.js";
 import {
@@ -100,6 +100,20 @@ import {
 import { adminHelpParts } from "../src/guides.js";
 
 const realFetch = globalThis.fetch;
+
+test("completed downloads can link to an existing login-protected OpenList path", () => {
+  const url = openListFirmwareUrl({
+    OPENLIST_BASE_URL: "https://files.example/openlist/",
+    OPENLIST_FIRMWARE_PATH: "/firmware"
+  }, {
+    state: "completed",
+    fileName: "SM-S9380_TGY_F9760ZSS2AZH7.zip"
+  });
+  assert.equal(url, "https://files.example/openlist/firmware/SM-S9380_TGY_F9760ZSS2AZH7.zip");
+  assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "https://files.example" }, { state: "downloading", fileName: "a.zip" }), "");
+  assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "http://files.example" }, { state: "completed", fileName: "a.zip" }), "");
+  assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "https://files.example", OPENLIST_FIRMWARE_PATH: "../firmware" }, { state: "completed", fileName: "a.zip" }), "");
+});
 
 function memoryKv() {
   const values = new Map();
