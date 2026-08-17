@@ -37,7 +37,7 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 8);
   assert.equal(config.parallelMaxSegments, 8);
-  assert.equal(config.parallelChunkBytes, 1024 * 1024 * 1024);
+  assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 120 * 1024 * 1024);
   assert.equal(config.decryptMode, "stream");

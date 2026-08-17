@@ -1126,7 +1126,7 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
       const rangesLabel = lang === "en" ? "Ranges" : "分片";
       lines.push(`${transferLabel}: ${job.transfer.activeLanes || 0}/${job.transfer.lanes} · ${rangesLabel}: ${job.transfer.completedRanges || 0}/${job.transfer.totalRanges || 0}`);
     }
-    if (job.speedBytesPerSecond) {
+    if (job.state !== "paused" && job.speedBytesPerSecond) {
       const speedLabel = job.state === "verifying"
         ? (lang === "en" ? "Verification speed" : "校验速度")
         : job.state === "decrypting"

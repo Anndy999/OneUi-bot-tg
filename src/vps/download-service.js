@@ -121,10 +121,9 @@ export function createDownloadConfig(env = process.env) {
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
       1024 * 1024 * 1024,
-      // One GiB keeps the eight lanes long-lived enough that Samsung FUS does
-      // not repeatedly throttle fresh Range requests midway through a large
-      // firmware. It still creates several reclaimable ranges for safe resume.
-      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 1024 * 1024 * 1024)
+      // Smaller reclaimable ranges let the next idle lane take work from a
+      // slower Samsung connection, instead of leaving a slow final 1/8th.
+      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
     )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     parallelWriteBatchBytes: Math.max(64 * 1024, Math.min(
