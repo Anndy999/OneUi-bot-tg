@@ -101,14 +101,6 @@ export function createDownloadConfig(env = process.env) {
     // ranges than the eight lanes for safe resume and work stealing.
     bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 1024 * 1024 * 1024)
   ));
-  const parallelTailBytes = Math.max(0, Math.min(
-    4 * 1024 ** 3,
-    bytes(env.DOWNLOAD_PARALLEL_TAIL_BYTES, 2 * 1024 ** 3)
-  ));
-  const parallelTailChunkBytes = Math.max(64 * 1024 * 1024, Math.min(
-    parallelChunkBytes,
-    bytes(env.DOWNLOAD_PARALLEL_TAIL_CHUNK_BYTES, 128 * 1024 * 1024)
-  ));
   return {
     host: text(env.DOWNLOAD_HOST, "127.0.0.1"),
     port: integer(env.DOWNLOAD_PORT || 8788, 8788, 1, 65535),
@@ -137,11 +129,6 @@ export function createDownloadConfig(env = process.env) {
     parallelStaggerMs: integer(env.DOWNLOAD_PARALLEL_STAGGER_MS || 100, 100, 0, 5_000),
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes,
-    // Use smaller work-stealable ranges only at the end. The first part stays
-    // long-lived, while the last two GiB keeps all eight lanes useful instead
-    // of letting one slow Samsung connection own the whole tail.
-    parallelTailBytes,
-    parallelTailChunkBytes,
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     parallelWriteBatchBytes: Math.max(64 * 1024, Math.min(
       16 * 1024 * 1024,
@@ -532,30 +519,6 @@ function contentRange(value) {
   const total = Number(match[3]);
   if (![start, end, total].every(Number.isSafeInteger) || start < 0 || end < start || total <= end) return null;
   return { start, end, total };
-}
-
-export function buildParallelSegments(totalBytes, config) {
-  const total = Math.max(0, Number(totalBytes) || 0);
-  if (!Number.isSafeInteger(total) || total < 2) return [];
-  const normalChunk = Math.max(1, Number(config?.parallelChunkBytes) || total);
-  const tailBytes = Math.min(total, Math.max(0, Number(config?.parallelTailBytes) || 0));
-  const tailChunk = Math.max(1, Math.min(normalChunk, Number(config?.parallelTailChunkBytes) || normalChunk));
-  const tailStart = Math.max(0, total - tailBytes);
-  const segments = [];
-  const append = (from, until, chunkBytes) => {
-    for (let start = from; start < until; start += chunkBytes) {
-      segments.push({ start, end: Math.min(until - 1, start + chunkBytes - 1), bytes: 0 });
-    }
-  };
-  append(0, tailStart, normalChunk);
-  append(tailStart, total, tailChunk);
-  if (segments.length >= 2 && segments.length <= MAX_PARALLEL_RANGE_COUNT) return segments;
-  const count = Math.min(MAX_PARALLEL_RANGE_COUNT, Math.max(2, Math.ceil(total / normalChunk)));
-  const chunk = Math.ceil(total / count);
-  return Array.from({ length: count }, (_, index) => {
-    const start = index * chunk;
-    return { start, end: Math.min(total - 1, start + chunk - 1), bytes: 0 };
-  });
 }
 
 async function fileCrc32(filePath, signal, onProgress = null) {
@@ -1232,6 +1195,10 @@ export class FirmwareDownloadService {
     // reclaimable configured ranges. A slow Samsung connection then holds
     // only one range instead of becoming the sole remaining 1/8th of a file.
     // The claimed ranges and their durable offsets still make pause/resume safe.
+    const requestedSegmentCount = Math.min(
+      MAX_PARALLEL_RANGE_COUNT,
+      Math.max(2, Math.ceil(total / this.config.parallelChunkBytes))
+    );
     const savedSegments = Array.isArray(job.parallel?.segments) ? job.parallel.segments : null;
     const savedFile = await stat(partPath).catch(() => null);
     const canResume = Boolean(
@@ -1248,6 +1215,7 @@ export class FirmwareDownloadService {
       }) && Number(savedSegments.at(-1)?.end) === total - 1
     );
     if (!canResume) {
+      const segmentSize = Math.ceil(total / requestedSegmentCount);
       const file = await open(partPath, "w+", 0o640);
       try {
         await file.truncate(total);
@@ -1256,7 +1224,10 @@ export class FirmwareDownloadService {
       }
       job.parallel = {
         total,
-        segments: buildParallelSegments(total, this.config)
+        segments: Array.from({ length: requestedSegmentCount }, (_, index) => {
+          const start = index * segmentSize;
+          return { start, end: Math.min(total - 1, start + segmentSize - 1), bytes: 0 };
+        })
       };
       job.bytes = 0;
       await this.persist();

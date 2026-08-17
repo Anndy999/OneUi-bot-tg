@@ -8,7 +8,6 @@ import { join } from "node:path";
 import { resolveVpsOfficialFirmwareDownload } from "../src/vps/fus-resolver.js";
 import {
   FirmwareDownloadService,
-  buildParallelSegments,
   buildDownloadApp,
   createDownloadConfig,
   isAllowedOfficialHost,
@@ -39,8 +38,6 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.parallelSegments, 8);
   assert.equal(config.parallelMaxSegments, 8);
   assert.equal(config.parallelChunkBytes, 1024 * 1024 * 1024);
-  assert.equal(config.parallelTailBytes, 2 * 1024 * 1024 * 1024);
-  assert.equal(config.parallelTailChunkBytes, 128 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 120 * 1024 * 1024);
   assert.equal(config.decryptMode, "stream");
@@ -61,19 +58,6 @@ test("download configuration defaults to an isolated local API", () => {
   assert.deepEqual(config.allowedHosts, ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"]);
   assert.equal(isAllowedOfficialHost("fota-cloud-dn.ospserver.net"), true);
   assert.equal(isAllowedOfficialHost("example.com"), false);
-});
-
-test("parallel tail keeps work-stealable ranges without shrinking the fast path", () => {
-  const GiB = 1024 * 1024 * 1024;
-  const MiB = 1024 * 1024;
-  const config = createDownloadConfig({});
-  const segments = buildParallelSegments(17 * GiB, config);
-  assert.equal(segments.length, 31);
-  assert.deepEqual(segments[0], { start: 0, end: GiB - 1, bytes: 0 });
-  const tail = segments.slice(-16);
-  assert.equal(tail[0].start, 15 * GiB);
-  assert.ok(tail.every((segment) => segment.end - segment.start + 1 === 128 * MiB));
-  assert.equal(tail.at(-1).end, 17 * GiB - 1);
 });
 
 test("download index can stay outside the public firmware directory", async () => {

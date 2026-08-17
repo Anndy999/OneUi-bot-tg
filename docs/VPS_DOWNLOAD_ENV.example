@@ -40,11 +40,6 @@ DOWNLOAD_PARALLEL_STAGGER_MS=100
 # authorization/throttling. A 17 GiB file still has more ranges than the eight
 # lanes, so pause/resume and work stealing remain available.
 DOWNLOAD_PARALLEL_CHUNK_BYTES=1073741824
-# Only the final two GiB uses smaller ranges, so the eight connections can
-# keep taking work near completion instead of one slow Range owning the tail.
-# This stays far below the request volume of an all-256-MiB profile.
-DOWNLOAD_PARALLEL_TAIL_BYTES=2147483648
-DOWNLOAD_PARALLEL_TAIL_CHUNK_BYTES=134217728
 # Commit 4 MiB at a time to reduce filesystem overhead without ever marking
 # bytes complete before their positional write succeeds. Valid range: 64 KiB-16 MiB.
 DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
