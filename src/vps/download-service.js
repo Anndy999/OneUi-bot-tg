@@ -1,4 +1,4 @@
-import { createDecipheriv, createHash, createHmac, randomUUID } from "node:crypto";
+import { createDecipheriv, createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, readdir } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
@@ -37,7 +37,6 @@ const DEFAULT_PARALLEL_MAX_LANES = 8;
 const DEFAULT_DECRYPT_MODE = "stream";
 const DEFAULT_DECRYPT_WORKER_COUNT = 3;
 const DEFAULT_DECRYPT_STREAM_CHUNK_BYTES = 16 * 1024 * 1024;
-const DEFAULT_PUBLIC_DOWNLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -71,35 +70,6 @@ function bytes(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function publicDownloadBaseUrl(value) {
-  const raw = text(value);
-  if (!raw) return "";
-  try {
-    const url = new URL(raw);
-    if (!["http:", "https:"].includes(url.protocol)) return "";
-    url.search = "";
-    url.hash = "";
-    return url.toString().replace(/\/+$/, "");
-  } catch {
-    return "";
-  }
-}
-
-function downloadLinkSignature(secret, id, expiresAtSeconds) {
-  return createHmac("sha256", String(secret || ""))
-    .update(`oneui-download-link\\n${id}\\n${expiresAtSeconds}`)
-    .digest("base64url");
-}
-
-function publicDownloadUrl(config, id, now = Date.now()) {
-  if (!config.publicDownloadBaseUrl || !config.apiSecret || !id) return "";
-  const expiresAtSeconds = Math.floor((now + config.publicDownloadTtlMs) / 1000);
-  const url = new URL(`/files/${encodeURIComponent(id)}`, `${config.publicDownloadBaseUrl}/`);
-  url.searchParams.set("expires", String(expiresAtSeconds));
-  url.searchParams.set("signature", downloadLinkSignature(config.apiSecret, id, expiresAtSeconds));
-  return url.toString();
-}
-
 export function createDownloadConfig(env = process.env) {
   const configuredHosts = text(env.DOWNLOAD_ALLOWED_HOSTS)
     .split(",")
@@ -128,13 +98,6 @@ export function createDownloadConfig(env = process.env) {
     dir,
     indexDir: resolve(text(env.DOWNLOAD_INDEX_DIR, dir)),
     apiSecret: text(env.DOWNLOAD_API_SECRET),
-    publicDownloadBaseUrl: publicDownloadBaseUrl(env.DOWNLOAD_PUBLIC_BASE_URL),
-    publicDownloadTtlMs: integer(
-      env.DOWNLOAD_PUBLIC_LINK_TTL_MS || DEFAULT_PUBLIC_DOWNLOAD_TTL_MS,
-      DEFAULT_PUBLIC_DOWNLOAD_TTL_MS,
-      60_000,
-      30 * 24 * 60 * 60 * 1000
-    ),
     redisUrl: text(env.REDIS_URL),
     queuePrefix: text(env.DOWNLOAD_QUEUE_PREFIX, "oneui-download"),
     maxBytes: bytes(env.DOWNLOAD_MAX_BYTES, 20 * 1024 ** 3),
@@ -266,7 +229,7 @@ function jsonSafe(value) {
   return JSON.stringify(value, null, 2);
 }
 
-function publicJob(job, config = null) {
+function publicJob(job) {
   const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, sourceVersion: _sourceVersion, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const verifying = safe.state === "verifying";
@@ -299,8 +262,7 @@ function publicJob(job, config = null) {
     totalRanges: Array.isArray(parallel.segments) ? parallel.segments.length : 0
   } : null;
   const version = normalizeFirmwareVersion(safe.version) || String(safe.version || "").trim();
-  const downloadUrl = safe.state === "completed" && config ? publicDownloadUrl(config, safe.id) : "";
-  return { ...safe, version, ...(downloadUrl ? { downloadUrl } : {}), percent, phasePercent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
+  return { ...safe, version, percent, phasePercent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
 }
 
 function resetSpeedTracking(job, phase, bytesAtStart, timestamp) {
@@ -973,7 +935,7 @@ export class FirmwareDownloadService {
       await this.persist();
       throw error;
     }
-    return publicJob(job, this.config);
+    return publicJob(job);
   }
 
   async reserveOutputName(id, requestedName) {
@@ -1008,11 +970,11 @@ export class FirmwareDownloadService {
     });
   }
 
-  list() { return [...this.jobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map((job) => publicJob(job, this.config)); }
+  list() { return [...this.jobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map(publicJob); }
 
   get(id) {
     const job = this.jobs.get(String(id));
-    return job ? publicJob(job, this.config) : null;
+    return job ? publicJob(job) : null;
   }
 
   async cancel(id) {
@@ -1836,21 +1798,6 @@ function requireDownloadKey(request, reply, secret) {
   return true;
 }
 
-function requireFileAccess(request, reply, config) {
-  if (constantTimeSecretEquals(config.apiSecret, firstHeader(request, "x-download-api-key"))) return true;
-  const expiresAtSeconds = Number(request.query?.expires || 0);
-  const signature = String(request.query?.signature || "");
-  const id = String(request.params?.id || "");
-  const valid = config.publicDownloadBaseUrl &&
-    Number.isInteger(expiresAtSeconds) &&
-    expiresAtSeconds >= Math.floor(Date.now() / 1000) &&
-    Boolean(signature) &&
-    constantTimeSecretEquals(downloadLinkSignature(config.apiSecret, id, expiresAtSeconds), signature);
-  if (valid) return true;
-  reply.code(403).send({ ok: false, error: "Forbidden" });
-  return false;
-}
-
 export function buildDownloadApp({ app = null, service, version = "1.0.0" } = {}) {
   if (!service) throw new TypeError("buildDownloadApp requires a FirmwareDownloadService");
   app ||= Fastify({
@@ -1934,7 +1881,7 @@ export function buildDownloadApp({ app = null, service, version = "1.0.0" } = {}
     }
   });
   app.get("/files/:id", async (request, reply) => {
-    if (!requireFileAccess(request, reply, service.config)) return;
+    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
     try {
       const file = await service.file(request.params.id);
       if (!file) { reply.code(404); return { ok: false, error: "Completed file not found" }; }

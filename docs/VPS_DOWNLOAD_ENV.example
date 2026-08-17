@@ -8,12 +8,6 @@ DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
 # Keep the internal task index outside public file-list directories.
 DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 DOWNLOAD_API_SECRET=REPLACE_WITH_A_RANDOM_SECRET
-# Optional HTTPS address already proxying this download service. Completed
-# administrator tasks receive a signed, temporary direct-download URL.
-DOWNLOAD_PUBLIC_BASE_URL=https://dl.example.com
-# A link is valid for seven days. It is signed with DOWNLOAD_API_SECRET and
-# does not expose that secret or the VPS file path.
-DOWNLOAD_PUBLIC_LINK_TTL_MS=604800000
 # Keep only official Samsung/FUS hosts. Add a host only after verification.
 DOWNLOAD_ALLOWED_HOSTS=samsung.com,samsungmobile.com,ospserver.net,cdngc.net
 DOWNLOAD_MAX_BYTES=21474836480

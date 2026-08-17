@@ -848,12 +848,7 @@ test("download API requires an admin key and serves only completed files", async
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({
-        DOWNLOAD_DIR: dir,
-        DOWNLOAD_API_SECRET: "test-download-secret",
-        DOWNLOAD_PUBLIC_BASE_URL: "https://dl.example.test",
-        DOWNLOAD_MIN_FREE_BYTES: "0"
-      }),
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       fetchImpl: async () => ({
         ok: true,
@@ -885,18 +880,6 @@ test("download API requires an admin key and serves only completed files", async
     const completed = await app.inject({ method: "GET", url: `/api/v1/downloads/${id}`, headers: { "x-download-api-key": "test-download-secret" } });
     assert.equal(completed.json().download.state, "completed");
     assert.equal(completed.json().download.percent, 100);
-    const directUrl = new URL(completed.json().download.downloadUrl);
-    assert.equal(directUrl.origin, "https://dl.example.test");
-    assert.equal(directUrl.pathname, `/files/${id}`);
-    assert.equal(directUrl.searchParams.has("signature"), true);
-    assert.equal(directUrl.toString().includes("test-download-secret"), false);
-
-    const signedFile = await app.inject({ method: "GET", url: `${directUrl.pathname}${directUrl.search}` });
-    assert.equal(signedFile.statusCode, 200);
-    assert.equal(signedFile.body, "hello world");
-    const rejectedSignature = await app.inject({ method: "GET", url: `${directUrl.pathname}?expires=${directUrl.searchParams.get("expires")}&signature=invalid` });
-    assert.equal(rejectedSignature.statusCode, 403);
-
     const file = await app.inject({ method: "GET", url: `/files/${id}`, headers: { "x-download-api-key": "test-download-secret" } });
     assert.equal(file.statusCode, 200);
     assert.equal(file.body, "hello world");
