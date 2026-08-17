@@ -1135,7 +1135,10 @@ function formatDownloadJob(job, lang = "zh", detailed = false) {
       lines.push(`${speedLabel}: ${formatBytes(job.speedBytesPerSecond)}/s · ${lang === "en" ? "ETA" : "剩余"}: ${formatDuration(job.etaSeconds)}`);
     }
   }
-  if (job.state === "completed") lines.push(`${lang === "en" ? "File" : "文件"}: ${job.originalName || job.fileName || "firmware"}`);
+  if (job.state === "completed") {
+    lines.push(`${lang === "en" ? "File" : "文件"}: ${job.originalName || job.fileName || "firmware"}`);
+    if (job.downloadUrl) lines.push(`${lang === "en" ? "Download" : "下载链接"}: ${job.downloadUrl}`);
+  }
   if (job.state === "failed" && job.error) lines.push(`${lang === "en" ? "Reason" : "原因"}: ${String(job.error).slice(0, 220)}`);
   if (detailed) lines.push(`${lang === "en" ? "Task" : "任务"}: ${job.id}`);
   return lines.join("\n");

@@ -1,4 +1,4 @@
-import { createDecipheriv, createHash, randomUUID } from "node:crypto";
+import { createDecipheriv, createHash, createHmac, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, mkdir, open, readFile, rename, rm, stat, statfs, writeFile, readdir } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
@@ -13,6 +13,7 @@ import { Queue, Worker as BullWorker } from "bullmq";
 import Redis from "ioredis";
 import { constantTimeSecretEquals } from "./config.js";
 import { resolveVpsOfficialFirmwareDownload } from "./fus-resolver.js";
+import { normalizeFirmwareVersion } from "../firmware-version.js";
 
 const DEFAULT_ALLOWED_HOSTS = ["samsung.com", "samsungmobile.com", "ospserver.net", "cdngc.net"];
 const MAX_REDIRECTS = 5;
@@ -31,13 +32,12 @@ const MAX_PARALLEL_RANGE_COUNT = 512;
 const MAX_PARALLEL_LANE_COUNT = 12;
 const DEFAULT_PARALLEL_LANES = 8;
 const DEFAULT_PARALLEL_MAX_LANES = 8;
-// Samsung firmware AES-ECB blocks are independent. A bounded three-worker
-// pipeline lets a four-core VPS use native OpenSSL without taking every core
-// away from the download service. The stream mode remains available for
-// constrained hosts or diagnostics.
-const DEFAULT_DECRYPT_MODE = "parallel";
+// Bifrost's fast path keeps one native AES-ECB stream alive from input to
+// output. On the VPS this avoids cross-thread copies and ordered write waits.
+const DEFAULT_DECRYPT_MODE = "stream";
 const DEFAULT_DECRYPT_WORKER_COUNT = 3;
 const DEFAULT_DECRYPT_STREAM_CHUNK_BYTES = 16 * 1024 * 1024;
+const DEFAULT_PUBLIC_DOWNLOAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_STATES = new Set(["queued", "downloading", "verifying", "decrypting", "paused", "completed", "failed", "cancelled"]);
 
 class OfficialSourceAuthorizationError extends Error {
@@ -71,6 +71,35 @@ function bytes(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function publicDownloadBaseUrl(value) {
+  const raw = text(value);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function downloadLinkSignature(secret, id, expiresAtSeconds) {
+  return createHmac("sha256", String(secret || ""))
+    .update(`oneui-download-link\\n${id}\\n${expiresAtSeconds}`)
+    .digest("base64url");
+}
+
+function publicDownloadUrl(config, id, now = Date.now()) {
+  if (!config.publicDownloadBaseUrl || !config.apiSecret || !id) return "";
+  const expiresAtSeconds = Math.floor((now + config.publicDownloadTtlMs) / 1000);
+  const url = new URL(`/files/${encodeURIComponent(id)}`, `${config.publicDownloadBaseUrl}/`);
+  url.searchParams.set("expires", String(expiresAtSeconds));
+  url.searchParams.set("signature", downloadLinkSignature(config.apiSecret, id, expiresAtSeconds));
+  return url.toString();
+}
+
 export function createDownloadConfig(env = process.env) {
   const configuredHosts = text(env.DOWNLOAD_ALLOWED_HOSTS)
     .split(",")
@@ -99,6 +128,13 @@ export function createDownloadConfig(env = process.env) {
     dir,
     indexDir: resolve(text(env.DOWNLOAD_INDEX_DIR, dir)),
     apiSecret: text(env.DOWNLOAD_API_SECRET),
+    publicDownloadBaseUrl: publicDownloadBaseUrl(env.DOWNLOAD_PUBLIC_BASE_URL),
+    publicDownloadTtlMs: integer(
+      env.DOWNLOAD_PUBLIC_LINK_TTL_MS || DEFAULT_PUBLIC_DOWNLOAD_TTL_MS,
+      DEFAULT_PUBLIC_DOWNLOAD_TTL_MS,
+      60_000,
+      30 * 24 * 60 * 60 * 1000
+    ),
     redisUrl: text(env.REDIS_URL),
     queuePrefix: text(env.DOWNLOAD_QUEUE_PREFIX, "oneui-download"),
     maxBytes: bytes(env.DOWNLOAD_MAX_BYTES, 20 * 1024 ** 3),
@@ -122,7 +158,10 @@ export function createDownloadConfig(env = process.env) {
     parallelMinBytes: bytes(env.DOWNLOAD_PARALLEL_MIN_BYTES, 64 * 1024 * 1024),
     parallelChunkBytes: Math.max(8 * 1024 * 1024, Math.min(
       1024 * 1024 * 1024,
-      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 256 * 1024 * 1024)
+      // One GiB keeps the eight lanes long-lived enough that Samsung FUS does
+      // not repeatedly throttle fresh Range requests midway through a large
+      // firmware. It still creates several reclaimable ranges for safe resume.
+      bytes(env.DOWNLOAD_PARALLEL_CHUNK_BYTES, 1024 * 1024 * 1024)
     )),
     parallelRetries: integer(env.DOWNLOAD_PARALLEL_RETRIES || 3, 3, 0, 5),
     parallelWriteBatchBytes: Math.max(64 * 1024, Math.min(
@@ -227,8 +266,8 @@ function jsonSafe(value) {
   return JSON.stringify(value, null, 2);
 }
 
-function publicJob(job) {
-  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
+function publicJob(job, config = null) {
+  const { sourceUrl: _sourceUrl, sourceUrlHash: _sourceUrlHash, sourceHeaders: _sourceHeaders, sourceVersion: _sourceVersion, decryption: _decryption, encryptedFileName: _encryptedFileName, expectedCrc32: _expectedCrc32, filePath: _filePath, parallel: parallel, downloadStartBytes: _downloadStartBytes, speedSamples: _speedSamples, speedPhase: _speedPhase, downloadComplete: _downloadComplete, downloadVerified: _downloadVerified, ...safe } = job;
   const decrypting = safe.state === "decrypting";
   const verifying = safe.state === "verifying";
   const progressBytes = decrypting
@@ -259,7 +298,9 @@ function publicJob(job) {
     completedRanges: Math.max(0, Number(parallel.completedRanges || 0)),
     totalRanges: Array.isArray(parallel.segments) ? parallel.segments.length : 0
   } : null;
-  return { ...safe, percent, phasePercent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
+  const version = normalizeFirmwareVersion(safe.version) || String(safe.version || "").trim();
+  const downloadUrl = safe.state === "completed" && config ? publicDownloadUrl(config, safe.id) : "";
+  return { ...safe, version, ...(downloadUrl ? { downloadUrl } : {}), percent, phasePercent, speedBytesPerSecond, speedWindowSeconds: SPEED_WINDOW_MS / 1000, etaSeconds, transfer };
 }
 
 function resetSpeedTracking(job, phase, bytesAtStart, timestamp) {
@@ -867,7 +908,7 @@ export class FirmwareDownloadService {
     }
     const model = String(resolved.model || payload.model).toUpperCase();
     const csc = String(resolved.csc || payload.csc).toUpperCase();
-    const version = String(resolved.version || payload.version);
+    const version = normalizeFirmwareVersion(resolved.version || payload.version) || String(resolved.version || payload.version || "").trim();
     return {
       model,
       csc,
@@ -897,7 +938,10 @@ export class FirmwareDownloadService {
       : "firmware.bin";
     const model = firmwareLabel(payload.model);
     const csc = firmwareLabel(payload.csc);
-    const version = String(payload.version || "unknown");
+    // Keep Samsung's raw version strictly for the FUS request. Some responses
+    // include a legacy fourth PDA component, which users should never see.
+    const sourceVersion = String(payload.version || "unknown");
+    const version = normalizeFirmwareVersion(sourceVersion) || sourceVersion;
     const outputName = await this.reserveOutputName(id, firmwareOutputName(model, csc, version, sourceName));
     const job = {
       id,
@@ -905,6 +949,7 @@ export class FirmwareDownloadService {
       model,
       csc,
       version,
+      sourceVersion,
       fileName: outputName,
       originalName: outputName,
       sourceHost: sourceUrl?.hostname || "",
@@ -928,7 +973,7 @@ export class FirmwareDownloadService {
       await this.persist();
       throw error;
     }
-    return publicJob(job);
+    return publicJob(job, this.config);
   }
 
   async reserveOutputName(id, requestedName) {
@@ -963,11 +1008,11 @@ export class FirmwareDownloadService {
     });
   }
 
-  list() { return [...this.jobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map(publicJob); }
+  list() { return [...this.jobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).map((job) => publicJob(job, this.config)); }
 
   get(id) {
     const job = this.jobs.get(String(id));
-    return job ? publicJob(job) : null;
+    return job ? publicJob(job, this.config) : null;
   }
 
   async cancel(id) {
@@ -1182,9 +1227,9 @@ export class FirmwareDownloadService {
     if (total > this.config.maxBytes) throw new Error("firmware file exceeds DOWNLOAD_MAX_BYTES");
     job.totalBytes = total;
     // Keep the eight network lanes bounded, but split a large file into
-    // reclaimable 256 MiB ranges. A slow Samsung connection then holds only
-    // one range instead of becoming the sole remaining 1/8th of a file. The
-    // claimed ranges and their durable offsets still make pause/resume safe.
+    // reclaimable configured ranges. A slow Samsung connection then holds
+    // only one range instead of becoming the sole remaining 1/8th of a file.
+    // The claimed ranges and their durable offsets still make pause/resume safe.
     const requestedSegmentCount = Math.min(
       MAX_PARALLEL_RANGE_COUNT,
       Math.max(2, Math.ceil(total / this.config.parallelChunkBytes))
@@ -1471,7 +1516,7 @@ export class FirmwareDownloadService {
       await this.persist();
       let actualCrc32 = null;
       const resolveFusJob = async ({ refresh = false } = {}) => {
-        const resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.version, { role: "admin", signal: controller.signal });
+        const resolved = await this.resolveImpl(this.fusEnv, job.model, job.csc, job.sourceVersion || job.version, { role: "admin", signal: controller.signal });
         const nextSourceUrl = String(resolved.sourceUrl || "");
         const nextEncryptedFileName = safeName(resolved.fileName, "firmware.bin");
         const nextExpectedCrc32 = expectedCrc32(resolved.crc32);
@@ -1502,7 +1547,10 @@ export class FirmwareDownloadService {
         job.encryptedFileName = nextEncryptedFileName;
         job.decryption = nextDecryption;
         if (nextExpectedCrc32 !== null || !refresh) job.expectedCrc32 = nextExpectedCrc32;
-        if (resolved.version) job.version = resolved.version;
+        if (resolved.version) {
+          job.sourceVersion = String(resolved.version);
+          job.version = normalizeFirmwareVersion(resolved.version) || String(resolved.version);
+        }
         const outputName = firmwareOutputName(job.model, job.csc, job.version, nextEncryptedFileName);
         if (!refresh) job.fileName = await this.reserveOutputName(job.id, outputName);
         job.originalName = job.fileName;
@@ -1788,6 +1836,21 @@ function requireDownloadKey(request, reply, secret) {
   return true;
 }
 
+function requireFileAccess(request, reply, config) {
+  if (constantTimeSecretEquals(config.apiSecret, firstHeader(request, "x-download-api-key"))) return true;
+  const expiresAtSeconds = Number(request.query?.expires || 0);
+  const signature = String(request.query?.signature || "");
+  const id = String(request.params?.id || "");
+  const valid = config.publicDownloadBaseUrl &&
+    Number.isInteger(expiresAtSeconds) &&
+    expiresAtSeconds >= Math.floor(Date.now() / 1000) &&
+    Boolean(signature) &&
+    constantTimeSecretEquals(downloadLinkSignature(config.apiSecret, id, expiresAtSeconds), signature);
+  if (valid) return true;
+  reply.code(403).send({ ok: false, error: "Forbidden" });
+  return false;
+}
+
 export function buildDownloadApp({ app = null, service, version = "1.0.0" } = {}) {
   if (!service) throw new TypeError("buildDownloadApp requires a FirmwareDownloadService");
   app ||= Fastify({
@@ -1871,7 +1934,7 @@ export function buildDownloadApp({ app = null, service, version = "1.0.0" } = {}
     }
   });
   app.get("/files/:id", async (request, reply) => {
-    if (!requireDownloadKey(request, reply, service.config.apiSecret)) return;
+    if (!requireFileAccess(request, reply, service.config)) return;
     try {
       const file = await service.file(request.params.id);
       if (!file) { reply.code(404); return { ok: false, error: "Completed file not found" }; }

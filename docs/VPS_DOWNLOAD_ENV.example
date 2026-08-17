@@ -8,6 +8,12 @@ DOWNLOAD_DIR=/opt/oneui-bot/data/firmware
 # Keep the internal task index outside public file-list directories.
 DOWNLOAD_INDEX_DIR=/opt/oneui-bot/data/download-state
 DOWNLOAD_API_SECRET=REPLACE_WITH_A_RANDOM_SECRET
+# Optional HTTPS address already proxying this download service. Completed
+# administrator tasks receive a signed, temporary direct-download URL.
+DOWNLOAD_PUBLIC_BASE_URL=https://dl.example.com
+# A link is valid for seven days. It is signed with DOWNLOAD_API_SECRET and
+# does not expose that secret or the VPS file path.
+DOWNLOAD_PUBLIC_LINK_TTL_MS=604800000
 # Keep only official Samsung/FUS hosts. Add a host only after verification.
 DOWNLOAD_ALLOWED_HOSTS=samsung.com,samsungmobile.com,ospserver.net,cdngc.net
 DOWNLOAD_MAX_BYTES=21474836480
@@ -36,9 +42,9 @@ DOWNLOAD_PARALLEL_SCALE_STEP=2
 # explicit experiment only; do not use the old 16/24 burst profile.
 # Stagger parallel connection setup to avoid Samsung source throttling.
 DOWNLOAD_PARALLEL_STAGGER_MS=100
-# 256 MiB reclaimable ranges let eight lanes pick up more work when a Samsung
-# connection slows down, avoiding a single slow final 1/8th of a large file.
-DOWNLOAD_PARALLEL_CHUNK_BYTES=268435456
+# One GiB ranges retain eight long-lived Samsung sessions and substantially
+# reduce mid-download reauthorization/reconnect waves. They remain resumable.
+DOWNLOAD_PARALLEL_CHUNK_BYTES=1073741824
 # Commit 4 MiB at a time to reduce filesystem overhead without ever marking
 # bytes complete before their positional write succeeds. Valid range: 64 KiB-16 MiB.
 DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
@@ -46,13 +52,9 @@ DOWNLOAD_PARALLEL_WRITE_BATCH_BYTES=4194304
 DOWNLOAD_PARALLEL_MIN_BYTES=67108864
 # Retry a failed individual Range before falling back to one connection.
 DOWNLOAD_PARALLEL_RETRIES=3
-# Native AES-ECB uses three bounded workers on a four-core VPS. The worker
-# path transfers buffers without copying and preserves sequential file output.
-DOWNLOAD_DECRYPT_MODE=parallel
-DOWNLOAD_DECRYPT_WORKERS=3
-DOWNLOAD_DECRYPT_WORKER_MIN_BYTES=134217728
-DOWNLOAD_DECRYPT_CHUNK_BYTES=16777216
-# Stream mode remains available for constrained hosts and uses 16 MiB I/O.
+# Bifrost-style native AES-ECB stream: no worker-message copying or random
+# writes. This is the recommended VPS profile and uses 16 MiB sequential I/O.
+DOWNLOAD_DECRYPT_MODE=stream
 DOWNLOAD_DECRYPT_STREAM_CHUNK_BYTES=16777216
 # A paused Range-capable download resumes its saved byte ranges after restart.
 # Do not manually delete *.part files; use the Telegram Delete button instead.

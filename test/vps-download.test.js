@@ -37,10 +37,10 @@ test("download configuration defaults to an isolated local API", () => {
   assert.equal(config.indexDir, config.dir);
   assert.equal(config.parallelSegments, 8);
   assert.equal(config.parallelMaxSegments, 8);
-  assert.equal(config.parallelChunkBytes, 256 * 1024 * 1024);
+  assert.equal(config.parallelChunkBytes, 1024 * 1024 * 1024);
   assert.equal(config.parallelWriteBatchBytes, 4 * 1024 * 1024);
   assert.equal(config.parallelScaleTargetBytesPerSecond, 120 * 1024 * 1024);
-  assert.equal(config.decryptMode, "parallel");
+  assert.equal(config.decryptMode, "stream");
   assert.equal(config.decryptStreamChunkBytes, 16 * 1024 * 1024);
   assert.equal(config.decryptWorkerCount, 3);
   assert.equal(config.decryptWorkerMinBytes, 128 * 1024 * 1024);
@@ -122,6 +122,38 @@ test("friendly firmware output names include model and CSC without overwriting a
     assert.equal(await service.reserveOutputName(id, requested), requested);
     await writeFile(join(dir, requested), "already here");
     assert.equal(await service.reserveOutputName(id, requested), "SM-S9180_CHC_S9180ZCS8FZG1_12345678.zip");
+    await service.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("download cards normalize duplicate version fields without changing the FUS request", async () => {
+  const dir = await tempDir();
+  const rawVersion = "F9760ZSS2AZH7/F9760OZS2AZH7/F9760ZCS2AZH5/F9760ZSS2AZH7";
+  let requestedVersion = "";
+  try {
+    const service = await new FirmwareDownloadService({
+      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_MIN_FREE_BYTES: "0" }),
+      lookupImpl: async () => [{ address: "93.184.216.34" }],
+      resolveImpl: async (_env, _model, _csc, version) => {
+        requestedVersion = version;
+        return {
+          sourceUrl: "https://fota-cloud-dn.ospserver.net/firmware/fold.zip",
+          fileName: "SM-F9760_TGY_TEST.zip",
+          version,
+          size: 5
+        };
+      },
+      fetchImpl: async () => new Response("hello", { status: 200, headers: { "content-length": "5" } })
+    }).init({ startQueue: false });
+    const preview = await service.preview({ model: "SM-F9760", csc: "TGY", version: rawVersion });
+    assert.equal(preview.version, "F9760ZSS2AZH7/F9760OZS2AZH7/F9760ZCS2AZH5");
+    const created = await service.create({ model: "SM-F9760", csc: "TGY", version: rawVersion }, "owner");
+    assert.equal(service.get(created.id).version, preview.version);
+    await service.runJob({ data: { id: created.id } });
+    assert.equal(requestedVersion, rawVersion);
+    assert.equal(service.get(created.id).version, preview.version);
     await service.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -816,7 +848,12 @@ test("download API requires an admin key and serves only completed files", async
   const dir = await tempDir();
   try {
     const service = await new FirmwareDownloadService({
-      config: createDownloadConfig({ DOWNLOAD_DIR: dir, DOWNLOAD_API_SECRET: "test-download-secret", DOWNLOAD_MIN_FREE_BYTES: "0" }),
+      config: createDownloadConfig({
+        DOWNLOAD_DIR: dir,
+        DOWNLOAD_API_SECRET: "test-download-secret",
+        DOWNLOAD_PUBLIC_BASE_URL: "https://dl.example.test",
+        DOWNLOAD_MIN_FREE_BYTES: "0"
+      }),
       lookupImpl: async () => [{ address: "93.184.216.34" }],
       fetchImpl: async () => ({
         ok: true,
@@ -848,6 +885,17 @@ test("download API requires an admin key and serves only completed files", async
     const completed = await app.inject({ method: "GET", url: `/api/v1/downloads/${id}`, headers: { "x-download-api-key": "test-download-secret" } });
     assert.equal(completed.json().download.state, "completed");
     assert.equal(completed.json().download.percent, 100);
+    const directUrl = new URL(completed.json().download.downloadUrl);
+    assert.equal(directUrl.origin, "https://dl.example.test");
+    assert.equal(directUrl.pathname, `/files/${id}`);
+    assert.equal(directUrl.searchParams.has("signature"), true);
+    assert.equal(directUrl.toString().includes("test-download-secret"), false);
+
+    const signedFile = await app.inject({ method: "GET", url: `${directUrl.pathname}${directUrl.search}` });
+    assert.equal(signedFile.statusCode, 200);
+    assert.equal(signedFile.body, "hello world");
+    const rejectedSignature = await app.inject({ method: "GET", url: `${directUrl.pathname}?expires=${directUrl.searchParams.get("expires")}&signature=invalid` });
+    assert.equal(rejectedSignature.statusCode, 403);
 
     const file = await app.inject({ method: "GET", url: `/files/${id}`, headers: { "x-download-api-key": "test-download-secret" } });
     assert.equal(file.statusCode, 200);

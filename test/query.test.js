@@ -1635,6 +1635,17 @@ test("expired FUS sessions are renewed before the next History request", async (
   assert.equal(nonceCalls, 2);
 });
 
+test("query card removes a duplicated legacy fourth firmware component", () => {
+  const raw = "F9760ZSS2AZH7/F9760OZS2AZH7/F9760ZCS2AZH5/F9760ZSS2AZH7";
+  const card = formatFirmwareResult({
+    model: "SM-F9760",
+    csc: "TGY",
+    latest: raw
+  }, { lang: "zh" });
+  assert.match(card, /F9760ZSS2AZH7\/F9760OZS2AZH7\/F9760ZCS2AZH5/);
+  assert.doesNotMatch(card, /F9760ZCS2AZH5\/F9760ZSS2AZH7/);
+});
+
 test("compact SmartHistory versions resolve through official Samsung metadata", async () => {
   globalThis.fetch = async (url) => {
     assert.match(String(url), /fota-cloud-dn\.ospserver\.net\/firmware\/TGY\/SM-S9480\/version\.xml/);
