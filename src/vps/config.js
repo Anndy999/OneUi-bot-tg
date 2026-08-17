@@ -36,7 +36,9 @@ export function createVpsConfig(env = process.env) {
     scheduleIntervalMs: bounded(env.VPS_SCHEDULE_INTERVAL_MS, 60_000, 15_000, 10 * 60_000),
     requestTimeoutMs: bounded(env.VPS_REQUEST_TIMEOUT_MS, 30_000, 5_000, 5 * 60_000),
     healthTimeoutMs: bounded(env.VPS_HEALTH_TIMEOUT_MS, 5_000, 1_000, 30_000),
-    telegramWorkerConcurrency: bounded(env.TELEGRAM_WORKER_CONCURRENCY, 3, 1, 8),
+    // Four bounded firmware lookups can wait in the shared scheduler while two
+    // extra workers keep callbacks and menus responsive.
+    telegramWorkerConcurrency: bounded(env.TELEGRAM_WORKER_CONCURRENCY, 6, 1, 8),
     notificationWorkerConcurrency: bounded(env.NOTIFICATION_WORKER_CONCURRENCY, 4, 1, 8),
     monitorWorkerConcurrency: bounded(env.MONITOR_WORKER_CONCURRENCY, 2, 1, 4),
     scheduleStaleMs: bounded(env.VPS_SCHEDULE_STALE_MS, 5 * 60_000, 60_000, 30 * 60_000),

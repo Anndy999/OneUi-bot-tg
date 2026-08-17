@@ -15,7 +15,9 @@ import {
 import { adminHelpParts, guideText } from "./guides.js";
 import { formatSchedule, processMonitorQueueMessage, runMonitor, runScheduledTasks } from "./monitor.js";
 import { coordinatedFirmwareQuery } from "./firmware-query-coordinator.js";
+import { scheduleInteractiveFirmwareQuery } from "./interactive-query-scheduler.js";
 import { queryFirmwareHistory, queryFirmwareHybrid } from "./samsung.js";
+import { beginTelegramInteraction, isTelegramInteractionCurrent } from "./telegram-interaction.js";
 import { applyFlagshipProposalDecision } from "./flagship-priority.js";
 import {
   addRolloutTarget,
@@ -171,7 +173,7 @@ import {
 export { MonitorScheduler } from "./monitor-scheduler.js";
 export { FirmwareQueryCoordinator } from "./firmware-query-coordinator.js";
 
-const APP_VERSION = "2.22.1";
+const APP_VERSION = "2.22.2";
 
 export default {
   async fetch(request, env, ctx) {
@@ -2135,6 +2137,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
   // The webhook has already returned 200. Finish the short Telegram callback
   // acknowledgement before any KV or FUS work so the client clears its spinner.
   await answerCallbackQuery(env, callbackQuery.id, callbackProgressText(data));
+  const interaction = beginTelegramInteraction(chatId, messageId);
 
   if (data === "menu:home") {
     const identity = await getIdentity(env, chatId);
@@ -2275,6 +2278,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       ctx,
       query: { model, csc },
       targetMessageId: messageId,
+      interaction,
       silentPlaceholder: true
     }));
     return;
@@ -2310,6 +2314,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       ctx,
       query: { model, csc },
       targetMessageId: messageId,
+      interaction,
       silentPlaceholder: true
     }));
     return;
@@ -2397,6 +2402,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       ctx,
       query: { model: request.model, csc: request.csc, version: request.version },
       targetMessageId: messageId,
+      interaction,
       silentPlaceholder: true
     }));
     return;
@@ -2427,6 +2433,7 @@ async function handleCallback(callbackQuery, env, ctx = null) {
       ctx,
       refresh: true,
       targetMessageId: messageId,
+      interaction,
       silentPlaceholder: true
     }));
     return;
@@ -4217,6 +4224,9 @@ async function handleManualQuery(env, chatId, text, options = {}) {
   };
 
   const deliver = async (body, markup = keyboard, deliveryOptions = {}) => {
+    // A later callback may have already replaced this panel. Do not let an old
+    // Samsung response overwrite the user's newer selection.
+    if (options.interaction && !isTelegramInteractionCurrent(options.interaction)) return outputMessageId;
     let delivered = false;
     if (outputMessageId) {
       delivered = await safeEditOrSend(env, chatId, outputMessageId, body, markup);
@@ -4301,6 +4311,11 @@ async function handleManualQuery(env, chatId, text, options = {}) {
     });
     return cacheValue;
   };
+  // Bound distinct live requests across all chats while sharing equivalent
+  // requests. Monitoring has its own worker/queue and is intentionally not
+  // part of this interactive limit.
+  const sharedQueryKey = [query.model, query.csc, query.version || "latest"].join(":");
+  const fetchLiveScheduled = () => scheduleInteractiveFirmwareQuery(env, sharedQueryKey, fetchLive);
 
   if (!query.version && !forceRefresh && cacheSettings.enabled) {
     const negative = getNegativeFirmware(query.model, query.csc);
@@ -4400,7 +4415,7 @@ async function handleManualQuery(env, chatId, text, options = {}) {
           totalBeforeTelegramMs: Date.now() - startedAt,
           degraded: kvCached.degraded
         });
-        runBackground(options.ctx, fetchLive().then((cacheValue) => deliver(formatFirmwareResult(cacheValue, {
+        runBackground(options.ctx, fetchLiveScheduled().then((cacheValue) => deliver(formatFirmwareResult(cacheValue, {
           source: cacheValue.source,
           queriedAt: cacheValue.cachedAt,
           elapsedMs: Date.now() - startedAt,
@@ -4415,7 +4430,7 @@ async function handleManualQuery(env, chatId, text, options = {}) {
 
   let liveCompleted = false;
   let placeholderStarted = false;
-  const livePromise = fetchLive();
+  const livePromise = fetchLiveScheduled();
   const placeholderPromise = (!options.silentPlaceholder && (options.targetMessageId || telegramQueryPlaceholderEnabled(env)))
     ? waitFor(300).then(async () => {
       if (liveCompleted) return;

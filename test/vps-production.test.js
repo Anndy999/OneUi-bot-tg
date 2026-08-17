@@ -2,10 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createPersistentQueueBinding, validateVpsProductionEnv } from "../src/vps/production.js";
 import { OFFSET_KEY, startTelegramPolling } from "../src/vps/telegram-polling.js";
-import { withTelegramChatOrder } from "../src/vps/workers.js";
+import { processTelegramJob, withTelegramChatOrder } from "../src/vps/workers.js";
 import { randomId } from "../src/runtime/random-id.js";
 import { PersistentNamespace } from "../src/runtime/postgres.js";
 import { createVpsConfig } from "../src/vps/config.js";
+import {
+  interactiveQuerySchedulerSnapshot,
+  scheduleInteractiveFirmwareQuery
+} from "../src/interactive-query-scheduler.js";
+import {
+  beginTelegramInteraction,
+  isTelegramInteractionCurrent,
+  resetTelegramInteractionStateForTest
+} from "../src/telegram-interaction.js";
 
 const webhookSecret = ["webhook", "test", "secret"].join("-");
 const webhookKey = ["WEBHOOK", "SECRET"].join("_");
@@ -48,6 +57,19 @@ test("VPS queue binding adds retry and retention policy without exposing payload
   assert.equal(received.options.jobId, "notification:test");
   assert.equal(received.options.attempts, 5);
   assert.equal(received.options.backoff.type, "exponential");
+});
+
+test("VPS queue binding preserves an explicit interactive priority", async () => {
+  let received;
+  const binding = createPersistentQueueBinding({
+    async add(_name, _data, options) {
+      received = options;
+      return { id: options.jobId };
+    }
+  });
+  await binding.send({ id: "telegram-update:1" }, { priority: 1 });
+  assert.equal(received.priority, 1);
+  assert.equal(received.attempts, 5);
 });
 
 test("portable random IDs work when the runtime has no Web Crypto global", () => {
@@ -129,9 +151,36 @@ test("VPS Telegram polling persists one offset per burst", async () => {
   await poller.close();
 });
 
+test("VPS Telegram polling prioritizes callback acknowledgements", async () => {
+  let queued;
+  let resolveQueued;
+  const queuedOnce = new Promise((resolve) => { resolveQueued = resolve; });
+  const poller = startTelegramPolling({
+    token: "poll-token",
+    storage: { async get() { return null; }, async put() {} },
+    queue: {
+      async send(data, options) {
+        queued = { data, options };
+        resolveQueued();
+      }
+    },
+    logger: { error() {}, warn() {} },
+    fetchImpl: async (_url, init) => ({
+      ok: true,
+      async json() {
+        return { ok: true, result: [{ update_id: 44, callback_query: { id: "button-1" } }] };
+      }
+    })
+  });
+  await queuedOnce;
+  await poller.close();
+  assert.equal(queued.data.id, "telegram-update:44");
+  assert.equal(queued.options.priority, 1);
+});
+
 test("VPS concurrency and stale-loop settings stay within safe bounds", () => {
   const defaults = createVpsConfig({});
-  assert.equal(defaults.telegramWorkerConcurrency, 3);
+  assert.equal(defaults.telegramWorkerConcurrency, 6);
   assert.equal(defaults.monitorWorkerConcurrency, 2);
   assert.equal(defaults.scheduleStaleMs, 5 * 60_000);
   const bounded = createVpsConfig({
@@ -209,6 +258,80 @@ test("VPS Telegram jobs serialize one chat without blocking another chat", async
   releaseFirst();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["first-start", "other", "first-end", "second"]);
+});
+
+test("a slow query does not hold the same chat's later callback lane", async () => {
+  const background = new Set();
+  const events = [];
+  let releaseSlow;
+  const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
+  const runtime = {
+    env: {},
+    context: { pendingBackground: () => new Set(background) }
+  };
+  const processUpdate = async (update) => {
+    if (update.kind === "slow") {
+      const task = slowGate.finally(() => background.delete(task));
+      background.add(task);
+      events.push("slow-started");
+      return;
+    }
+    events.push("callback-ran");
+  };
+  const slow = processTelegramJob({ id: "slow", data: { update: { kind: "slow", message: { chat: { id: 9 } } } } }, runtime, "", processUpdate);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const callback = processTelegramJob({ id: "callback", data: { update: { kind: "callback", callback_query: { message: { chat: { id: 9 } } } } } }, runtime, "", processUpdate);
+  await callback;
+  assert.deepEqual(events, ["slow-started", "callback-ran"]);
+  releaseSlow();
+  await slow;
+});
+
+test("interactive firmware scheduler shares equal work and bounds distinct requests", async () => {
+  const env = { INTERACTIVE_QUERY_CONCURRENCY: "2" };
+  const events = [];
+  let releaseFirst;
+  let releaseSecond;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const first = scheduleInteractiveFirmwareQuery(env, "SM-S9110:TGY:latest", async () => {
+    events.push("first-start");
+    await firstGate;
+    events.push("first-end");
+    return "first";
+  });
+  const shared = scheduleInteractiveFirmwareQuery(env, "SM-S9110:TGY:latest", async () => {
+    throw new Error("equal work must not run twice");
+  });
+  const second = scheduleInteractiveFirmwareQuery(env, "SM-S9110:KOO:latest", async () => {
+    events.push("second-start");
+    await secondGate;
+    events.push("second-end");
+    return "second";
+  });
+  const third = scheduleInteractiveFirmwareQuery(env, "SM-S9110:CHC:latest", async () => {
+    events.push("third");
+    return "third";
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(first, shared);
+  assert.deepEqual(events, ["first-start", "second-start"]);
+  assert.deepEqual(interactiveQuerySchedulerSnapshot(env), { active: 2, waiting: 1, shared: 3 });
+  releaseFirst();
+  releaseSecond();
+  assert.deepEqual(await Promise.all([first, shared, second, third]), ["first", "first", "second", "third"]);
+  assert.deepEqual(events, ["first-start", "second-start", "first-end", "second-end", "third"]);
+});
+
+test("newer Telegram interaction prevents stale panel delivery", () => {
+  resetTelegramInteractionStateForTest();
+  const first = beginTelegramInteraction("chat", "message", 1000);
+  const second = beginTelegramInteraction("chat", "message", 1001);
+  const other = beginTelegramInteraction("chat", "other", 1001);
+  assert.equal(isTelegramInteractionCurrent(first, 1001), false);
+  assert.equal(isTelegramInteractionCurrent(second, 1001), true);
+  assert.equal(isTelegramInteractionCurrent(other, 1001), true);
+  assert.equal(isTelegramInteractionCurrent(second, 1000 + 10 * 60_000 + 1), false);
 });
 
 test("PersistentNamespace restores due alarms and finishes transactional background work before commit", async () => {

@@ -110,7 +110,7 @@ export function startTelegramPolling({
             kind: "telegram_update",
             update,
             createdAt: new Date().toISOString()
-          });
+          }, update.callback_query ? { priority: 1 } : { priority: 5 });
           nextOffset = Math.max(Number(nextOffset || 0), id + 1);
           lastActivityAt = Date.now();
         }

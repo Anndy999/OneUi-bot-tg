@@ -54,16 +54,21 @@ export async function withTelegramChatOrder(chatId, task) {
   }
 }
 
-async function processTelegramJob(job, runtime, origin) {
+export async function processTelegramJob(job, runtime, origin, processUpdate = processTelegramUpdate) {
   const data = job.data || {};
   const update = data.update || data;
   const chatId = String(chatIdFromUpdate(update) || `update:${update?.update_id || job.id}`);
-  return withTelegramChatOrder(chatId, async () => {
-    const pendingBefore = runtime.context.pendingBackground?.() || new Set();
-    await processTelegramUpdate(update, runtime.env, origin, runtime.context);
-    await runtime.context.waitForBackground({ exclude: pendingBefore });
-    return { ok: true };
+  const pendingBefore = runtime.context.pendingBackground?.() || new Set();
+  await withTelegramChatOrder(chatId, async () => {
+    await processUpdate(update, runtime.env, origin, runtime.context);
   });
+  // Release the chat's control lane before waiting for this update's slow work.
+  // The BullMQ job itself still stays active until its own background tasks end,
+  // so a process restart can retry it instead of silently dropping a query.
+  const ownBackground = [...(runtime.context.pendingBackground?.() || [])]
+    .filter((task) => !pendingBefore.has(task));
+  await Promise.allSettled(ownBackground);
+  return { ok: true };
 }
 
 async function processMaintenanceJob(job, runtime) {
