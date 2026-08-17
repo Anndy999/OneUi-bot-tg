@@ -26,7 +26,7 @@ import {
 import { FirmwareQueryCoordinator } from "../src/firmware-query-coordinator.js";
 import { enqueueTelegramNotification, processNotificationQueue } from "../src/notification-queue.js";
 import { queryFirmwareHybrid } from "../src/samsung.js";
-import worker, { openListFirmwareUrl } from "../src/index.js";
+import worker, { displayFirmwareFileName, openListFirmwareUrl } from "../src/index.js";
 import { buildFirmwareCacheRecord } from "../src/firmware-cache.js";
 import { defaultSchedule, normalizeMonitorItems, notifyAllowedUsersOnUpdate } from "../src/config.js";
 import {
@@ -113,6 +113,14 @@ test("completed downloads can link to an existing login-protected OpenList path"
   assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "https://files.example" }, { state: "downloading", fileName: "a.zip" }), "");
   assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "http://files.example" }, { state: "completed", fileName: "a.zip" }), "");
   assert.equal(openListFirmwareUrl({ OPENLIST_BASE_URL: "https://files.example", OPENLIST_FIRMWARE_PATH: "../firmware" }, { state: "completed", fileName: "a.zip" }), "");
+});
+
+test("completed download cards use a short model and CSC file label", () => {
+  assert.equal(
+    displayFirmwareFileName({ model: "sm-s9110", csc: "tgy", fileName: "SM-S9110_TGY_S9110ZHS8FZG1_a1b2c3d4.zip" }),
+    "SM-S9110_TGY.zip"
+  );
+  assert.equal(displayFirmwareFileName({}), "firmware.zip");
 });
 
 function memoryKv() {
