@@ -34,6 +34,7 @@ import {
   formatSchedule,
   processPendingUpdateReminders,
   runMonitor,
+  runScheduledTasks,
   nextMonitorSchedule,
   selectDueMonitorItems,
   shouldRunNow
@@ -79,9 +80,11 @@ import {
   createRolloutProposalForUpdate,
   getRolloutItemScheduleDecision,
   getRolloutChains,
+  applyOneTimeEuropeanRolloutRecovery,
   restartDependentRolloutChain,
   setRolloutChainSettings
 } from "../src/rollout-chain.js";
+import { setRolloutChainsState } from "../src/state.js";
 import { normalizeReleaseWindowGroups, releaseWindowPeers, validateModelCsc } from "../src/targets.js";
 import {
   applyFlagshipProposalDecision,
@@ -3559,6 +3562,47 @@ test("S25 waits for S26 Korea and only the recovery path can start it manually",
   const items = await getMonitorItems(env);
   assert.equal(items.find((item) => item.model === "SM-S938N" && item.csc === "KOO").enabled, true);
   assert.equal(items.find((item) => item.model === "SM-S938B" && item.csc === "EUX").enabled, false);
+});
+
+test("the one-time EU rollout recovery activates S26 and S25 Europe exactly once", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  // Simulate the stored rollout state from before this recovery release. New
+  // installations receive the marker in their default state and are untouched.
+  await setRolloutChainsState(env, { schemaVersion: 2, chains: [] });
+  const now = new Date("2026-08-26T08:00:00.000Z");
+  const applied = await applyOneTimeEuropeanRolloutRecovery(env, now);
+  assert.equal(applied.ok, true);
+  assert.equal(applied.applied, true);
+
+  const chains = await getRolloutChains(env);
+  for (const id of ["s26", "s25"]) {
+    const chain = chains.chains.find((entry) => entry.id === id);
+    assert.equal(chain.enabled, true);
+    assert.equal(chain.status, "active");
+    assert.equal(chain.activeStageId, "eu");
+  }
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S948B" && item.csc === "EUX").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S938B" && item.csc === "EUX").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S948N" && item.csc === "KOO").enabled, false);
+  assert.equal(items.find((item) => item.model === "SM-S938N" && item.csc === "KOO").enabled, false);
+
+  const again = await applyOneTimeEuropeanRolloutRecovery(env, new Date("2026-08-26T08:05:00.000Z"));
+  assert.equal(again.ok, true);
+  assert.equal(again.applied, false);
+  assert.equal(again.reason, "applied");
+  assert.equal((await getRolloutChains(env)).oneTimeRecoveries.filter((entry) => entry.id === "2026-08-26-s26-s25-eu").length, 1);
+});
+
+test("scheduled startup applies the one-time EU recovery even while ordinary monitoring is paused", async () => {
+  resetStateMemoryCache();
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await setRolloutChainsState(env, { schemaVersion: 2, chains: [] });
+  await setMonitorSchedule(env, { enabled: false, startTime: "00:00", endTime: "23:59" });
+  const result = await runScheduledTasks(env);
+  assert.equal(result.rolloutRecovery.applied, true);
+  assert.equal(result.monitor.skipped, true);
+  assert.equal((await getRolloutChains(env)).chains.find((entry) => entry.id === "s26").activeStageId, "eu");
 });
 
 test("administrator help explains role boundaries and administrator setup", () => {

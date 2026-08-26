@@ -36,6 +36,7 @@ import {
 } from "./flagship-priority.js";
 import {
   createRolloutProposalForUpdate,
+  applyOneTimeEuropeanRolloutRecovery,
   getRolloutItemScheduleDecision,
   isRolloutItemWithinSchedule,
   rolloutProposalKeyboard,
@@ -83,11 +84,23 @@ const monitorTargetFlights = new Map();
 
 export async function runScheduledTasks(env) {
   if (scheduledTasksPromise) return scheduledTasksPromise;
-  scheduledTasksPromise = runScheduledMonitor(env).then(async (monitorSummary) => ({
-    ok: true,
-    monitor: monitorSummary,
-    dailySummary: await maybeSendDailyMonitorSummary(env)
-  })).finally(() => {
+  scheduledTasksPromise = (async () => {
+    // Must run before the normal schedule decision. The recovery is a durable
+    // one-shot, so a service restart applies it immediately even if ordinary
+    // monitor hours are currently closed.
+    const rolloutRecovery = await applyOneTimeEuropeanRolloutRecovery(env)
+      .catch((error) => {
+        console.log(`One-time EU rollout recovery deferred: ${error.message}`);
+        return { ok: false, applied: false, reason: "storage_error" };
+      });
+    const monitorSummary = await runScheduledMonitor(env);
+    return {
+      ok: true,
+      monitor: monitorSummary,
+      rolloutRecovery,
+      dailySummary: await maybeSendDailyMonitorSummary(env)
+    };
+  })().finally(() => {
     scheduledTasksPromise = null;
   });
   return scheduledTasksPromise;

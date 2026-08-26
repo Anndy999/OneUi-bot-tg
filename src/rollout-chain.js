@@ -7,6 +7,7 @@ import {
   getRolloutProposal,
   putRolloutProposal,
   recordMonitorEvent,
+  forceMonitorDue,
   setRolloutChainsState,
   snoozeMonitorItem,
   upsertMonitorItem
@@ -22,6 +23,11 @@ const STAGES = [
 // Exact retail targets verified from Samsung's public product/support pages.
 // The rollout chains remain disabled until an administrator enables them.
 const OFFICIAL_PRESET_VERSION = 1;
+// Production missed this specific rollout transition while the bot was
+// unavailable.  It is intentionally a one-time state migration, not a new
+// release-chain rule: existing installations consume it once, while fresh
+// installations are created with the marker already satisfied.
+const ONE_TIME_EU_RECOVERY_ID = "2026-08-26-s26-s25-eu";
 const OFFICIAL_TARGETS = {
   s26: {
     kr: [
@@ -157,8 +163,13 @@ function normalizeChain(raw = {}, fallback) {
 
 export function defaultRolloutChains() {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     officialPresetVersion: OFFICIAL_PRESET_VERSION,
+    oneTimeRecoveries: [{
+      id: ONE_TIME_EU_RECOVERY_ID,
+      status: "not_applicable",
+      appliedAt: new Date().toISOString()
+    }],
     chains: DEFAULT_CHAINS.map((chain) => normalizeChain({}, chain)),
     updatedAt: new Date().toISOString()
   };
@@ -174,8 +185,15 @@ export function normalizeRolloutChains(value) {
   const seedOfficialTargets = !hasConfiguredTargets && !Number(value?.officialPresetVersion);
   const byId = new Map((seedOfficialTargets ? [] : rawChains).map((chain) => [String(chain?.id || "").trim(), chain]));
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     officialPresetVersion: Number(value?.officialPresetVersion) || OFFICIAL_PRESET_VERSION,
+    oneTimeRecoveries: (Array.isArray(value?.oneTimeRecoveries) ? value.oneTimeRecoveries : [])
+      .map((entry) => ({
+        id: cleanText(entry?.id, 80),
+        status: cleanText(entry?.status, 32),
+        appliedAt: cleanText(entry?.appliedAt, 40)
+      }))
+      .filter((entry) => entry.id),
     chains: DEFAULT_CHAINS.map((fallback) => normalizeChain(byId.get(fallback.id) || {}, fallback)),
     updatedAt: cleanText(value?.updatedAt, 40) || new Date().toISOString()
   };
@@ -322,6 +340,64 @@ export async function restartDependentRolloutChain(env, chainId) {
   chain.enabled = true;
   await activateOnlyStage(env, chain, firstStage);
   return saveChains(env, chains);
+}
+
+// This is deliberately not exposed through Telegram controls. It exists only
+// to repair the single missed 2026 S26/S25 transition: both chains move to the
+// already-configured EU stage, then continue through their normal next-stage
+// confirmation flow. The persisted marker makes repeated service restarts a
+// no-op.
+export async function applyOneTimeEuropeanRolloutRecovery(env, now = new Date()) {
+  const chains = await getRolloutChains(env);
+  const existing = chains.oneTimeRecoveries.find((entry) => entry.id === ONE_TIME_EU_RECOVERY_ID);
+  if (existing) return { ok: true, applied: false, reason: existing.status || "already_applied", recovery: existing };
+
+  const recoveries = ["s26", "s25"].map((chainId) => {
+    const chain = findChain(chains, chainId);
+    const stage = findStage(chain, "eu");
+    return { chain, stage };
+  });
+  const missing = recoveries.filter(({ chain, stage }) => !chain || !stage?.targets.length);
+  if (missing.length) {
+    const recovery = {
+      id: ONE_TIME_EU_RECOVERY_ID,
+      status: "skipped_missing_targets",
+      appliedAt: now.toISOString()
+    };
+    chains.oneTimeRecoveries.push(recovery);
+    await saveChains(env, chains);
+    console.log("One-time EU rollout recovery skipped: configured EU targets are missing.");
+    return { ok: false, applied: false, reason: recovery.status, recovery };
+  }
+
+  for (const { chain, stage } of recoveries) {
+    chain.enabled = true;
+    chain.status = "active";
+    chain.activeStageId = stage.id;
+    chain.pendingProposalId = "";
+    await activateOnlyStage(env, chain, stage);
+    await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
+  }
+  const recovery = {
+    id: ONE_TIME_EU_RECOVERY_ID,
+    status: "applied",
+    appliedAt: now.toISOString(),
+    chains: recoveries.map(({ chain }) => chain.id)
+  };
+  chains.oneTimeRecoveries.push(recovery);
+  await saveChains(env, chains);
+  await recordMonitorEvent(env, {
+    type: "rollout_one_time_eu_recovery",
+    // Monitor events are keyed by a valid Model / CSC pair. The detail keeps
+    // the complete scope while the event remains compatible with that store.
+    model: "SM-S948B",
+    csc: "EUX",
+    name: "One-time EU recovery",
+    detail: "S26 and S25 EU monitoring enabled after missed rollout transition",
+    at: recovery.appliedAt
+  });
+  console.log("One-time EU rollout recovery applied for S26 and S25.");
+  return { ok: true, applied: true, recovery, chains: ["s26", "s25"] };
 }
 
 export async function setRolloutChainStage(env, chainId, stageId) {
