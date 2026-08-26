@@ -82,8 +82,7 @@ export async function coordinatedFirmwareQuery(env, model, csc, options = {}) {
   if (!binding) {
     return queryFirmwareHybrid(env, model, csc, {
       ...options,
-      allowOfficialMetadataFallback: !options.monitor,
-      preferOfficialMetadata: !options.monitor
+      allowOfficialMetadataFallback: !options.monitor
     });
   }
 
@@ -247,8 +246,7 @@ export class FirmwareQueryCoordinator {
         .then(() => queryFirmwareHybrid(this.env, target.model, target.csc, {
           role,
           monitor: role === "monitor",
-          allowOfficialMetadataFallback: role !== "monitor",
-          preferOfficialMetadata: role !== "monitor"
+          allowOfficialMetadataFallback: role !== "monitor"
         }))
         .then(async (result) => {
           const isExactHistory = result.parsed?.sourceType === "smart_history";

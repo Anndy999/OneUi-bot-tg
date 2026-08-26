@@ -114,10 +114,11 @@ function requireExactCsc(parsed, csc) {
   throw error;
 }
 
-function canUseOfficialMetadataFallback(error) {
-  const code = String(error?.code || "");
-  if (code === "FUS_SMART_HISTORY_EMPTY") return true;
-  return code === "FUS_SMART_HISTORY_STATUS" && String(error?.status || "") === "S02";
+function canUseOfficialMetadataFallback(error, options = {}) {
+  // A caller cancellation must stay cancelled; every upstream SmartHistory
+  // failure is otherwise eligible for the public version.xml fallback.
+  if (options.signal?.aborted || error?.name === "AbortError") return false;
+  return true;
 }
 
 function officialMetadataResult(model, csc, version, historyError, queryTiming) {
@@ -167,17 +168,21 @@ export async function queryFirmwareHistory(env, model, csc, options = {}) {
 }
 
 export async function queryFirmwareHybrid(env, model, csc, options = {}) {
-  // Monitoring stays History-only so an incomplete official metadata record
-  // can never trigger a false update notification. Interactive and admin
-  // queries can use Samsung's official version.xml, matching Bifrost's FOTA
-  // first strategy, with SmartHistory as the richer fallback.
+  // Monitoring stays History-only so an incomplete version.xml record can
+  // never trigger a false update notification. Interactive and admin queries
+  // use exact SmartHistory first, then fall back to version.xml only when
+  // SmartHistory has no usable exact public record or its request fails.
   if (options.monitor || options.allowOfficialMetadataFallback !== true) {
     return queryFirmwareHistory(env, model, csc, options);
   }
 
   const normalized = validateModelCsc(model, csc);
   const startedAt = Date.now();
-  if (options.preferOfficialMetadata === true) {
+  try {
+    return await queryFirmwareHistory(env, normalized.model, normalized.csc, options);
+  } catch (historyError) {
+    if (!canUseOfficialMetadataFallback(historyError, options)) throw historyError;
+    const historyMs = Date.now() - startedAt;
     const metadataStartedAt = Date.now();
     try {
       const version = await resolveOfficialFirmwareVersion(
@@ -187,42 +192,18 @@ export async function queryFirmwareHybrid(env, model, csc, options = {}) {
         options.requestedVersion || "",
         options
       );
-      return officialMetadataResult(normalized.model, normalized.csc, version, null, {
+      return officialMetadataResult(normalized.model, normalized.csc, version, historyError, {
+        historyMs,
         officialMetadataMs: Date.now() - metadataStartedAt,
         totalMs: Date.now() - startedAt,
         singleFlightJoined: false
       });
-    } catch (metadataError) {
-      try {
-        return await queryFirmwareHistory(env, normalized.model, normalized.csc, options);
-      } catch (historyError) {
-        // Preserve the more useful official endpoint error when both Samsung
-        // endpoints have no usable record for this exact model/CSC.
-        if (canUseOfficialMetadataFallback(historyError)) throw metadataError;
-        throw historyError;
-      }
+    } catch {
+      // When both sources fail, retain SmartHistory's exact-CSC diagnostics
+      // (including official alternatives) instead of replacing them with a
+      // less actionable version.xml transport error.
+      throw historyError;
     }
-  }
-
-  try {
-    return await queryFirmwareHistory(env, normalized.model, normalized.csc, options);
-  } catch (historyError) {
-    if (!canUseOfficialMetadataFallback(historyError)) throw historyError;
-    const historyMs = Date.now() - startedAt;
-    const metadataStartedAt = Date.now();
-    const version = await resolveOfficialFirmwareVersion(
-      env,
-      normalized.model,
-      normalized.csc,
-      options.requestedVersion || "",
-      options
-    );
-    return officialMetadataResult(normalized.model, normalized.csc, version, historyError, {
-      historyMs,
-      officialMetadataMs: Date.now() - metadataStartedAt,
-      totalMs: Date.now() - startedAt,
-      singleFlightJoined: false
-    });
   }
 }
 

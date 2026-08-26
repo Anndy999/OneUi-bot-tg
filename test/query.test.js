@@ -462,48 +462,156 @@ test("History-only queries never request version XML", async () => {
   assert.equal(xmlCalls, 0);
 });
 
-test("interactive queries prefer official version.xml for every CSC", async () => {
+test("interactive latest query prefers newer exact SmartHistory over older version XML", async () => {
   resetFusSession();
+  let xmlCalls = 0;
   globalThis.fetch = async (url) => {
     const value = String(url);
-    if (value.includes("version.xml")) {
-      return new Response("<firmware><version><latest>S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1</latest></version></firmware>");
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([
+        historyRow({
+          model: "SM-S942N",
+          localCsc: "KOO",
+          sequence: "2",
+          version: "S942NKSS4AZHA/S942NOKR4AZHA/S942NKSS4AZG1"
+        })
+      ]));
     }
-    throw new Error(`Unexpected non-official query URL: ${value}`);
+    if (value.includes("version.xml")) {
+      xmlCalls += 1;
+      return new Response(versionDocument("S942NKSS4AZG5/S942NOKR4AZG5/S942NKSS4AZG1"));
+    }
+    throw new Error(`Unexpected query URL: ${value}`);
   };
 
-  const result = await queryFirmwareHybrid(env, "SM-S9480", "CHC", {
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
     role: "interactive",
     allowOfficialMetadataFallback: true,
     preferOfficialMetadata: true
   });
-  assert.equal(result.latest, "S9480ZCS4AZG1/S9480CHC4AZG1/S9480ZCS4AZG1/S9480ZCS4AZG1");
-  assert.equal(result.sourceType, "version_xml");
-  assert.equal(result.selectedSource, "version_xml");
-  assert.equal(result.degraded, false);
+  assert.equal(result.latest, "S942NKSS4AZHA/S942NOKR4AZHA/S942NKSS4AZG1");
+  assert.equal(result.sourceType, "smart_history");
+  assert.equal(result.selectedSource, "history");
+  assert.equal(xmlCalls, 0);
 });
 
-test("interactive query uses SmartHistory when official version.xml is unavailable", async () => {
+test("interactive latest query accepts matching SmartHistory and version XML versions", async () => {
   resetFusSession();
-  const version = "S9380NEW1/S9380CHC1/S9380MODEM1";
+  const version = "S942NKSS4AZHA/S942NOKR4AZHA/S942NKSS4AZG1";
+  let xmlCalls = 0;
   globalThis.fetch = async (url) => {
     const value = String(url);
-    if (value.includes("version.xml")) return new Response("unavailable", { status: 403 });
     if (value.includes("GenerateNonce")) return nonceResponse();
     if (value.includes("SmartHistory")) {
       return new Response(historyDocument([
-        historyRow({ sequence: "1", localCsc: "CHC", version })
+        historyRow({ model: "SM-S942N", sequence: "2", localCsc: "KOO", version })
+      ]));
+    }
+    if (value.includes("version.xml")) {
+      xmlCalls += 1;
+      return new Response(versionDocument(version));
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true
+  });
+  assert.equal(result.latest, version);
+  assert.equal(result.sourceType, "smart_history");
+  assert.equal(xmlCalls, 0);
+});
+
+test("interactive latest query falls back to version XML when SmartHistory is empty", async () => {
+  resetFusSession();
+  const fallbackVersion = "S942NKSS4AZG5/S942NOKR4AZG5/S942NKSS4AZG1";
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) return new Response(historyDocument([]));
+    if (value.includes("version.xml")) return new Response(versionDocument(fallbackVersion));
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true
+  });
+  assert.equal(result.latest, `${fallbackVersion}/${fallbackVersion.split("/")[0]}`);
+  assert.equal(result.sourceType, "version_xml");
+  assert.equal(result.fallbackUsed, true);
+});
+
+test("interactive latest query falls back to version XML after SmartHistory request failure", async () => {
+  resetFusSession();
+  const fallbackVersion = "S942NKSS4AZG5/S942NOKR4AZG5/S942NKSS4AZG1";
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) return new Response("failure", { status: 500 });
+    if (value.includes("version.xml")) return new Response(versionDocument(fallbackVersion));
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true
+  });
+  assert.equal(result.sourceType, "version_xml");
+  assert.equal(result.latest, `${fallbackVersion}/${fallbackVersion.split("/")[0]}`);
+});
+
+test("interactive latest query never uses a different CSC SmartHistory record", async () => {
+  resetFusSession();
+  const fallbackVersion = "S942NKSS4AZG5/S942NOKR4AZG5/S942NKSS4AZG1";
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([
+        historyRow({
+          model: "SM-S942N",
+          localCsc: "EUX",
+          sequence: "99",
+          version: "S942NXXU9AZHA/S942NEUX9AZHA/S942NXXU9AZHA"
+        })
+      ]));
+    }
+    if (value.includes("version.xml")) return new Response(versionDocument(fallbackVersion));
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
+    role: "interactive",
+    allowOfficialMetadataFallback: true
+  });
+  assert.equal(result.sourceType, "version_xml");
+  assert.equal(result.latest, `${fallbackVersion}/${fallbackVersion.split("/")[0]}`);
+  assert.doesNotMatch(result.latest, /EUX|AZHA/);
+});
+
+test("interactive latest query filters SmartHistory beta rows before selecting the newest formal firmware", async () => {
+  resetFusSession();
+  const formalVersion = "S942NKSS4AZHA/S942NOKR4AZHA/S942NKSS4AZG1";
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([
+        historyRow({ model: "SM-S942N", localCsc: "KOO", sequence: "2", version: formalVersion }),
+        historyRow({ model: "SM-S942N", localCsc: "KOO", sequence: "99", os: "Z(Android 99)", version: "S942NKZU9BETA/S942NKOO9BETA/S942NKZU9BETA" })
       ]));
     }
     throw new Error(`Unexpected URL: ${value}`);
   };
 
-  const result = await queryFirmwareHybrid(env, "SM-S9380", "CHC", {
+  const result = await queryFirmwareHybrid(env, "SM-S942N", "KOO", {
     role: "interactive",
-    allowOfficialMetadataFallback: true,
-    preferOfficialMetadata: true
+    allowOfficialMetadataFallback: true
   });
-  assert.equal(result.latest, version);
+  assert.equal(result.latest, formalVersion);
   assert.equal(result.sourceType, "smart_history");
 });
 
@@ -2367,6 +2475,46 @@ test("FirmwareQueryCoordinator globally shares one History request and micro-cac
   const cached = await call();
   assert.equal(cached.coordinator.cacheHit, true);
   assert.equal(historyCalls, 1);
+});
+
+test("FirmwareQueryCoordinator refresh bypasses an older cached result and refetches SmartHistory", async () => {
+  resetFusSession();
+  const coordinator = new FirmwareQueryCoordinator({ storage: memoryDoStorage() }, {
+    ...env,
+    QUERY_COORDINATOR_CACHE_MS: "5000"
+  });
+  const oldVersion = "S942NKSS4AZG5/S942NOKR4AZG5/S942NKSS4AZG1";
+  const newVersion = "S942NKSS4AZHA/S942NOKR4AZHA/S942NKSS4AZG1";
+  let liveVersion = oldVersion;
+  let historyCalls = 0;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      historyCalls += 1;
+      return new Response(historyDocument([
+        historyRow({ model: "SM-S942N", localCsc: "KOO", sequence: historyCalls, version: liveVersion })
+      ]));
+    }
+    if (value.includes("version.xml")) throw new Error("version.xml must not replace usable SmartHistory");
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+  const request = (refresh) => coordinator.fetch(new Request("https://firmware-query/query", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "SM-S942N", csc: "KOO", role: "interactive", refresh })
+  }));
+
+  const cached = await request(false);
+  assert.equal(cached.status, 200);
+  assert.equal((await cached.json()).result.latest, oldVersion);
+  liveVersion = newVersion;
+  const refreshed = await request(true);
+  assert.equal(refreshed.status, 200);
+  const body = await refreshed.json();
+  assert.equal(body.result.latest, newVersion);
+  assert.equal(body.result.parsed.sourceType, "smart_history");
+  assert.equal(historyCalls, 2);
 });
 
 test("FirmwareQueryCoordinator negative-caches exact-CSC failures across object restarts", async () => {
