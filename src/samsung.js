@@ -108,7 +108,10 @@ function wrapParsed(parsed, model, csc, rawOutput, extra = {}) {
 
 function requireExactCsc(parsed, csc) {
   const matchType = String(parsed?.smartHistory?.cscMatchType || "").toLowerCase();
-  if (matchType === "local" || matchType === "buyer") return;
+  // The SmartHistory request itself is scoped by the requested CSC. Bifrost
+  // trusts generic BINARY_INFO rows returned by that scoped request, so accept
+  // them here as well while still rejecting explicitly foreign rows.
+  if (matchType === "local" || matchType === "buyer" || matchType === "generic") return;
   const error = new Error(`SmartHistory 未返回 ${csc} 的精确 CSC 固件记录`);
   error.code = "EXACT_CSC_REQUIRED";
   throw error;
@@ -168,10 +171,11 @@ export async function queryFirmwareHistory(env, model, csc, options = {}) {
 }
 
 export async function queryFirmwareHybrid(env, model, csc, options = {}) {
-  // Monitoring stays History-only so an incomplete version.xml record can
-  // never trigger a false update notification. Interactive and admin queries
-  // use exact SmartHistory first, then fall back to version.xml only when
-  // SmartHistory has no usable exact public record or its request fails.
+  // Bifrost-compatible source order: SmartHistory is the primary latest-version
+  // source. version.xml remains a fallback for interactive/admin queries only
+  // when History has no usable scoped record or the History request fails.
+  // Monitoring stays History-first/History-only to avoid promoting an
+  // incomplete metadata tuple to an automatic release notification.
   if (options.monitor || options.allowOfficialMetadataFallback !== true) {
     return queryFirmwareHistory(env, model, csc, options);
   }

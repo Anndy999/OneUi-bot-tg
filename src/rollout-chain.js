@@ -28,6 +28,7 @@ const OFFICIAL_PRESET_VERSION = 1;
 // release-chain rule: existing installations consume it once, while fresh
 // installations are created with the marker already satisfied.
 const ONE_TIME_EU_RECOVERY_ID = "2026-08-26-s26-s25-eu";
+const ONE_TIME_S25_HK_RECOVERY_ID = "2026-08-31-s25-eu-to-hk";
 const OFFICIAL_TARGETS = {
   s26: {
     kr: [
@@ -165,11 +166,18 @@ export function defaultRolloutChains() {
   return {
     schemaVersion: 3,
     officialPresetVersion: OFFICIAL_PRESET_VERSION,
-    oneTimeRecoveries: [{
-      id: ONE_TIME_EU_RECOVERY_ID,
-      status: "not_applicable",
-      appliedAt: new Date().toISOString()
-    }],
+    oneTimeRecoveries: [
+      {
+        id: ONE_TIME_EU_RECOVERY_ID,
+        status: "not_applicable",
+        appliedAt: new Date().toISOString()
+      },
+      {
+        id: ONE_TIME_S25_HK_RECOVERY_ID,
+        status: "not_applicable",
+        appliedAt: new Date().toISOString()
+      }
+    ],
     chains: DEFAULT_CHAINS.map((chain) => normalizeChain({}, chain)),
     updatedAt: new Date().toISOString()
   };
@@ -398,6 +406,63 @@ export async function applyOneTimeEuropeanRolloutRecovery(env, now = new Date())
   });
   console.log("One-time EU rollout recovery applied for S26 and S25.");
   return { ok: true, applied: true, recovery, chains: ["s26", "s25"] };
+}
+
+// Production reached the S25 EU stage through the 2026-08-26 recovery, but the
+// subsequent EU release was missed while SmartHistory querying diverged from
+// Bifrost. The owner confirmed that the S25 EU wave has already shipped, so an
+// upgraded existing installation should resume from the next normal stage:
+// Hong Kong (TGY). Fresh installations carry a not_applicable marker and are
+// never force-advanced by this migration.
+export async function applyOneTimeS25HongKongRolloutRecovery(env, now = new Date()) {
+  const chains = await getRolloutChains(env);
+  const existing = chains.oneTimeRecoveries.find((entry) => entry.id === ONE_TIME_S25_HK_RECOVERY_ID);
+  if (existing) return { ok: true, applied: false, reason: existing.status || "already_applied", recovery: existing };
+
+  const chain = findChain(chains, "s25");
+  const stage = findStage(chain, "hk");
+  let status = "applied";
+
+  if (!chain || !stage?.targets.length) {
+    status = "skipped_missing_targets";
+  } else if (!chain.enabled || chain.activeStageId !== "eu") {
+    status = "not_applicable";
+  }
+
+  const recovery = {
+    id: ONE_TIME_S25_HK_RECOVERY_ID,
+    status,
+    appliedAt: now.toISOString()
+  };
+
+  if (status !== "applied") {
+    chains.oneTimeRecoveries.push(recovery);
+    await saveChains(env, chains);
+    console.log(`One-time S25 HK rollout recovery skipped: ${status}.`);
+    return { ok: status !== "skipped_missing_targets", applied: false, reason: status, recovery };
+  }
+
+  chain.enabled = true;
+  chain.status = "active";
+  chain.activeStageId = stage.id;
+  chain.pendingProposalId = "";
+  await activateOnlyStage(env, chain, stage);
+  await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
+
+  recovery.chain = chain.id;
+  recovery.stage = stage.id;
+  chains.oneTimeRecoveries.push(recovery);
+  await saveChains(env, chains);
+  await recordMonitorEvent(env, {
+    type: "rollout_one_time_s25_hk_recovery",
+    model: "SM-S9380",
+    csc: "TGY",
+    name: "S25 Hong Kong recovery",
+    detail: "S25 EU release already completed; Hong Kong monitoring activated",
+    at: recovery.appliedAt
+  });
+  console.log("One-time S25 rollout recovery advanced Europe -> Hong Kong.");
+  return { ok: true, applied: true, recovery, chain: "s25", stage: "hk" };
 }
 
 export async function setRolloutChainStage(env, chainId, stageId) {

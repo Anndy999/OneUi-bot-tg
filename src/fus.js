@@ -613,8 +613,10 @@ async function authHeader(lane, signature = "") {
   const sig = String(signature || "").trim();
   const serverNonce = lane.session?.serverNonce || lane.session?.nonce || "";
   if (sig) {
-    const logicNonce = lane.session?.nonce || serverNonce;
-    return `FUS nonce="${serverNonce}", signature="${await makeSignatureHash(logicNonce, sig)}", nc="00000001", type="auth", realm="interface"`;
+    // Bifrost signs interface-authenticated requests with the raw NONCE value
+    // returned by Samsung. The decrypted nonce is only used for the legacy
+    // session-auth signature when no interface signature is supplied.
+    return `FUS nonce="${serverNonce}", signature="${await makeSignatureHash(serverNonce, sig)}", nc="00000001", type="auth", realm="interface"`;
   }
   return `FUS nonce="${serverNonce}", signature="${lane.session?.auth || ""}", nc="", type="", realm=""`;
 }
@@ -779,7 +781,11 @@ export async function makeFusRequest(env, requestPath, data, signature, retry = 
 export async function querySmartHistory(env, model, csc, options = {}) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const body = smartHistoryBody(normalizedModel, normalizedCsc);
-  const xml = await makeFusRequest(env, HISTORY_PATH, body, "", true, {
+  // Match Bifrost's current VersionFetch.performHistoryRequest(): SmartHistory
+  // is an interface-authenticated request and the model name is its signature.
+  // An unsigned request can still return data, but Samsung may serve a stale or
+  // incomplete History view for newly staged firmware.
+  const xml = await makeFusRequest(env, HISTORY_PATH, body, normalizedModel, true, {
     ...options,
     model: normalizedModel,
     csc: normalizedCsc
@@ -905,23 +911,6 @@ export function fusPoolSnapshot() {
 }
 
 
-function isFutureOpenDate(value, now = Date.now()) {
-  const text = String(value || "").trim();
-  if (!/^\d{8}$/.test(text)) return false;
-  const year = Number(text.slice(0, 4));
-  const month = Number(text.slice(4, 6));
-  const day = Number(text.slice(6, 8));
-  const parsed = Date.UTC(year, month - 1, day);
-  if (!Number.isFinite(parsed)) return false;
-  const today = new Date(now);
-  const tomorrowUtc = Date.UTC(
-    today.getUTCFullYear(),
-    today.getUTCMonth(),
-    today.getUTCDate() + 1
-  );
-  return parsed > tomorrowUtc;
-}
-
 export function parseSmartHistoryRows(xml, model, csc) {
   const { model: normalizedModel, csc: normalizedCsc } = validateModelCsc(model, csc);
   const blocks = collectTags(xml, "BINARY_INFO");
@@ -975,13 +964,11 @@ export function parseSmartHistoryRows(xml, model, csc) {
     if (!row.latest) return false;
     if (row.rawAndroid === "Z(Android 99)") return false;
     if (row.model && row.model !== normalizedModel) return false;
-    // Samsung occasionally leaves withdrawn/unavailable records in History.
-    // Only reject explicit false values; unknown or missing values remain valid
-    // until their semantics are confirmed from real responses.
-    if (/^(?:0|N|NO|FALSE)$/i.test(String(row.exists || "").trim())) return false;
-    // Only accept records whose public/open date is not in the future. Unknown
-    // formats stay eligible because Samsung does not document every legacy format.
-    if (isFutureOpenDate(row.openDate)) return false;
+    // Keep Bifrost's History eligibility semantics: once Samsung returns a
+    // non-beta BINARY_INFO row for this exact Model/CSC request, BINARY_EXIST
+    // and BINARY_OPEN_DATE are metadata, not publication gates. Newly staged
+    // firmware can appear before those fields look "public" and must remain
+    // visible to an early-warning monitor.
     return true;
   });
 }
@@ -1020,16 +1007,19 @@ export function parseSmartHistory(xml, model, csc, options = {}) {
     throw error;
   }
 
-  // Never allow a higher sequence from another CSC to masquerade as the
-  // requested region. Prefer exact local CSC, then buyer CSC, then generic rows.
-  const bestCscRank = Math.max(...rows.map((row) => row.cscRank));
-  if (bestCscRank <= 0) {
+  // Samsung's request body already scopes SmartHistory by BINARY_LOCAL_CODE.
+  // Follow Bifrost by selecting the newest sequence from that response. Keep a
+  // narrow safety guard against rows that explicitly identify only a different
+  // CSC; generic rows remain eligible because Samsung may omit the CSC fields
+  // on newly staged records.
+  const scopedRows = rows.filter((row) => row.cscRank > 0);
+  if (!scopedRows.length) {
     const error = new Error(`SmartHistory has no matching CSC record for ${normalizedCsc}`);
     error.code = "EXACT_CSC_REQUIRED";
     error.officialCscOptions = officialCscOptionsFromSmartHistoryRows(rows);
     throw error;
   }
-  let candidates = rows.filter((row) => row.cscRank === bestCscRank);
+  let candidates = scopedRows;
   const requestedVersion = normalizeFirmwareVersion(options.requestedVersion || "");
   if (requestedVersion) {
     const requestedParts = requestedVersion.split("/").filter(Boolean);
@@ -1046,8 +1036,7 @@ export function parseSmartHistory(xml, model, csc, options = {}) {
       const error = new Error(`Samsung SmartHistory has no matching firmware version for ${requestedVersion}`);
       error.code = "FUS_SMART_HISTORY_VERSION_NOT_FOUND";
       error.requestedVersion = requestedVersion;
-      error.availableVersions = rows
-        .filter((row) => row.cscRank === bestCscRank)
+      error.availableVersions = scopedRows
         .map((row) => row.latest)
         .filter(Boolean)
         .slice(-10);

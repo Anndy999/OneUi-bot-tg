@@ -22,7 +22,10 @@ function deadlineFromFetchedAt(fetchedAt, ttlSeconds, fallbackNow) {
 export function isExactSmartHistory(value) {
   if (value?.sourceType !== "smart_history") return false;
   const matchType = String(value?.smartHistory?.cscMatchType || "").toLowerCase();
-  return matchType === "local" || matchType === "buyer";
+  // "generic" still comes from a SmartHistory request scoped with the exact
+  // requested BINARY_LOCAL_CODE. Bifrost does not require Samsung to echo the
+  // CSC fields inside every BINARY_INFO row, especially for newly staged builds.
+  return matchType === "local" || matchType === "buyer" || matchType === "generic";
 }
 
 export function resultSnapshot(value) {
@@ -80,13 +83,14 @@ function mergeHistoryChain(existing, incomingSnapshot) {
 }
 
 /**
- * Build the canonical cache from an exact CSC SmartHistory result only.
- * Legacy non-authoritative fields are intentionally not copied forward.
+ * Build the canonical cache from a request-scoped SmartHistory result only.
+ * Explicitly foreign CSC rows are rejected before this point. Legacy
+ * non-authoritative fields are intentionally not copied forward.
  */
 export function buildFirmwareCacheRecord(env, existing, model, csc, parsed, now = Date.now()) {
   const incoming = firmwareCacheValue("global", model, csc, parsed);
   if (!isExactSmartHistory(incoming)) {
-    const error = new Error(`Refusing to cache non-exact SmartHistory for ${model}/${csc}`);
+    const error = new Error(`Refusing to cache non-scoped SmartHistory for ${model}/${csc}`);
     error.code = "EXACT_HISTORY_CACHE_REQUIRED";
     throw error;
   }

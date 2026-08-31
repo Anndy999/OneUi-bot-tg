@@ -37,6 +37,7 @@ import {
 import {
   createRolloutProposalForUpdate,
   applyOneTimeEuropeanRolloutRecovery,
+  applyOneTimeS25HongKongRolloutRecovery,
   getRolloutItemScheduleDecision,
   isRolloutItemWithinSchedule,
   rolloutProposalKeyboard,
@@ -93,11 +94,17 @@ export async function runScheduledTasks(env) {
         console.log(`One-time EU rollout recovery deferred: ${error.message}`);
         return { ok: false, applied: false, reason: "storage_error" };
       });
+    const s25HongKongRecovery = await applyOneTimeS25HongKongRolloutRecovery(env)
+      .catch((error) => {
+        console.log(`One-time S25 HK rollout recovery deferred: ${error.message}`);
+        return { ok: false, applied: false, reason: "storage_error" };
+      });
     const monitorSummary = await runScheduledMonitor(env);
     return {
       ok: true,
       monitor: monitorSummary,
       rolloutRecovery,
+      s25HongKongRecovery,
       dailySummary: await maybeSendDailyMonitorSummary(env)
     };
   })().finally(() => {

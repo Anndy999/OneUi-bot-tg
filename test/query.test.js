@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fusLaneIdFor, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareDownload, resolveOfficialFirmwareVersion, resolveOfficialFirmwareVersionCandidates } from "../src/fus.js";
+import { fusLaneIdFor, makeSignatureHash, parseSmartHistory, querySmartHistory, resetFusSession, resolveOfficialFirmwareDownload, resolveOfficialFirmwareVersion, resolveOfficialFirmwareVersionCandidates } from "../src/fus.js";
 import { rankOfficialCscOptions } from "../src/csc-suggestions.js";
 import {
   clearFirmwareMemoryCaches,
@@ -81,6 +81,7 @@ import {
   getRolloutItemScheduleDecision,
   getRolloutChains,
   applyOneTimeEuropeanRolloutRecovery,
+  applyOneTimeS25HongKongRolloutRecovery,
   restartDependentRolloutChain,
   setRolloutChainSettings
 } from "../src/rollout-chain.js";
@@ -465,6 +466,43 @@ test("History-only queries never request version XML", async () => {
   assert.equal(xmlCalls, 0);
 });
 
+test("SmartHistory request uses Bifrost model interface authentication with the raw Samsung nonce", async () => {
+  resetFusSession();
+  const model = "SM-S9380";
+  const csc = "CHC";
+  const version = "S9380ZCS1TEST/S9380CHC1TEST/S9380ZCS1TEST";
+  const rawNonce = "raw-server-nonce-0123456789";
+  let authorization = "";
+  globalThis.fetch = async (url, init = {}) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) {
+      return new Response("", {
+        status: 200,
+        headers: {
+          NONCE: rawNonce,
+          "set-cookie": "JSESSIONID=bifrost-auth-test; Path=/; Secure"
+        }
+      });
+    }
+    if (value.includes("SmartHistory")) {
+      authorization = String(init?.headers?.authorization || init?.headers?.Authorization || "");
+      return new Response(historyDocument([
+        historyRow({ model, localCsc: csc, sequence: "1", version })
+      ]));
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const result = await querySmartHistory(env, model, csc);
+  const expectedSignature = await makeSignatureHash(rawNonce, model);
+  assert.equal(result.latest, version);
+  assert.match(authorization, new RegExp(`nonce="${rawNonce}"`));
+  assert.match(authorization, new RegExp(`signature="${expectedSignature}"`));
+  assert.match(authorization, /nc="00000001"/);
+  assert.match(authorization, /type="auth"/);
+  assert.match(authorization, /realm="interface"/);
+});
+
 test("interactive latest query prefers newer exact SmartHistory over older version XML", async () => {
   resetFusSession();
   let xmlCalls = 0;
@@ -618,7 +656,7 @@ test("interactive latest query filters SmartHistory beta rows before selecting t
   assert.equal(result.sourceType, "smart_history");
 });
 
-test("buyer CSC is accepted only when no exact local CSC row exists", () => {
+test("Bifrost-compatible History selection lets a newer generic row from the scoped request win", () => {
   const buyerVersion = "S9380BUY2/S9380CSC2/S9380MODEM2";
   const genericVersion = "S9380GEN9/S9380CSC9/S9380MODEM9";
   const result = parseSmartHistory(historyDocument([
@@ -626,9 +664,8 @@ test("buyer CSC is accepted only when no exact local CSC row exists", () => {
     historyRow({ sequence: "2", localCsc: "EUX", buyerCsc: "CHC", version: buyerVersion })
   ]), "SM-S9380", "CHC");
 
-  assert.equal(result.latest, buyerVersion);
-  assert.equal(result.smartHistory.cscMatchType, "buyer");
-  assert.equal(result.smartHistory.buyerCode, "CHC");
+  assert.equal(result.latest, genericVersion);
+  assert.equal(result.smartHistory.cscMatchType, "generic");
 });
 
 test("foreign-only History rows are rejected instead of being reported as the requested CSC", () => {
@@ -641,7 +678,7 @@ test("foreign-only History rows are rejected instead of being reported as the re
   );
 });
 
-test("future-dated History rows cannot become the official latest version", () => {
+test("Bifrost-compatible History keeps future open dates as metadata instead of hiding staged firmware", () => {
   const current = "S9380NOW1/S9380CSC1/S9380MODEM1";
   const future = "S9380FUT2/S9380CSC2/S9380MODEM2";
   const xml = historyDocument([
@@ -649,22 +686,23 @@ test("future-dated History rows cannot become the official latest version", () =
     historyRow({ sequence: "99", localCsc: "CHC", version: future, openDate: "20991231" })
   ]);
   const result = parseSmartHistory(xml, "SM-S9380", "CHC");
-  assert.equal(result.latest, current);
+  assert.equal(result.latest, future);
+  assert.equal(result.smartHistory.openDate, "20991231");
 });
 
-test("withdrawn History records with BINARY_EXIST=0 are ignored", () => {
+test("Bifrost-compatible History does not reinterpret BINARY_EXIST as a publication gate", () => {
   const withdrawn = "S9380BAD9/S9380CSC9/S9380MODEM9";
   const available = "S9380GOOD2/S9380CSC2/S9380MODEM2";
   const result = parseSmartHistory(historyDocument([
     historyRow({ sequence: "99", localCsc: "CHC", version: withdrawn, exists: "0" }),
     historyRow({ sequence: "2", localCsc: "CHC", version: available, exists: "1" })
   ]), "SM-S9380", "CHC");
-  assert.equal(result.latest, available);
-  assert.equal(result.smartHistory.exists, "1");
+  assert.equal(result.latest, withdrawn);
+  assert.equal(result.smartHistory.exists, "0");
 });
 
 
-test("generic History is rejected for an exact CSC query", async () => {
+test("generic History returned by the exact scoped request is accepted like Bifrost", async () => {
   const genericVersion = "S9380GEN3/S9380CSC3/S9380MODEM3";
   globalThis.fetch = async (url) => {
     const value = String(url);
@@ -676,10 +714,9 @@ test("generic History is rejected for an exact CSC query", async () => {
     }
     throw new Error(`Unexpected URL: ${value}`);
   };
-  await assert.rejects(
-    queryFirmwareHybrid(env, "SM-S9380", "CHC"),
-    /精确 CSC/
-  );
+  const result = await queryFirmwareHybrid(env, "SM-S9380", "CHC");
+  assert.equal(result.latest, genericVersion);
+  assert.equal(result.smartHistory.cscMatchType, "generic");
 });
 
 test("non-History results cannot enter the canonical cache", () => {
@@ -688,7 +725,7 @@ test("non-History results cannot enter the canonical cache", () => {
     source: "legacy endpoint",
     sourceType: "version_xml",
     fetchedAt: "2026-07-09T23:59:50.000Z"
-  }), /non-exact SmartHistory/);
+  }), /non-scoped SmartHistory/);
 });
 
 test("a successful exact History refresh renews the authoritative stale deadline", () => {
@@ -748,7 +785,7 @@ test("firmware History Chain keeps exact authoritative versions only", () => {
     latest: "OTHER/OTHER/OTHER",
     sourceType: "version_xml",
     fetchedAt: "2026-07-11T00:01:00.000Z"
-  }), /non-exact SmartHistory/);
+  }), /non-scoped SmartHistory/);
 
   assert.deepEqual(second.historyChain.map((entry) => entry.sequence), [3, 4]);
   assert.equal(second.historyChain[1].securityPatch, "2026-07-01");
@@ -1681,7 +1718,7 @@ test("monitor fails fast without requesting unusable XML fallback", async () => 
   assert.match(runtime.lastError, /SmartHistory nonce HTTP 500/);
 });
 
-test("monitor rejects generic History and never initializes or notifies from it", async () => {
+test("monitor accepts generic History returned by an exact scoped request", async () => {
   const kv = memoryKv();
   let telegramCalls = 0;
   const monitorEnv = {
@@ -1715,9 +1752,9 @@ test("monitor rejects generic History and never initializes or notifies from it"
   };
 
   const summary = await runMonitor(monitorEnv, { reason: "manual_test" });
-  assert.equal(summary.failed, 1);
-  assert.equal(summary.initialized, 0);
-  assert.equal(await kv.get("firmware:last:SM-S9380:CHC"), null);
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.initialized, 1);
+  assert.equal(await kv.get("firmware:last:SM-S9380:CHC"), "S9380GEN5/S9380CSC5/S9380MODEM5");
   assert.equal(telegramCalls, 0);
 });
 
@@ -3594,6 +3631,37 @@ test("the one-time EU rollout recovery activates S26 and S25 Europe exactly once
   assert.equal((await getRolloutChains(env)).oneTimeRecoveries.filter((entry) => entry.id === "2026-08-26-s26-s25-eu").length, 1);
 });
 
+test("the one-time S25 recovery advances an existing Europe stage to Hong Kong exactly once", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  // Build the real upgraded-production shape: the older recovery already put
+  // S25 on EU, but the new HK marker does not exist yet.
+  await setRolloutChainsState(env, { schemaVersion: 2, chains: [] });
+  await applyOneTimeEuropeanRolloutRecovery(env, new Date("2026-08-26T08:00:00.000Z"));
+
+  const applied = await applyOneTimeS25HongKongRolloutRecovery(env, new Date("2026-08-31T04:30:00.000Z"));
+  assert.equal(applied.ok, true);
+  assert.equal(applied.applied, true);
+
+  const chains = await getRolloutChains(env);
+  const s25 = chains.chains.find((entry) => entry.id === "s25");
+  const s26 = chains.chains.find((entry) => entry.id === "s26");
+  assert.equal(s25.enabled, true);
+  assert.equal(s25.status, "active");
+  assert.equal(s25.activeStageId, "hk");
+  assert.equal(s26.activeStageId, "eu");
+
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S9380" && item.csc === "TGY").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S938B" && item.csc === "EUX").enabled, false);
+  assert.equal(items.find((item) => item.model === "SM-S9380" && item.csc === "CHC").enabled, false);
+
+  const again = await applyOneTimeS25HongKongRolloutRecovery(env, new Date("2026-08-31T04:35:00.000Z"));
+  assert.equal(again.ok, true);
+  assert.equal(again.applied, false);
+  assert.equal(again.reason, "applied");
+  assert.equal((await getRolloutChains(env)).oneTimeRecoveries.filter((entry) => entry.id === "2026-08-31-s25-eu-to-hk").length, 1);
+});
+
 test("scheduled startup applies the one-time EU recovery even while ordinary monitoring is paused", async () => {
   resetStateMemoryCache();
   const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
@@ -3601,8 +3669,10 @@ test("scheduled startup applies the one-time EU recovery even while ordinary mon
   await setMonitorSchedule(env, { enabled: false, startTime: "00:00", endTime: "23:59" });
   const result = await runScheduledTasks(env);
   assert.equal(result.rolloutRecovery.applied, true);
+  assert.equal(result.s25HongKongRecovery.applied, true);
   assert.equal(result.monitor.skipped, true);
   assert.equal((await getRolloutChains(env)).chains.find((entry) => entry.id === "s26").activeStageId, "eu");
+  assert.equal((await getRolloutChains(env)).chains.find((entry) => entry.id === "s25").activeStageId, "hk");
 });
 
 test("administrator help explains role boundaries and administrator setup", () => {
