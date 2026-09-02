@@ -21,9 +21,11 @@ import { beginTelegramInteraction, isTelegramInteractionCurrent } from "./telegr
 import { applyFlagshipProposalDecision } from "./flagship-priority.js";
 import {
   addRolloutTarget,
+  advanceRolloutChainStage,
   applyRolloutProposalDecision,
   getRolloutChains,
   restartDependentRolloutChain,
+  restartRolloutChainFromKorea,
   rolloutChainPanelText,
   setRolloutChainSettings,
   setRolloutChainStage
@@ -2689,6 +2691,28 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     }
     return;
   }
+  if (data.startsWith("admin:rollout-next:")) {
+    if (!await requireOwner(env, chatId)) return;
+    const chainId = data.slice("admin:rollout-next:".length);
+    try {
+      await advanceRolloutChainStage(env, chainId);
+      await renderRolloutChain(env, chatId, messageId, chainId);
+    } catch (error) {
+      await safeEditOrSend(env, chatId, messageId, String(error.message || error), { inline_keyboard: [[{ text: lang === "en" ? "Back" : "返回", callback_data: `admin:rollout:${chainId}` }]] });
+    }
+    return;
+  }
+  if (data.startsWith("admin:rollout-from-kr:")) {
+    if (!await requireOwner(env, chatId)) return;
+    const chainId = data.slice("admin:rollout-from-kr:".length);
+    try {
+      await restartRolloutChainFromKorea(env, chainId);
+      await renderRolloutChain(env, chatId, messageId, chainId);
+    } catch (error) {
+      await safeEditOrSend(env, chatId, messageId, String(error.message || error), { inline_keyboard: [[{ text: lang === "en" ? "Back" : "返回", callback_data: `admin:rollout:${chainId}` }]] });
+    }
+    return;
+  }
   if (data.startsWith("admin:rollout:")) {
     const chainId = data.slice("admin:rollout:".length);
     await renderRolloutChain(env, chatId, messageId, chainId);
@@ -3882,11 +3906,22 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
     return;
   }
 
+  if (command === "/chainnext") {
+    if (!await requireOwner(env, chatId)) return;
+    try {
+      const result = await advanceRolloutChainStage(env, args[0]);
+      await sendTelegramMessage(env, chatId, `已开始下一阶段监控：${String(result.stageId || "").toUpperCase()}`);
+    } catch (error) {
+      await sendTelegramMessage(env, chatId, `设置失败：${error.message}`);
+    }
+    return;
+  }
+
   if (command === "/chainstart") {
     if (!await requireOwner(env, chatId)) return;
     try {
-      await restartDependentRolloutChain(env, args[0]);
-      await sendTelegramMessage(env, chatId, "从属发布链已从韩版重新启动。");
+      await restartRolloutChainFromKorea(env, args[0]);
+      await sendTelegramMessage(env, chatId, "发布链已从韩版重新启动并立即启用监控。");
     } catch (error) {
       await sendTelegramMessage(env, chatId, `设置失败：${error.message}`);
     }
@@ -4752,6 +4787,36 @@ async function renderRolloutMenu(env, chatId, messageId = null) {
   return sendTelegramMessage(env, chatId, text, markup);
 }
 
+async function rolloutRealtimeQueryStatus(env, chain, lang = "zh") {
+  const en = lang === "en";
+  const current = chain.stages.find((stage) => stage.id === chain.activeStageId);
+  if (!current?.targets?.length) {
+    return en
+      ? "Live query: no configured targets"
+      : "实时查询：当前阶段无已配置机型";
+  }
+  const runtimeRows = await Promise.all(current.targets.map(async (target) => ({
+    target,
+    runtime: await getMonitorRuntime(env, target.model, target.csc)
+  })));
+  const latest = runtimeRows
+    .filter((row) => row.runtime?.lastSuccessAt)
+    .sort((a, b) => Date.parse(b.runtime.lastSuccessAt || "") - Date.parse(a.runtime.lastSuccessAt || ""))[0];
+  if (!latest || latest.runtime.lastQueryMode !== "realtime") {
+    return en
+      ? ["Last live query: waiting for the next successful monitor run", "Source: Samsung FUS SmartHistory", "Cache: monitor bypass enabled"].join("\n")
+      : ["上次实时查询：等待下一轮成功监控", "来源：Samsung FUS SmartHistory", "缓存：自动监控已强制绕过"].join("\n");
+  }
+  const checkedAt = formatBeijingTime(new Date(latest.runtime.lastSuccessAt), lang);
+  const source = latest.runtime.lastQuerySource || "Samsung FUS SmartHistory";
+  const cache = latest.runtime.lastQueryCacheHit
+    ? (en ? "unexpected cache hit" : "异常：命中缓存")
+    : (en ? "not used" : "未使用");
+  return en
+    ? [`Last live query: ${checkedAt}`, `Source: ${source}`, `Cache: ${cache}`].join("\n")
+    : [`上次实时查询：${checkedAt}`, `来源：${source}`, `缓存：${cache}`].join("\n");
+}
+
 async function renderRolloutChain(env, chatId, messageId, chainId) {
   const [chains, lang] = await Promise.all([getRolloutChains(env), getUserLanguage(env, chatId)]);
   const chain = chains.chains.find((item) => item.id === chainId);
@@ -4759,7 +4824,8 @@ async function renderRolloutChain(env, chatId, messageId, chainId) {
   const en = lang === "en";
   const dependent = chain.id === "s25";
   const owner = isOwnerChatId(env, chatId);
-  const text = `${rolloutChainPanelText(chain, lang)}\n\n${dependent
+  const realtimeStatus = await rolloutRealtimeQueryStatus(env, chain, lang);
+  const text = `${rolloutChainPanelText(chain, lang)}\n\n${realtimeStatus}\n\n${dependent
     ? (en ? "S25 is started automatically after S26 Korea is confirmed." : "S25 会在 S26 韩版确认后自动启动。")
     : (en ? "Start this chain manually. S25 will remain waiting until S26 Korea is confirmed." : "手动启动 S26 后，S25 将保持等待，直至 S26 韩版确认。")}`;
   const rows = [
@@ -4774,6 +4840,14 @@ async function renderRolloutChain(env, chatId, messageId, chainId) {
   if (!dependent) rows.push([{ text: chain.enabled ? (en ? "Pause S26" : "暂停 S26") : (en ? "Start S26" : "启动 S26"), callback_data: `admin:rollout-enable:${chain.id}:${chain.enabled ? "off" : "on"}` }]);
   if (dependent && chain.enabled) rows.push([{ text: en ? "Pause S25" : "暂停 S25", callback_data: `admin:rollout-enable:${chain.id}:off` }]);
   if (dependent && !chain.enabled && owner) rows.push([{ text: en ? "Owner: restart S25" : "所有者：重新启动 S25", callback_data: `admin:rollout-restart:${chain.id}` }]);
+  if (owner) {
+    const currentIndex = chain.stages.findIndex((stage) => stage.id === chain.activeStageId);
+    const hasNextStage = currentIndex >= 0 && currentIndex < chain.stages.length - 1;
+    if (hasNextStage) {
+      rows.push([{ text: en ? "▶ Start next stage" : "➡️ 开始下一阶段监控", callback_data: `admin:rollout-next:${chain.id}` }]);
+    }
+    rows.push([{ text: en ? "↩ Restart from Korea" : "↩️ 从韩版开始", callback_data: `admin:rollout-from-kr:${chain.id}` }]);
+  }
   rows.push([{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "admin:rollout-menu" }]);
   return safeEditOrSend(env, chatId, messageId, text, { inline_keyboard: rows });
 }

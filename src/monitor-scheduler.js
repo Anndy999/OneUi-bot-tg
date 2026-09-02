@@ -390,7 +390,11 @@ export class MonitorScheduler {
       lastCheckedAt: iso(record.lastCheckedAt),
       nextCheckAt: iso(record.nextCheckAt),
       monitorMode: String(record.monitorMode || "NORMAL"),
-      modeUntil: iso(record.modeUntil)
+      modeUntil: iso(record.modeUntil),
+      lastQuerySource: String(record.lastQuerySource || ""),
+      lastQueryMode: String(record.lastQueryMode || ""),
+      lastQueryCacheHit: record.lastQueryCacheHit === true,
+      lastQueryShared: record.lastQueryShared === true
     };
   }
 
@@ -588,6 +592,10 @@ export class MonitorScheduler {
         lastPeerUpdateAt: 0,
         lastBuildDate: "",
         lastSequence: null,
+        lastQuerySource: "",
+        lastQueryMode: "",
+        lastQueryCacheHit: false,
+        lastQueryShared: false,
         scheduleKey
       };
       await this.ctx.storage.put(storageKey, record);
@@ -792,6 +800,18 @@ export class MonitorScheduler {
       lastSequence: body.sequence !== undefined && body.sequence !== null && Number.isFinite(Number(body.sequence))
         ? Number(body.sequence)
         : (current.lastSequence ?? null),
+      lastQuerySource: status === "failed" || status === "skipped"
+        ? String(current.lastQuerySource || "")
+        : String(body.querySource || current.lastQuerySource || ""),
+      lastQueryMode: status === "failed" || status === "skipped"
+        ? String(current.lastQueryMode || "")
+        : String(body.queryMode || current.lastQueryMode || ""),
+      lastQueryCacheHit: status === "failed" || status === "skipped" || body.queryCacheHit === undefined
+        ? current.lastQueryCacheHit === true
+        : Boolean(body.queryCacheHit),
+      lastQueryShared: status === "failed" || status === "skipped" || body.queryShared === undefined
+        ? current.lastQueryShared === true
+        : Boolean(body.queryShared),
       scheduleKey
     };
     await this.ctx.storage.put(storageKey, record);

@@ -438,7 +438,11 @@ export async function runMonitor(env, options = {}) {
         retrySeconds: outcome?.retrySeconds || 0,
         officialUpdateAt: outcome?.officialUpdateAt || "",
         buildDate: outcome?.buildDate || "",
-        sequence: outcome?.sequence
+        sequence: outcome?.sequence,
+        querySource: outcome?.querySource || "",
+        queryMode: outcome?.queryMode || "",
+        queryCacheHit: outcome?.queryCacheHit,
+        queryShared: outcome?.queryShared
       });
       if (completion && completion.ok === false) {
         summary.schedulerConflicts += 1;
@@ -516,7 +520,11 @@ export async function processMonitorQueueMessage(env, payload) {
     retrySeconds: outcome?.retrySeconds || 0,
     officialUpdateAt: outcome?.officialUpdateAt || "",
     buildDate: outcome?.buildDate || "",
-    sequence: outcome?.sequence
+    sequence: outcome?.sequence,
+    querySource: outcome?.querySource || "",
+    queryMode: outcome?.queryMode || "",
+    queryCacheHit: outcome?.queryCacheHit,
+    queryShared: outcome?.queryShared
   });
   if (!completion?.ok) throw new Error("Sub-minute monitor completion was rejected");
   if (outcome?.notificationPromise) await outcome.notificationPromise;
@@ -591,7 +599,11 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
     }
     const result = await coordinatedFirmwareQuery(env, item.model, item.csc, {
       monitor: true,
-      role: "monitor"
+      role: "monitor",
+      // Automatic monitoring must always verify Samsung directly. The
+      // coordinator may still join an already-running live request for the
+      // exact same target, but positive/negative caches are bypassed.
+      refresh: true
     });
     const parsed = result.parsed;
     if (!isExactSmartHistory(parsed)) {
@@ -611,7 +623,11 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
         ? now.toISOString()
         : samsungDateIso(parsed.buildDate || parsed.smartHistory?.openDate),
       buildDate: parsed.buildDate || parsed.smartHistory?.openDate || "",
-      sequence: parsed.smartHistory?.sequence
+      sequence: parsed.smartHistory?.sequence,
+      querySource: parsed.source || "Samsung FUS SmartHistory",
+      queryMode: "realtime",
+      queryCacheHit: Boolean(result.coordinator?.cacheHit),
+      queryShared: Boolean(result.coordinator?.shared || result.queryTiming?.singleFlightJoined)
     };
     await writeMonitorGlobalCache(env, item, parsed, result.canonicalCache);
     if (!schedulerOwnsVersion) {

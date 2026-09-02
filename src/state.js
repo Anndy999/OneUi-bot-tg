@@ -826,7 +826,11 @@ function normalizeRuntime(value = {}) {
     lastCheckedAt: value?.lastCheckedAt || "",
     nextCheckAt: value?.nextCheckAt || "",
     monitorMode: String(value?.monitorMode || "NORMAL"),
-    modeUntil: value?.modeUntil || ""
+    modeUntil: value?.modeUntil || "",
+    lastQuerySource: String(value?.lastQuerySource || ""),
+    lastQueryMode: String(value?.lastQueryMode || ""),
+    lastQueryCacheHit: value?.lastQueryCacheHit === true,
+    lastQueryShared: value?.lastQueryShared === true
   };
 }
 
@@ -864,6 +868,10 @@ export async function recordMonitorSuccess(env, model, csc, checkedAt = new Date
     lastOfficialUpdateAt: metadata.officialUpdateAt || changedAt || current.lastOfficialUpdateAt,
     lastBuildDate: metadata.buildDate || current.lastBuildDate,
     lastSequence: Number.isFinite(Number(metadata.sequence)) ? Number(metadata.sequence) : current.lastSequence,
+    lastQuerySource: metadata.querySource || current.lastQuerySource,
+    lastQueryMode: metadata.queryMode || current.lastQueryMode,
+    lastQueryCacheHit: metadata.queryCacheHit === undefined ? current.lastQueryCacheHit : Boolean(metadata.queryCacheHit),
+    lastQueryShared: metadata.queryShared === undefined ? current.lastQueryShared : Boolean(metadata.queryShared),
     priorityScore: Number.isFinite(Number(metadata.priorityScore))
       ? Math.max(0, Math.min(100, Number(metadata.priorityScore)))
       : current.priorityScore

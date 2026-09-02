@@ -350,6 +350,65 @@ export async function restartDependentRolloutChain(env, chainId) {
   return saveChains(env, chains);
 }
 
+async function switchRolloutStageNow(env, chains, chain, stage, eventType, detail, now = new Date()) {
+  if (!stage?.targets.length) throw new Error("目标地区还没有配置可监控的 Model / CSC");
+  chain.enabled = true;
+  chain.status = "active";
+  chain.activeStageId = stage.id;
+  chain.pendingProposalId = "";
+  await activateOnlyStage(env, chain, stage);
+  await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
+  const saved = await saveChains(env, chains);
+  const eventTarget = stage.targets[0];
+  if (eventTarget) {
+    await recordMonitorEvent(env, {
+      type: eventType,
+      model: eventTarget.model,
+      csc: eventTarget.csc,
+      name: chain.name,
+      detail,
+      at: now.toISOString()
+    }).catch(() => {});
+  }
+  return saved;
+}
+
+export async function advanceRolloutChainStage(env, chainId, now = new Date()) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain) throw new Error("发布链不存在");
+  const current = findStage(chain, chain.activeStageId);
+  const next = nextStage(chain, chain.activeStageId);
+  if (!next) throw new Error("当前已经是最后一个地区阶段");
+  await switchRolloutStageNow(
+    env,
+    chains,
+    chain,
+    next,
+    "rollout_manual_advance",
+    `${current?.name || chain.activeStageId} -> ${next.name}`,
+    now
+  );
+  return { ok: true, chainId: chain.id, previousStageId: current?.id || "", stageId: next.id };
+}
+
+export async function restartRolloutChainFromKorea(env, chainId, now = new Date()) {
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, chainId);
+  if (!chain) throw new Error("发布链不存在");
+  const firstStage = chain.stages[0];
+  await switchRolloutStageNow(
+    env,
+    chains,
+    chain,
+    firstStage,
+    "rollout_manual_restart_korea",
+    `${chain.activeStageId || "-"} -> ${firstStage.name}`,
+    now
+  );
+  return { ok: true, chainId: chain.id, stageId: firstStage.id };
+}
+
 // This is deliberately not exposed through Telegram controls. It exists only
 // to repair the single missed 2026 S26/S25 transition: both chains move to the
 // already-configured EU stage, then continue through their normal next-stage
@@ -782,9 +841,18 @@ export function rolloutChainPanelText(chain, lang = "zh") {
       ...stageLines
     ].join("\n");
   }
+  const statusText = chain.status === "completed"
+    ? "本轮完成"
+    : chain.status === "awaiting_confirmation"
+      ? "等待确认"
+      : chain.enabled
+        ? "监控中"
+        : current?.targets?.length
+          ? "已暂停"
+          : "待配置";
   return [
     `📣 ${chain.name}`,
-    `状态：${chain.status === "active" ? "监控中" : chain.status === "awaiting_confirmation" ? "等待确认" : chain.status === "completed" ? "本轮完成" : "待配置"}`,
+    `状态：${statusText}`,
     `地区：${current?.name || "未配置"}`,
     `下一步：${next?.name || "本轮完成"}`,
     "触发：任一预设机型",

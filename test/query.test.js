@@ -76,6 +76,7 @@ import {
 } from "../src/state.js";
 import {
   addRolloutTarget,
+  advanceRolloutChainStage,
   applyRolloutProposalDecision,
   createRolloutProposalForUpdate,
   getRolloutItemScheduleDecision,
@@ -83,7 +84,10 @@ import {
   applyOneTimeEuropeanRolloutRecovery,
   applyOneTimeS25HongKongRolloutRecovery,
   restartDependentRolloutChain,
-  setRolloutChainSettings
+  restartRolloutChainFromKorea,
+  rolloutChainPanelText,
+  setRolloutChainSettings,
+  setRolloutChainStage
 } from "../src/rollout-chain.js";
 import { setRolloutChainsState } from "../src/state.js";
 import { normalizeReleaseWindowGroups, releaseWindowPeers, validateModelCsc } from "../src/targets.js";
@@ -1452,10 +1456,12 @@ test("an unchanged DO-scheduled monitor check performs zero additional KV writes
     name: "S26 Ultra TGY",
     priority: "high"
   }]);
+  let realtimeHistoryCalls = 0;
   globalThis.fetch = async (url) => {
     const value = String(url);
     if (value.includes("GenerateNonce")) return nonceResponse();
     if (value.includes("SmartHistory")) {
+      realtimeHistoryCalls += 1;
       return new Response(historyDocument([historyRow({
         sequence: "1",
         localCsc: "TGY",
@@ -1471,6 +1477,7 @@ test("an unchanged DO-scheduled monitor check performs zero additional KV writes
   const second = await runMonitor(monitorEnv, { reason: "manual_test" });
   assert.equal(second.checked, 1);
   assert.equal(second.updated, 0);
+  assert.equal(realtimeHistoryCalls, 2, "each monitor run must query Samsung SmartHistory instead of coordinator cache");
   assert.equal(kvWrites, afterFirst);
 });
 
@@ -3599,6 +3606,53 @@ test("S25 waits for S26 Korea and only the recovery path can start it manually",
   const items = await getMonitorItems(env);
   assert.equal(items.find((item) => item.model === "SM-S938N" && item.csc === "KOO").enabled, true);
   assert.equal(items.find((item) => item.model === "SM-S938B" && item.csc === "EUX").enabled, false);
+});
+
+test("owner can advance a paused S26 chain from Europe to Hong Kong and monitoring starts immediately", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await setRolloutChainSettings(env, "s26", { enabled: true });
+  await setRolloutChainStage(env, "s26", "eu");
+  await setRolloutChainSettings(env, "s26", { enabled: false });
+
+  const result = await advanceRolloutChainStage(env, "s26", new Date("2026-09-02T04:00:00.000Z"));
+  assert.equal(result.stageId, "hk");
+
+  const s26 = (await getRolloutChains(env)).chains.find((chain) => chain.id === "s26");
+  assert.equal(s26.enabled, true);
+  assert.equal(s26.status, "active");
+  assert.equal(s26.activeStageId, "hk");
+
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "TGY").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S948B" && item.csc === "EUX").enabled, false);
+  assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "CHC").enabled, false);
+});
+
+test("owner can restart S26 from Korea regardless of its current rollout stage", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await setRolloutChainSettings(env, "s26", { enabled: true });
+  await advanceRolloutChainStage(env, "s26");
+  await advanceRolloutChainStage(env, "s26");
+  const restarted = await restartRolloutChainFromKorea(env, "s26", new Date("2026-09-02T04:05:00.000Z"));
+  assert.equal(restarted.stageId, "kr");
+
+  const s26 = (await getRolloutChains(env)).chains.find((chain) => chain.id === "s26");
+  assert.equal(s26.enabled, true);
+  assert.equal(s26.activeStageId, "kr");
+  const items = await getMonitorItems(env);
+  assert.equal(items.find((item) => item.model === "SM-S948N" && item.csc === "KOO").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S948B" && item.csc === "EUX").enabled, false);
+});
+
+test("configured but disabled rollout panel is labeled paused instead of needs configuration", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  const s26 = (await getRolloutChains(env)).chains.find((chain) => chain.id === "s26");
+  s26.activeStageId = "eu";
+  s26.enabled = false;
+  s26.status = "needs_configuration";
+  const panel = rolloutChainPanelText(s26, "zh");
+  assert.match(panel, /状态：已暂停/);
+  assert.match(panel, /地区：欧版/);
 });
 
 test("the one-time EU rollout recovery activates S26 and S25 Europe exactly once", async () => {
