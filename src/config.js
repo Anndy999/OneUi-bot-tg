@@ -247,6 +247,9 @@ export function normalizeMonitorItems(items) {
         adminDecision: String(item.adminDecision || "").trim(),
         rolloutChainId: String(item.rolloutChainId || "").trim().slice(0, 48),
         rolloutStageId: String(item.rolloutStageId || "").trim().slice(0, 48),
+        // Rollout stages re-baseline once when they become active so old
+        // releases are never replayed as fresh Telegram update alerts.
+        rolloutBaselinePending: item.rolloutBaselinePending === true,
         resumeAt: String(item.resumeAt || "").trim(),
         pausedAt: String(item.pausedAt || "").trim(),
         pauseSource: String(item.pauseSource || "").trim(),

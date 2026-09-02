@@ -320,7 +320,10 @@ export async function setRolloutChainSettings(env, chainId, patch = {}) {
           priority: "high",
           intervalMinutes: chain.intervalMinutes,
           rolloutChainId: chain.id,
-          rolloutStageId: stage.id
+          rolloutStageId: stage.id,
+          // Turning a rollout chain on establishes the current Samsung latest
+          // as the baseline before any future update notification is allowed.
+          rolloutBaselinePending: active && patch.enabled === true
         });
       }
     }
@@ -346,7 +349,7 @@ export async function restartDependentRolloutChain(env, chainId) {
   chain.pendingProposalId = "";
   chain.status = "active";
   chain.enabled = true;
-  await activateOnlyStage(env, chain, firstStage);
+  await activateOnlyStage(env, chain, firstStage, { rebaseline: true });
   return saveChains(env, chains);
 }
 
@@ -356,7 +359,7 @@ async function switchRolloutStageNow(env, chains, chain, stage, eventType, detai
   chain.status = "active";
   chain.activeStageId = stage.id;
   chain.pendingProposalId = "";
-  await activateOnlyStage(env, chain, stage);
+  await activateOnlyStage(env, chain, stage, { rebaseline: true });
   await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
   const saved = await saveChains(env, chains);
   const eventTarget = stage.targets[0];
@@ -442,7 +445,7 @@ export async function applyOneTimeEuropeanRolloutRecovery(env, now = new Date())
     chain.status = "active";
     chain.activeStageId = stage.id;
     chain.pendingProposalId = "";
-    await activateOnlyStage(env, chain, stage);
+    await activateOnlyStage(env, chain, stage, { rebaseline: true });
     await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
   }
   const recovery = {
@@ -505,7 +508,7 @@ export async function applyOneTimeS25HongKongRolloutRecovery(env, now = new Date
   chain.status = "active";
   chain.activeStageId = stage.id;
   chain.pendingProposalId = "";
-  await activateOnlyStage(env, chain, stage);
+  await activateOnlyStage(env, chain, stage, { rebaseline: true });
   await Promise.all(stage.targets.map((target) => forceMonitorDue(env, target.model, target.csc, now)));
 
   recovery.chain = chain.id;
@@ -530,7 +533,7 @@ export async function setRolloutChainStage(env, chainId, stageId) {
   const stage = findStage(chain, stageId);
   if (!chain || !stage) throw new Error("发布链或地区不存在");
   if (!stage.targets.length) throw new Error("请先为该地区添加至少一个精确 Model / CSC");
-  await activateOnlyStage(env, chain, stage);
+  await activateOnlyStage(env, chain, stage, { rebaseline: true });
   chain.activeStageId = stage.id;
   chain.status = chain.enabled ? "active" : "needs_configuration";
   chain.pendingProposalId = "";
@@ -714,7 +717,7 @@ export function rolloutProposalKeyboard(proposal, lang = "zh") {
   };
 }
 
-async function activateStage(env, chain, stage) {
+async function activateStage(env, chain, stage, options = {}) {
   for (const target of stage.targets) {
     await cancelMonitorItemSnooze(env, target.model, target.csc);
     await upsertMonitorItem(env, {
@@ -725,12 +728,13 @@ async function activateStage(env, chain, stage) {
       priority: "high",
       intervalMinutes: chain.intervalMinutes,
       rolloutChainId: chain.id,
-      rolloutStageId: stage.id
+      rolloutStageId: stage.id,
+      rolloutBaselinePending: options.rebaseline === true
     });
   }
 }
 
-async function activateOnlyStage(env, chain, stage) {
+async function activateOnlyStage(env, chain, stage, options = {}) {
   for (const candidate of chain.stages) {
     for (const target of candidate.targets) {
       const active = candidate.id === stage.id && chain.enabled;
@@ -745,7 +749,8 @@ async function activateOnlyStage(env, chain, stage) {
         priority: "high",
         intervalMinutes: chain.intervalMinutes,
         rolloutChainId: chain.id,
-        rolloutStageId: candidate.id
+        rolloutStageId: candidate.id,
+        rolloutBaselinePending: active ? options.rebaseline === true : false
       });
     }
   }
@@ -789,7 +794,7 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
     if (paused && !paused.ok) return { ok: false, reason: "pause_failed", proposal };
   }
   if (next) {
-    await activateStage(env, chain, next);
+    await activateStage(env, chain, next, { rebaseline: true });
     chain.activeStageId = next.id;
     chain.status = "active";
   } else {
@@ -801,7 +806,7 @@ export async function applyRolloutProposalDecision(env, proposalId, decision, de
     starter.status = "active";
     starter.activeStageId = starterStage.id;
     starter.pendingProposalId = "";
-    await activateOnlyStage(env, starter, starterStage);
+    await activateOnlyStage(env, starter, starterStage, { rebaseline: true });
   }
   chain.pendingProposalId = "";
   proposal.status = "decided";
@@ -837,6 +842,7 @@ export function rolloutChainPanelText(chain, lang = "zh") {
       `Trigger: any preset model`,
       `Schedule: ${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} min`,
       `Weekend: ${chain.skipWeekends ? "off" : "on"}`,
+      "Policy: baseline current latest on stage start; alert only later releases",
       "",
       ...stageLines
     ].join("\n");
@@ -858,6 +864,7 @@ export function rolloutChainPanelText(chain, lang = "zh") {
     "触发：任一预设机型",
     `时间：${chain.startTime}–${chain.endTime} · ${chain.intervalMinutes} 分钟`,
     `周末监控：${chain.skipWeekends ? "关闭" : "开启"}`,
+    "策略：新阶段先静默同步当前最新版，只通知之后的新版本",
     "",
     ...stageLines
   ].join("\n");

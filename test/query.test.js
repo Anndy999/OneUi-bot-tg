@@ -3624,6 +3624,7 @@ test("owner can advance a paused S26 chain from Europe to Hong Kong and monitori
 
   const items = await getMonitorItems(env);
   assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "TGY").enabled, true);
+  assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "TGY").rolloutBaselinePending, true);
   assert.equal(items.find((item) => item.model === "SM-S948B" && item.csc === "EUX").enabled, false);
   assert.equal(items.find((item) => item.model === "SM-S9480" && item.csc === "CHC").enabled, false);
 });
@@ -3727,6 +3728,97 @@ test("scheduled startup applies the one-time EU recovery even while ordinary mon
   assert.equal(result.monitor.skipped, true);
   assert.equal((await getRolloutChains(env)).chains.find((entry) => entry.id === "s26").activeStageId, "eu");
   assert.equal((await getRolloutChains(env)).chains.find((entry) => entry.id === "s25").activeStageId, "hk");
+});
+
+
+test("new rollout stage silently baselines Samsung current latest and only later versions notify", async () => {
+  resetFusSession();
+  resetStateMemoryCache();
+  const kv = memoryKv();
+  await kv.put("firmware:last:SM-S9480:TGY", "S9480OLD1/S9480CSC1/S9480MODEM1");
+  const monitorEnv = {
+    FIRMWARE_KV: kv,
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "999",
+    RELEASE_WINDOW_ENABLED: "false",
+    MONITOR_CONCURRENCY: "1"
+  };
+  await setMonitorItems(monitorEnv, [{
+    model: "SM-S9480",
+    csc: "TGY",
+    name: "S26 Ultra TGY",
+    priority: "high",
+    enabled: true,
+    rolloutChainId: "s26",
+    rolloutStageId: "hk",
+    rolloutBaselinePending: true
+  }]);
+
+  let currentVersion = "S9480CURR1/S9480CSC2/S9480MODEM2";
+  let telegramCalls = 0;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([historyRow({
+        sequence: currentVersion.includes("NEXT") ? "3" : "2",
+        localCsc: "TGY",
+        model: "SM-S9480",
+        version: currentVersion
+      })]));
+    }
+    if (value.includes("api.telegram.org")) {
+      telegramCalls += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: telegramCalls } }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const baseline = await runMonitor(monitorEnv, { reason: "manual_test" });
+  assert.equal(baseline.updated, 0);
+  assert.equal(baseline.initialized, 1);
+  assert.equal(telegramCalls, 0, "historical versions must not be replayed when a rollout stage is activated");
+  assert.equal(await kv.get("firmware:last:SM-S9480:TGY"), currentVersion);
+  assert.equal((await getMonitorItems(monitorEnv))[0].rolloutBaselinePending, false);
+
+  currentVersion = "S9480NEXT1/S9480CSC3/S9480MODEM3";
+  const changed = await runMonitor(monitorEnv, { reason: "manual_test" });
+  assert.equal(changed.updated, 1);
+  assert.equal(telegramCalls, 1, "only a version newer than the synchronized baseline should notify");
+});
+
+test("durable scheduler baseline completion updates lastVersion without entering HOT mode", async () => {
+  const now = Date.now();
+  const scheduler = new MonitorScheduler({ storage: memoryDoStorage() }, {});
+  const call = async (path, body) => {
+    const response = await scheduler.fetch(new Request(`https://scheduler.example${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }));
+    return response.json();
+  };
+  await call("/sync", { now, items: [{ model: "SM-S9480", csc: "TGY", priority: "high" }] });
+  let claim = await call("/claim", { now, limit: 1 });
+  await call("/complete", {
+    model: "SM-S9480", csc: "TGY", lock: claim.entries[0].lock,
+    nextCheckAt: now + 60_000, lastVersion: "OLD", priorityScore: 90,
+    status: "unchanged", completedAt: now
+  });
+  await call("/force", { model: "SM-S9480", csc: "TGY", dueAt: now + 1 });
+  claim = await call("/claim", { now: now + 1, limit: 1 });
+  const completed = await call("/complete", {
+    model: "SM-S9480", csc: "TGY", lock: claim.entries[0].lock,
+    nextCheckAt: now + 60_001, lastVersion: "CURRENT", priorityScore: 90,
+    status: "baseline", completedAt: now + 1
+  });
+  assert.equal(completed.monitorMode, "NORMAL");
+  const state = await call("/target-state/get", { model: "SM-S9480", csc: "TGY" });
+  assert.equal(state.runtime.lastVersion, "CURRENT");
+  assert.equal(state.runtime.lastVersionChangedAt, "");
 });
 
 test("administrator help explains role boundaries and administrator setup", () => {

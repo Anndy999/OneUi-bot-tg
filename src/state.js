@@ -614,6 +614,7 @@ export async function upsertMonitorItem(env, item) {
     if (item.adminDecision !== undefined) target.adminDecision = String(item.adminDecision || "");
     if (item.rolloutChainId !== undefined) target.rolloutChainId = String(item.rolloutChainId || "").slice(0, 48);
     if (item.rolloutStageId !== undefined) target.rolloutStageId = String(item.rolloutStageId || "").slice(0, 48);
+    if (item.rolloutBaselinePending !== undefined) target.rolloutBaselinePending = item.rolloutBaselinePending === true;
     if (item.resumeAt !== undefined) target.resumeAt = String(item.resumeAt || "");
     if (item.pausedAt !== undefined) target.pausedAt = String(item.pausedAt || "");
     if (item.pauseSource !== undefined) target.pauseSource = String(item.pauseSource || "");
@@ -640,6 +641,7 @@ export async function upsertMonitorItem(env, item) {
       adminDecision: String(item.adminDecision || ""),
       rolloutChainId: String(item.rolloutChainId || "").slice(0, 48),
       rolloutStageId: String(item.rolloutStageId || "").slice(0, 48),
+      rolloutBaselinePending: item.rolloutBaselinePending === true,
       resumeAt: String(item.resumeAt || ""),
       pausedAt: String(item.pausedAt || ""),
       pauseSource: String(item.pauseSource || ""),

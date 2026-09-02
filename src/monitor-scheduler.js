@@ -723,11 +723,12 @@ export class MonitorScheduler {
     const now = Number(body.completedAt || Date.now());
     const previousVersion = current.lastVersion || "";
     const nextVersion = body.lastVersion || previousVersion;
-    const versionChanged = Boolean(previousVersion && nextVersion && previousVersion !== nextVersion);
+    const status = String(body.status || "");
+    const baselineReset = status === "baseline";
+    const versionChanged = !baselineReset && Boolean(previousVersion && nextVersion && previousVersion !== nextVersion);
     let monitorMode = String(current.monitorMode || "NORMAL").toUpperCase();
     let modeUntil = Number(current.modeUntil || 0);
     let nextCheckAt = Math.max(now, Number(body.nextCheckAt || now));
-    const status = String(body.status || "");
     const priorityScore = Math.max(0, Math.min(100, Number(body.priorityScore || 0)));
     const intervalSettings = await this.intervalSettings();
     const watchMs = releaseModeIntervalMinutes("watch", intervalSettings) * 60 * 1000;
@@ -1283,6 +1284,9 @@ export class MonitorScheduler {
       if (item.notifyAllowedUsers !== undefined) {
         existing.notifyAllowedUsers = item.notifyAllowedUsers !== false;
       }
+      if (item.rolloutBaselinePending !== undefined) {
+        existing.rolloutBaselinePending = item.rolloutBaselinePending === true;
+      }
       for (const field of [
         "pauseReason",
         "prioritySource",
@@ -1290,6 +1294,8 @@ export class MonitorScheduler {
         "linkedRuleId",
         "linkedAt",
         "adminDecision",
+        "rolloutChainId",
+        "rolloutStageId",
         "resumeAt",
         "pausedAt",
         "pauseSource"
@@ -1312,6 +1318,9 @@ export class MonitorScheduler {
         linkedRuleId: String(item.linkedRuleId || ""),
         linkedAt: String(item.linkedAt || ""),
         adminDecision: String(item.adminDecision || ""),
+        rolloutChainId: String(item.rolloutChainId || "").slice(0, 48),
+        rolloutStageId: String(item.rolloutStageId || "").slice(0, 48),
+        rolloutBaselinePending: item.rolloutBaselinePending === true,
         resumeAt: String(item.resumeAt || ""),
         pausedAt: String(item.pausedAt || ""),
         pauseSource: String(item.pauseSource || ""),

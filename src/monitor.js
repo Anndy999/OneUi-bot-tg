@@ -77,7 +77,8 @@ import {
   recordPeerFirmwareUpdate,
   recordMonitorSuccess,
   recordMonitorEvent,
-  setFirmwareQueryCache
+  setFirmwareQueryCache,
+  upsertMonitorItem
 } from "./state.js";
 
 let scheduledTasksPromise = null;
@@ -616,7 +617,8 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       : String(schedulerEntry.lastVersion || "");
     const oldFingerprint = firmwareVersionFingerprint(oldLatest);
     const newFingerprint = firmwareVersionFingerprint(parsed.latest);
-    const versionChanged = Boolean(oldLatest) && oldFingerprint !== newFingerprint;
+    const baselineReset = item.rolloutBaselinePending === true;
+    const versionChanged = !baselineReset && Boolean(oldLatest) && oldFingerprint !== newFingerprint;
     const successMetadata = {
       versionChanged,
       officialUpdateAt: versionChanged
@@ -635,6 +637,31 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
         latest: parsed.latest,
         ...successMetadata
       });
+    }
+
+    if (baselineReset) {
+      // A newly activated rollout stage must begin from Samsung's current
+      // latest release. Old saved versions belong to a previous monitoring
+      // period and must never be replayed as fresh update notifications.
+      if (!schedulerOwnsVersion) await env.FIRMWARE_KV.put(key, parsed.latest);
+      await upsertMonitorItem(env, { ...item, rolloutBaselinePending: false });
+      await recordMonitorEventSafely(env, {
+        type: "rollout_baseline_initialized",
+        model: item.model,
+        csc: item.csc,
+        name: item.name,
+        detail: `Baseline -> ${parsed.latest}`,
+        source: parsed.source || "Samsung SmartHistory",
+        at: now.toISOString()
+      });
+      return {
+        status: "baseline",
+        baselineReset: true,
+        boostedTargets: 0,
+        latest: parsed.latest,
+        notificationPromise: null,
+        ...successMetadata
+      };
     }
 
     if (!oldLatest) {
@@ -747,7 +774,7 @@ function monitorFailureOutcome(env, error, previousFailureCount = 0) {
 
 function applyMonitorOutcome(summary, outcome) {
   summary.boostedTargets += Number(outcome?.boostedTargets || 0);
-  if (outcome?.status === "initialized") summary.initialized += 1;
+  if (["initialized", "baseline"].includes(outcome?.status)) summary.initialized += 1;
   if (outcome?.status === "updated") summary.updated += 1;
   if (outcome?.status !== "failed") return;
   summary.failed += 1;
