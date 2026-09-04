@@ -1,6 +1,6 @@
 {
   "name": "oneui-firmware-worker",
-  "version": "2.22.7",
+  "version": "2.22.8",
   "description": "Official Samsung SmartHistory firmware monitor with global coordination and flagship priority lifecycle on Cloudflare Workers.",
   "type": "module",
   "private": true,
@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "bullmq": "^5.58.5",
-    "fastify": "^5.5.0",
+    "fastify": "5.12.1",
     "ioredis": "^5.6.1",
     "pg": "^8.16.3"
   },
