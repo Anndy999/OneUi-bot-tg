@@ -743,6 +743,24 @@ function languageModeKeyboard(identity = "unauthorized", lang = "zh") {
   };
 }
 
+function startupLanguageText() {
+  return [
+    "🌐 Choose your language / 选择语言",
+    "",
+    "Please select the language you'd like to use.",
+    "请选择你想使用的语言。"
+  ].join("\n");
+}
+
+function startupLanguageKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: "🇺🇸 English", callback_data: "lang:en" },
+      { text: "🇨🇳 中文", callback_data: "lang:zh" }
+    ]]
+  };
+}
+
 async function mainMenuText(env, identity, lang = "zh") {
   if (identity === "admin") {
     return lang === "en"
@@ -2453,7 +2471,13 @@ async function handleCallback(callbackQuery, env, ctx = null) {
     const lang = data.endsWith(":en") ? "en" : "zh";
     await setUserLanguage(env, chatId, lang);
     const identity = await getIdentity(env, chatId);
-     await safeEditOrSend(env, chatId, messageId, await mainMenuText(env, identity, lang), mainMenuKeyboard(identity, lang));
+    const firstStart = !await hasCompletedOnboarding(env, chatId);
+    if (firstStart) {
+      await markOnboardingCompleted(env, chatId);
+      await safeEditOrSend(env, chatId, messageId, onboardingText(identity, lang), mainMenuKeyboard(identity, lang));
+    } else {
+      await safeEditOrSend(env, chatId, messageId, await mainMenuText(env, identity, lang), mainMenuKeyboard(identity, lang));
+    }
     return;
   }
 
@@ -3753,17 +3777,26 @@ async function handleCommand(env, chatId, text, message, identity, ctx = null) {
   const args = parts.slice(1);
 
   if (command === "/start") {
-    if (args[0] === "zh" || args[0] === "en") {
-      await setUserLanguage(env, chatId, args[0]);
-    }
+    const explicitLang = args[0] === "zh" || args[0] === "en" ? args[0] : "";
     const firstStart = !await hasCompletedOnboarding(env, chatId);
-    if (firstStart) {
-      await markOnboardingCompleted(env, chatId);
-      const lang = await getUserLanguage(env, chatId);
-      await sendTelegramMessage(env, chatId, onboardingText(identity, lang), mainMenuKeyboard(identity, lang));
-    } else {
-      await showMainMenu(env, chatId, identity);
+
+    if (explicitLang) {
+      await setUserLanguage(env, chatId, explicitLang);
+      if (firstStart) {
+        await markOnboardingCompleted(env, chatId);
+        await sendTelegramMessage(env, chatId, onboardingText(identity, explicitLang), mainMenuKeyboard(identity, explicitLang));
+      } else {
+        await showMainMenu(env, chatId, identity);
+      }
+      return;
     }
+
+    if (firstStart) {
+      await sendTelegramMessage(env, chatId, startupLanguageText(), startupLanguageKeyboard());
+      return;
+    }
+
+    await showMainMenu(env, chatId, identity);
     return;
   }
 

@@ -3391,10 +3391,12 @@ test("known wrong tablet CSC falls back to the confirmed correction when officia
   assert.ok(result.telegram.some((entry) => entry.body.text?.includes("CHN")));
 });
 
-test("Telegram start shows the compact role-based admin menu", async () => {
+test("Telegram start shows the compact role-based admin menu after onboarding", async () => {
   const payloads = [];
+  const kv = memoryKv();
+  await kv.put("user:onboarding:991", JSON.stringify({ completed: true }));
   const env = {
-    FIRMWARE_KV: memoryKv(),
+    FIRMWARE_KV: kv,
     WEBHOOK_SECRET: "test-header-secret",
     TELEGRAM_BOT_TOKEN: "test-token",
     TELEGRAM_CHAT_ID: "991"
@@ -3415,7 +3417,8 @@ test("Telegram start shows the compact role-based admin menu", async () => {
   assert.deepEqual(callbacks, [
     "menu:query-help",
     "admin:download-menu",
-    "admin:rollout-menu"
+    "admin:rollout-menu",
+    "admin:access-menu"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
@@ -4196,7 +4199,7 @@ test("My Devices persists shortcuts, deduplicates targets, and toggles subscript
   assert.deepEqual(await getUserDevices(env, "device-user"), []);
 });
 
-test("first /start shows onboarding once and retired device commands return to the main menu", async () => {
+test("first /start asks for language, then shows localized onboarding once", async () => {
   resetStateMemoryCache();
   const payloads = [];
   const env = {
@@ -4210,24 +4213,69 @@ test("first /start shows onboarding once and retired device commands return to t
     update_id: 700010,
     message: { message_id: 1, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
   }, payloads);
-  assert.equal(await hasCompletedOnboarding(env, "9911"), true);
-  assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")));
-  const onboarding = payloads.find((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心"));
-  assert.match(String(onboarding.body.text || ""), /致谢/);
-  assert.match(String(onboarding.body.text || ""), /@Dalee1ee/);
-  assert.match(String(onboarding.body.text || ""), /@fahadalijaved/);
-  const secondPayloads = [];
+
+  assert.equal(await hasCompletedOnboarding(env, "9911"), false);
+  const languagePrompt = payloads.find((entry) => String(entry.body.text || "").includes("Choose your language / 选择语言"));
+  assert.ok(languagePrompt);
+  const languageButtons = languagePrompt.body.reply_markup.inline_keyboard.flat();
+  assert.ok(languageButtons.some((button) => button.text === "🇺🇸 English" && button.callback_data === "lang:en"));
+  assert.ok(languageButtons.some((button) => button.text === "🇨🇳 中文" && button.callback_data === "lang:zh"));
+  assert.equal(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")), false);
+
+  const selectionPayloads = [];
   await dispatchTelegramTestUpdate(env, {
     update_id: 700011,
-    message: { message_id: 2, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
-  }, secondPayloads);
-  assert.equal(secondPayloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")), false);
-  const devicePayloads = [];
+    callback_query: {
+      id: "first-language-en",
+      data: "lang:en",
+      from: { id: 9911 },
+      message: { message_id: 1, chat: { id: 9911 } }
+    }
+  }, selectionPayloads);
+
+  assert.equal(await getUserLanguage(env, "9911"), "en");
+  assert.equal(await hasCompletedOnboarding(env, "9911"), true);
+  const onboarding = selectionPayloads.find((entry) => String(entry.body.text || "").includes("Welcome to OneUI Firmware Center"));
+  assert.ok(onboarding);
+  assert.match(String(onboarding.body.text || ""), /Acknowledgements/);
+  assert.match(String(onboarding.body.text || ""), /@Dalee1ee/);
+  assert.match(String(onboarding.body.text || ""), /@fahadalijaved/);
+
+  const secondPayloads = [];
   await dispatchTelegramTestUpdate(env, {
     update_id: 700012,
+    message: { message_id: 2, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
+  }, secondPayloads);
+  assert.equal(secondPayloads.some((entry) => String(entry.body.text || "").includes("Choose your language / 选择语言")), false);
+  assert.ok(secondPayloads.some((entry) => String(entry.body.text || "").startsWith("Administrator")));
+
+  const devicePayloads = [];
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 700013,
     message: { message_id: 3, chat: { id: 9911 }, from: { id: 9911 }, text: "/devices" }
   }, devicePayloads);
-  assert.ok(devicePayloads.some((entry) => String(entry.body.text || "").includes("查询固件")));
+  assert.ok(devicePayloads.some((entry) => String(entry.body.text || "").includes("Query firmware")));
+});
+
+test("first /start with an explicit language keeps deep-link behavior", async () => {
+  resetStateMemoryCache();
+  const payloads = [];
+  const env = {
+    FIRMWARE_KV: memoryKv(),
+    WEBHOOK_SECRET: "test-header-secret",
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "9912"
+  };
+
+  await dispatchTelegramTestUpdate(env, {
+    update_id: 700014,
+    message: { message_id: 1, chat: { id: 9912 }, from: { id: 9912 }, text: "/start zh" }
+  }, payloads);
+
+  assert.equal(await getUserLanguage(env, "9912"), "zh");
+  assert.equal(await hasCompletedOnboarding(env, "9912"), true);
+  assert.ok(payloads.some((entry) => String(entry.body.text || "").includes("欢迎使用 OneUI 固件中心")));
+  assert.equal(payloads.some((entry) => String(entry.body.text || "").includes("Choose your language / 选择语言")), false);
 });
 
 test("monitor target buttons change priority and require delete confirmation", async () => {
@@ -4560,6 +4608,7 @@ test("language and monitoring buttons stay writable when Workers KV rejects writ
     }
   };
   const baseKv = memoryKv();
+  await baseKv.put("user:onboarding:996", JSON.stringify({ completed: true }));
   let kvWriteAttempts = 0;
   const kv = {
     ...baseKv,
