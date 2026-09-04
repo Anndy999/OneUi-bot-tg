@@ -59,6 +59,7 @@ import {
   putMonitorBoost,
   putPendingUpdate,
   recordMonitorFailure,
+  recordMonitorSuccess,
   recordMonitorEvent,
   recordFirmwareQueryDemand,
   resetStateMemoryCache,
@@ -101,6 +102,7 @@ import { safeEditOrSend, sendTelegramMessage, sendTelegramMessageResult } from "
 import {
   formatFirmwareResult,
   firmwareBuildDateDisplay,
+  formatFirmwareUpdateBatch,
   formatMonitorBaseline,
   formatMonitorNotification,
   normalizeFirmwareVersion
@@ -1498,6 +1500,10 @@ test("overlapping monitor runs share one target query and one Telegram notificat
       { model: "SM-S9380", csc: "CHC", name: "test", priority: "high", intervalMinutes: 1 }
     ])
   };
+  await recordMonitorSuccess(monitorEnv, "SM-S9380", "CHC", new Date("2026-09-04T03:00:00Z"), {
+    latest: "S9380OLD1/S9380CSC1/S9380MODEM1",
+    sequence: 1
+  });
   globalThis.fetch = async (url) => {
     const value = String(url);
     if (value.includes("api.telegram.org")) {
@@ -1556,6 +1562,14 @@ test("slow Telegram delivery does not block the next monitor query", async () =>
     FUS_MONITOR_LANES: "2"
   };
   await setMonitorItems(pipelineEnv, items);
+  await recordMonitorSuccess(pipelineEnv, "SM-S9380", "CHC", new Date("2026-09-04T03:00:00Z"), {
+    latest: "OLD/OLD/OLD",
+    sequence: 1
+  });
+  await recordMonitorSuccess(pipelineEnv, "SM-S938B", "EUX", new Date("2026-09-04T03:00:00Z"), {
+    latest: "OLD/OLD/OLD",
+    sequence: 1
+  });
   let telegramFinished = false;
   let secondHistoryStartedBeforeTelegramFinished = false;
   globalThis.fetch = async (url, init = {}) => {
@@ -3093,6 +3107,10 @@ test("a current flagship version change sends one update without an admin confir
   };
   await setMonitorItems(env, [{ model: "SM-S948B", csc: "EUX", name: "S26 Ultra EUX", priority: "high" }]);
   await kv.put("firmware:last:SM-S948B:EUX", "S948BXXU1BYF1/S948BOXM1BYF1/S948BXXU1BYF1");
+  await recordMonitorSuccess(env, "SM-S948B", "EUX", new Date("2026-09-04T03:00:00Z"), {
+    latest: "S948BXXU1BYF1/S948BOXM1BYF1/S948BXXU1BYF1",
+    sequence: 19
+  });
   globalThis.fetch = async (url) => {
     if (String(url).includes("GenerateNonce")) return nonceResponse();
     return new Response(historyDocument([
@@ -3819,6 +3837,251 @@ test("durable scheduler baseline completion updates lastVersion without entering
   const state = await call("/target-state/get", { model: "SM-S9480", csc: "TGY" });
   assert.equal(state.runtime.lastVersion, "CURRENT");
   assert.equal(state.runtime.lastVersionChangedAt, "");
+});
+
+
+test("firmware update batches are bilingual and summarize only the latest snapshot per model", () => {
+  const batch = {
+    id: "batch-1",
+    series: "S26",
+    csc: "TGY",
+    events: [
+      {
+        model: "SM-S9420", csc: "TGY",
+        oldLatest: "S9420AAA1/CSC1/MODEM1",
+        latest: "S9420AAA3/CSC3/MODEM3"
+      },
+      {
+        model: "SM-S9480", csc: "TGY",
+        oldLatest: "S9480BBB1/CSC1/MODEM1",
+        latest: "S9480BBB4/CSC4/MODEM4"
+      }
+    ]
+  };
+  const zh = formatFirmwareUpdateBatch(batch, new Date("2026-09-04T04:00:00Z"), "zh");
+  assert.match(zh, /S26 港版发现 2 台新固件/);
+  assert.match(zh, /SM-S9420：AAA1 → AAA3/);
+  assert.match(zh, /SM-S9480：BBB1 → BBB4/);
+  assert.match(zh, /Samsung SmartHistory/);
+
+  const en = formatFirmwareUpdateBatch(batch, new Date("2026-09-04T04:00:00Z"), "en");
+  assert.match(en, /S26 Hong Kong: 2 new firmware versions/);
+  assert.match(en, /SM-S9420: AAA1 → AAA3/);
+  assert.match(en, /SM-S9480: BBB1 → BBB4/);
+  assert.match(en, /Full firmware versions are available from a manual query/);
+});
+
+test("firmware notification batch merges multiple S26 models into one recipient message", async () => {
+  resetStateMemoryCache();
+  const storage = memoryDoStorage();
+  const scheduler = new MonitorScheduler({ storage }, {});
+  const call = async (path, body) => {
+    const response = await scheduler.fetch(new Request(`https://scheduler.example${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }));
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const first = await call("/notification-batch/add", {
+    batchKey: "s26:tgy",
+    now: Date.now(),
+    windowSeconds: 20,
+    event: {
+      model: "SM-S9420", csc: "TGY", series: "S26",
+      oldLatest: "S9420AAA1/CSC1/MODEM1",
+      latest: "S9420AAA3/CSC3/MODEM3",
+      sequence: 3
+    }
+  });
+  const second = await call("/notification-batch/add", {
+    batchKey: "s26:tgy",
+    now: Date.now() + 1,
+    windowSeconds: 20,
+    event: {
+      model: "SM-S9480", csc: "TGY", series: "S26",
+      oldLatest: "S9480BBB1/CSC1/MODEM1",
+      latest: "S9480BBB4/CSC4/MODEM4",
+      sequence: 4
+    }
+  });
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.batchId, first.batchId);
+  assert.equal(second.count, 2);
+
+  const queued = [];
+  const batchEnv = {
+    FIRMWARE_KV: memoryKv(),
+    MONITOR_SCHEDULER: schedulerNamespace(scheduler),
+    MONITOR_SCHEDULER_ENABLED: "true",
+    NOTIFICATION_QUEUE_ENABLED: "true",
+    NOTIFICATION_QUEUE: {
+      async send(data, options = {}) {
+        queued.push({ data, options });
+      }
+    },
+    TELEGRAM_CHAT_ID: "999"
+  };
+  await setUserLanguage(batchEnv, "999", "en");
+  let acked = false;
+  await processNotificationQueue({ messages: [{
+    body: {
+      kind: "firmware_update_batch_flush",
+      batchKey: "s26:tgy",
+      batchId: first.batchId
+    },
+    ack() { acked = true; },
+    retry() { throw new Error("batch flush should not retry"); }
+  }] }, batchEnv);
+  assert.equal(acked, true);
+  assert.equal(queued.length, 1);
+  assert.match(queued[0].data.text, /S26 Hong Kong: 2 new firmware versions/);
+  assert.match(queued[0].data.text, /SM-S9420/);
+  assert.match(queued[0].data.text, /SM-S9480/);
+  const after = await call("/notification-batch/get", { batchKey: "s26:tgy", batchId: first.batchId });
+  assert.equal(after.found, false);
+});
+
+test("monitor ignores an older SmartHistory sequence and never downgrades or notifies", async () => {
+  resetFusSession();
+  resetStateMemoryCache();
+  const kv = memoryKv();
+  const current = "S9480CURRENT4/S9480CSC4/S9480MODEM4";
+  await kv.put("firmware:last:SM-S9480:TGY", current);
+  const monitorEnv = {
+    FIRMWARE_KV: kv,
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "999",
+    RELEASE_WINDOW_ENABLED: "false",
+    MONITOR_CONCURRENCY: "1"
+  };
+  await setMonitorItems(monitorEnv, [{
+    model: "SM-S9480", csc: "TGY", name: "Galaxy S26 Ultra", priority: "high", enabled: true
+  }]);
+  await recordMonitorSuccess(monitorEnv, "SM-S9480", "TGY", new Date("2026-09-04T03:00:00Z"), {
+    latest: current,
+    sequence: 4
+  });
+
+  let telegramCalls = 0;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([historyRow({
+        sequence: "3",
+        localCsc: "TGY",
+        model: "SM-S9480",
+        version: "S9480OLDER3/S9480CSC3/S9480MODEM3"
+      })]));
+    }
+    if (value.includes("api.telegram.org")) {
+      telegramCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const summary = await runMonitor(monitorEnv, { reason: "manual_test" });
+  assert.equal(summary.updated, 0);
+  assert.equal(telegramCalls, 0);
+  assert.equal(await kv.get("firmware:last:SM-S9480:TGY"), current);
+  const runtime = await getMonitorRuntime(monitorEnv, "SM-S9480", "TGY");
+  assert.equal(runtime.lastSequence, 4);
+  assert.equal(runtime.lastVersion, current);
+});
+
+test("existing baseline without sequence is upgraded silently before future notifications", async () => {
+  resetFusSession();
+  resetStateMemoryCache();
+  const kv = memoryKv();
+  await kv.put("firmware:last:SM-S9420:TGY", "S9420OLD1/S9420CSC1/S9420MODEM1");
+  const monitorEnv = {
+    FIRMWARE_KV: kv,
+    TELEGRAM_BOT_TOKEN: "test-token",
+    TELEGRAM_CHAT_ID: "999",
+    RELEASE_WINDOW_ENABLED: "false",
+    MONITOR_CONCURRENCY: "1"
+  };
+  await setMonitorItems(monitorEnv, [{
+    model: "SM-S9420", csc: "TGY", name: "Galaxy S26", priority: "high", enabled: true
+  }]);
+
+  let telegramCalls = 0;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    if (value.includes("GenerateNonce")) return nonceResponse();
+    if (value.includes("SmartHistory")) {
+      return new Response(historyDocument([historyRow({
+        sequence: "7",
+        localCsc: "TGY",
+        model: "SM-S9420",
+        version: "S9420CURRENT7/S9420CSC7/S9420MODEM7"
+      })]));
+    }
+    if (value.includes("api.telegram.org")) {
+      telegramCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+    throw new Error(`Unexpected URL: ${value}`);
+  };
+
+  const summary = await runMonitor(monitorEnv, { reason: "manual_test" });
+  assert.equal(summary.updated, 0);
+  assert.equal(summary.initialized, 1);
+  assert.equal(telegramCalls, 0);
+  const runtime = await getMonitorRuntime(monitorEnv, "SM-S9420", "TGY");
+  assert.equal(runtime.lastSequence, 7);
+  assert.equal(runtime.lastVersion, "S9420CURRENT7/S9420CSC7/S9420MODEM7");
+});
+
+test("durable scheduler never re-enters HOT mode for an older or duplicate-sequence snapshot", async () => {
+  const now = Date.now();
+  const scheduler = new MonitorScheduler({ storage: memoryDoStorage() }, {});
+  const call = async (path, body) => {
+    const response = await scheduler.fetch(new Request(`https://scheduler.example${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }));
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  await call("/sync", { now, items: [{ model: "SM-S9480", csc: "TGY", priority: "high" }] });
+  let claim = await call("/claim", { now, limit: 1 });
+  await call("/complete", {
+    model: "SM-S9480", csc: "TGY", lock: claim.entries[0].lock,
+    nextCheckAt: now + 60_000,
+    lastVersion: "CURRENT4", sequence: 4,
+    priorityScore: 90, status: "baseline", completedAt: now
+  });
+
+  await call("/force", { model: "SM-S9480", csc: "TGY", dueAt: now + 1 });
+  claim = await call("/claim", { now: now + 1, limit: 1 });
+  const older = await call("/complete", {
+    model: "SM-S9480", csc: "TGY", lock: claim.entries[0].lock,
+    nextCheckAt: now + 60_001,
+    lastVersion: "OLDER3", sequence: 3,
+    priorityScore: 90, status: "unchanged", completedAt: now + 1
+  });
+  assert.equal(older.versionChanged, false);
+  assert.equal(older.monitorMode, "NORMAL");
+  let state = await call("/target-state/get", { model: "SM-S9480", csc: "TGY" });
+  assert.equal(state.runtime.lastVersion, "CURRENT4");
+  assert.equal(state.runtime.lastSequence, 4);
+
+  await call("/force", { model: "SM-S9480", csc: "TGY", dueAt: now + 2 });
+  claim = await call("/claim", { now: now + 2, limit: 1 });
+  const duplicateSequence = await call("/complete", {
+    model: "SM-S9480", csc: "TGY", lock: claim.entries[0].lock,
+    nextCheckAt: now + 60_002,
+    lastVersion: "CURRENT4-METADATA", sequence: 4,
+    priorityScore: 90, status: "unchanged", completedAt: now + 2
+  });
+  assert.equal(duplicateSequence.versionChanged, false);
+  assert.equal(duplicateSequence.monitorMode, "NORMAL");
 });
 
 test("administrator help explains role boundaries and administrator setup", () => {

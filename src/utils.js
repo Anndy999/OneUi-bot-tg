@@ -567,6 +567,69 @@ export function formatMonitorNotification(item, oldLatest, parsed, now = new Dat
   return formatUpdateNotificationCard(item, oldLatest, parsed, now, lang, includeAck, options);
 }
 
+function shortFirmwareBuild(version) {
+  const normalized = normalizeFirmwareVersion(version) || String(version || "").trim();
+  const first = normalized.split("/")[0] || normalized;
+  const match = first.match(/([A-Z0-9]{4})$/i);
+  return match ? match[1].toUpperCase() : first;
+}
+
+function firmwareBatchRegionLabel(csc, lang = "zh") {
+  const normalized = String(csc || "").toUpperCase();
+  const labels = {
+    KOO: { zh: "韩版", en: "Korea" },
+    EUX: { zh: "欧版", en: "Europe" },
+    TGY: { zh: "港版", en: "Hong Kong" },
+    CHC: { zh: "国行", en: "China" }
+  };
+  return labels[normalized]?.[lang === "en" ? "en" : "zh"] || normalized;
+}
+
+export function formatFirmwareUpdateBatch(batch, now = new Date(), lang = "zh") {
+  const events = Array.isArray(batch?.events) ? batch.events : [];
+  if (!events.length) return "";
+  if (events.length === 1) {
+    const event = events[0];
+    return formatMonitorNotification(
+      { model: event.model, csc: event.csc, name: event.name || "" },
+      event.oldLatest,
+      { latest: event.latest },
+      now,
+      lang,
+      false
+    );
+  }
+
+  const series = String(batch?.series || events[0]?.series || "Galaxy").toUpperCase();
+  const csc = String(batch?.csc || events[0]?.csc || "").toUpperCase();
+  const region = firmwareBatchRegionLabel(csc, lang);
+  const ordered = [...events].sort((a, b) => String(a.model || "").localeCompare(String(b.model || "")));
+  if (lang === "en") {
+    return [
+      `🚀 ${series} ${region}: ${ordered.length} new firmware versions`,
+      "",
+      ...ordered.map((event) =>
+        `• ${event.model}: ${shortFirmwareBuild(event.oldLatest)} → ${shortFirmwareBuild(event.latest)}`
+      ),
+      "",
+      `Detected at: ${formatBeijingTime(now, "en")}`,
+      "Source: Samsung SmartHistory",
+      "Full firmware versions are available from a manual query."
+    ].join("\n");
+  }
+  return [
+    `🚀 ${series} ${region}发现 ${ordered.length} 台新固件`,
+    "",
+    ...ordered.map((event) =>
+      `• ${event.model}：${shortFirmwareBuild(event.oldLatest)} → ${shortFirmwareBuild(event.latest)}`
+    ),
+    "",
+    `发现时间：${formatBeijingTime(now, "zh")}`,
+    "来源：Samsung SmartHistory",
+    "完整版本号可通过手动查询查看。"
+  ].join("\n");
+}
+
 export function formatUpdateNotificationCard(item, oldLatest, parsed, now = new Date(), lang = "zh", includeAck = true, options = {}) {
   {
   // Update notices are intentionally compact. The monitor is autonomous, so

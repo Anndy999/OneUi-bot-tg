@@ -11,6 +11,7 @@ const INITIALIZED_KEY = "meta:initialized";
 const TARGET_COUNT_KEY = "meta:target-count";
 const TELEGRAM_DEDUPE_KEY = "telegram:dedupe";
 const NOTIFICATION_PREFIX = "notification:";
+const FIRMWARE_NOTIFICATION_BATCH_PREFIX = "firmware-notification-batch:";
 const NOTIFICATION_CLEANUP_KEY = "meta:notification-cleanup-at";
 const TARGET_PREFIX = "target:";
 const DUE_PREFIX = "due:";
@@ -266,6 +267,29 @@ export async function completeNotificationDelivery(env, notificationId, lock, se
   });
 }
 
+export async function addFirmwareNotificationBatch(env, batchKey, event, options = {}) {
+  return schedulerRequest(env, "/notification-batch/add", {
+    batchKey: String(batchKey || ""),
+    event,
+    now: Number(options.now || Date.now()),
+    windowSeconds: Number(options.windowSeconds || 20)
+  });
+}
+
+export async function getFirmwareNotificationBatch(env, batchKey, batchId) {
+  return schedulerRequest(env, "/notification-batch/get", {
+    batchKey: String(batchKey || ""),
+    batchId: String(batchId || "")
+  });
+}
+
+export async function deleteFirmwareNotificationBatch(env, batchKey, batchId) {
+  return schedulerRequest(env, "/notification-batch/delete", {
+    batchKey: String(batchKey || ""),
+    batchId: String(batchId || "")
+  });
+}
+
 export async function claimSchedulerDailySummary(env, dateKey, now = Date.now()) {
   return schedulerRequest(env, "/daily-summary/claim", { dateKey, now });
 }
@@ -487,6 +511,9 @@ export class MonitorScheduler {
       if (url.pathname === "/telegram-update") return Response.json(await this.serialized(() => this.telegramUpdate(body)));
       if (url.pathname === "/notification-claim") return Response.json(await this.serialized(() => this.notificationClaim(body)));
       if (url.pathname === "/notification-complete") return Response.json(await this.serialized(() => this.notificationComplete(body)));
+      if (url.pathname === "/notification-batch/add") return Response.json(await this.serialized(() => this.notificationBatchAdd(body)));
+      if (url.pathname === "/notification-batch/get") return Response.json(await this.serialized(() => this.notificationBatchGet(body)));
+      if (url.pathname === "/notification-batch/delete") return Response.json(await this.serialized(() => this.notificationBatchDelete(body)));
       if (url.pathname === "/daily-summary/claim") return Response.json(await this.serialized(() => this.dailySummaryClaim(body)));
       if (url.pathname === "/daily-summary/complete") return Response.json(await this.serialized(() => this.dailySummaryComplete(body)));
       if (url.pathname === "/control-state/get") return Response.json(await this.serialized(() => this.controlStateGet(body)));
@@ -722,10 +749,32 @@ export class MonitorScheduler {
 
     const now = Number(body.completedAt || Date.now());
     const previousVersion = current.lastVersion || "";
-    const nextVersion = body.lastVersion || previousVersion;
+    let nextVersion = body.lastVersion || previousVersion;
     const status = String(body.status || "");
     const baselineReset = status === "baseline";
-    const versionChanged = !baselineReset && Boolean(previousVersion && nextVersion && previousVersion !== nextVersion);
+    const previousSequence = current.lastSequence !== null && current.lastSequence !== undefined && current.lastSequence !== "" && Number.isFinite(Number(current.lastSequence))
+      ? Number(current.lastSequence)
+      : null;
+    let nextSequence = body.sequence !== undefined && body.sequence !== null && body.sequence !== "" && Number.isFinite(Number(body.sequence))
+      ? Number(body.sequence)
+      : previousSequence;
+    const staleSequence = !baselineReset &&
+      previousSequence !== null &&
+      nextSequence !== null &&
+      nextSequence < previousSequence;
+    if (staleSequence) {
+      // A temporarily incomplete SmartHistory response must never move the
+      // authoritative baseline backwards. Otherwise the older snapshot could
+      // be re-announced as a "new" release when Samsung returns the latest row
+      // again on the next check.
+      nextVersion = previousVersion;
+      nextSequence = previousSequence;
+    }
+    const versionChanged = !baselineReset && !staleSequence && Boolean(previousVersion && nextVersion) && previousVersion !== nextVersion && (
+      previousSequence !== null && nextSequence !== null
+        ? nextSequence > previousSequence
+        : true
+    );
     let monitorMode = String(current.monitorMode || "NORMAL").toUpperCase();
     let modeUntil = Number(current.modeUntil || 0);
     let nextCheckAt = Math.max(now, Number(body.nextCheckAt || now));
@@ -798,9 +847,7 @@ export class MonitorScheduler {
         ? (Date.parse(body.officialUpdateAt) || Number(current.lastOfficialUpdateAt || 0))
         : (versionChanged ? now : Number(current.lastOfficialUpdateAt || 0)),
       lastBuildDate: String(body.buildDate || current.lastBuildDate || ""),
-      lastSequence: body.sequence !== undefined && body.sequence !== null && Number.isFinite(Number(body.sequence))
-        ? Number(body.sequence)
-        : (current.lastSequence ?? null),
+      lastSequence: nextSequence,
       lastQuerySource: status === "failed" || status === "skipped"
         ? String(current.lastQuerySource || "")
         : String(body.querySource || current.lastQuerySource || ""),
@@ -1006,6 +1053,100 @@ export class MonitorScheduler {
     }
     await this.ctx.storage.delete(key);
     return { ok: true, sent: false };
+  }
+
+
+  normalizeNotificationBatchKey(value) {
+    const key = String(value || "").trim().toLowerCase();
+    if (!/^[a-z0-9-]{2,24}:[a-z0-9]{3}$/.test(key)) throw new Error("Invalid firmware notification batch key");
+    return key;
+  }
+
+  normalizeNotificationBatchEvent(value = {}) {
+    const target = validateModelCsc(value.model, value.csc);
+    const latest = String(value.latest || "").trim().slice(0, 512);
+    const oldLatest = String(value.oldLatest || "").trim().slice(0, 512);
+    if (!latest) throw new Error("Firmware notification batch event requires latest version");
+    const rawSequence = value.sequence;
+    const sequence = rawSequence !== null && rawSequence !== undefined && rawSequence !== "" && Number.isFinite(Number(rawSequence))
+      ? Number(rawSequence)
+      : null;
+    return {
+      model: target.model,
+      csc: target.csc,
+      name: String(value.name || "").trim().slice(0, 64),
+      oldLatest,
+      latest,
+      sequence,
+      source: String(value.source || "Samsung SmartHistory").trim().slice(0, 80),
+      series: String(value.series || "").trim().toUpperCase().slice(0, 16),
+      notifyManagers: value.notifyManagers !== false,
+      notifyAllowedUsers: value.notifyAllowedUsers !== false,
+      detectedAt: String(value.detectedAt || new Date().toISOString()).slice(0, 40)
+    };
+  }
+
+  async notificationBatchAdd(body) {
+    const batchKey = this.normalizeNotificationBatchKey(body.batchKey);
+    const storageKey = `${FIRMWARE_NOTIFICATION_BATCH_PREFIX}${batchKey}`;
+    const now = Number(body.now || Date.now());
+    const windowSeconds = Math.max(5, Math.min(60, Number(body.windowSeconds || 20)));
+    const incoming = this.normalizeNotificationBatchEvent(body.event || {});
+    let current = await this.ctx.storage.get(storageKey);
+    const orphaned = current && Number(current.flushAt || 0) > 0 && Number(current.flushAt || 0) < now - 5 * 60 * 1000;
+    let created = false;
+    if (!current || orphaned) {
+      current = {
+        schemaVersion: 1,
+        id: randomId(),
+        key: batchKey,
+        createdAt: now,
+        flushAt: now + windowSeconds * 1000,
+        events: []
+      };
+      created = true;
+    }
+
+    const events = Array.isArray(current.events) ? [...current.events] : [];
+    const index = events.findIndex((event) => event.model === incoming.model && event.csc === incoming.csc);
+    if (index >= 0) {
+      const existingSequence = Number.isFinite(Number(events[index].sequence)) ? Number(events[index].sequence) : null;
+      const incomingSequence = Number.isFinite(Number(incoming.sequence)) ? Number(incoming.sequence) : null;
+      if (existingSequence === null || incomingSequence === null || incomingSequence >= existingSequence) {
+        events[index] = incoming;
+      }
+    } else {
+      events.push(incoming);
+    }
+
+    const next = { ...current, events: events.slice(0, 16), updatedAt: now };
+    await this.ctx.storage.put(storageKey, next);
+    return {
+      ok: true,
+      created,
+      batchId: next.id,
+      batchKey,
+      flushAt: next.flushAt,
+      count: next.events.length
+    };
+  }
+
+  async notificationBatchGet(body) {
+    const batchKey = this.normalizeNotificationBatchKey(body.batchKey);
+    const batchId = String(body.batchId || "").trim();
+    const value = await this.ctx.storage.get(`${FIRMWARE_NOTIFICATION_BATCH_PREFIX}${batchKey}`);
+    if (!value || (batchId && value.id !== batchId)) return { ok: true, found: false };
+    return { ok: true, found: true, batch: value };
+  }
+
+  async notificationBatchDelete(body) {
+    const batchKey = this.normalizeNotificationBatchKey(body.batchKey);
+    const batchId = String(body.batchId || "").trim();
+    const storageKey = `${FIRMWARE_NOTIFICATION_BATCH_PREFIX}${batchKey}`;
+    const value = await this.ctx.storage.get(storageKey);
+    if (!value || (batchId && value.id !== batchId)) return { ok: true, deleted: false };
+    await this.ctx.storage.delete(storageKey);
+    return { ok: true, deleted: true };
   }
 
   async dailySummaryClaim(body) {

@@ -73,7 +73,12 @@ export function validateVpsProductionEnv(env = process.env) {
 export function createPersistentQueueBinding(queue) {
   return {
     async send(data, options = {}) {
-      return queue.add("oneui", data, { ...queueOptions(data), ...options });
+      const queueSpecific = { ...options };
+      if (queueSpecific.delay === undefined && Number.isFinite(Number(queueSpecific.delaySeconds))) {
+        queueSpecific.delay = Math.max(0, Number(queueSpecific.delaySeconds)) * 1000;
+      }
+      delete queueSpecific.delaySeconds;
+      return queue.add("oneui", data, { ...queueOptions(data), ...queueSpecific });
     }
   };
 }

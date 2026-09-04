@@ -1,8 +1,18 @@
 import {
   claimNotificationDelivery,
-  completeNotificationDelivery
+  completeNotificationDelivery,
+  deleteFirmwareNotificationBatch,
+  getFirmwareNotificationBatch
 } from "./monitor-scheduler.js";
-import { putPendingUpdate, recordMonitorEvent } from "./state.js";
+import {
+  getAdminChatIds,
+  getAllowedUsers,
+  getUserLanguage,
+  putPendingUpdate,
+  recordMonitorEvent
+} from "./state.js";
+import { notifyAllowedUsersOnUpdate } from "./config.js";
+import { formatFirmwareUpdateBatch } from "./utils.js";
 import { sendTelegramMessage } from "./telegram.js";
 
 function queueEnabled(env) {
@@ -74,8 +84,107 @@ export async function enqueueTelegramNotification(env, payload) {
   return { ok: sent, queued: false, sent };
 }
 
+function batchMenuKeyboard(lang = "zh") {
+  return {
+    inline_keyboard: [[{
+      text: lang === "en" ? "Open menu" : "打开菜单",
+      callback_data: "menu:home"
+    }]]
+  };
+}
+
+async function enqueueFirmwareBatchRecipients(env, batch) {
+  const events = Array.isArray(batch?.events) ? batch.events : [];
+  if (!events.length) return { attempted: 0, queued: 0, sent: 0 };
+  const adminIds = await getAdminChatIds(env);
+  const managerSet = new Set(adminIds.map((id) => String(id || "")));
+  const allowedUsers = notifyAllowedUsersOnUpdate(env)
+    ? await getAllowedUsers(env)
+    : [];
+  const recipients = new Map();
+
+  if (events.some((event) => event.notifyManagers !== false)) {
+    for (const chatId of adminIds) {
+      recipients.set(String(chatId), {
+        chatId: String(chatId),
+        audience: "owner",
+        events: events.filter((event) => event.notifyManagers !== false)
+      });
+    }
+  }
+
+  for (const user of allowedUsers) {
+    const chatId = String(user.chatId || "").trim();
+    if (!chatId || managerSet.has(chatId)) continue;
+    const userEvents = events.filter((event) => event.notifyAllowedUsers !== false);
+    if (!userEvents.length) continue;
+    recipients.set(chatId, { chatId, audience: "allowed_user", events: userEvents });
+  }
+
+  let queued = 0;
+  let sent = 0;
+  const now = new Date();
+  for (const recipient of recipients.values()) {
+    const lang = await getUserLanguage(env, recipient.chatId);
+    const scopedBatch = {
+      ...batch,
+      events: recipient.events,
+      series: batch.series || recipient.events[0]?.series || "",
+      csc: batch.csc || recipient.events[0]?.csc || ""
+    };
+    const delivery = await enqueueTelegramNotification(env, {
+      id: `firmware-update-batch:${batch.id}:${recipient.chatId}`,
+      chatId: recipient.chatId,
+      text: formatFirmwareUpdateBatch(scopedBatch, now, lang),
+      replyMarkup: batchMenuKeyboard(lang),
+      monitorEvent: {
+        model: recipient.events[0]?.model || "",
+        csc: scopedBatch.csc,
+        name: `${scopedBatch.series || "Samsung"} firmware batch`,
+        audience: recipient.audience,
+        source: "Samsung SmartHistory",
+        detail: `Merged ${recipient.events.length} latest firmware update${recipient.events.length === 1 ? "" : "s"}`
+      }
+    });
+    if (delivery.queued) queued += 1;
+    if (delivery.sent) sent += 1;
+  }
+  return { attempted: recipients.size, queued, sent };
+}
+
+async function flushFirmwareUpdateBatch(env, payload) {
+  const batchKey = String(payload?.batchKey || "");
+  const batchId = String(payload?.batchId || "");
+  const result = await getFirmwareNotificationBatch(env, batchKey, batchId);
+  if (!result?.ok || !result.found || !result.batch) return { ok: true, missing: true };
+  const batch = result.batch;
+  const events = Array.isArray(batch.events) ? batch.events : [];
+  if (!events.length) {
+    await deleteFirmwareNotificationBatch(env, batchKey, batchId);
+    return { ok: true, empty: true };
+  }
+  const [series, csc] = String(batchKey).split(":");
+  batch.series = batch.series || String(series || "").toUpperCase();
+  batch.csc = batch.csc || String(csc || "").toUpperCase();
+  const delivery = await enqueueFirmwareBatchRecipients(env, batch);
+  const deleted = await deleteFirmwareNotificationBatch(env, batchKey, batchId);
+  if (deleted?.ok === false) throw new Error("Unable to clear delivered firmware notification batch");
+  return { ok: true, ...delivery };
+}
+
 export async function processNotificationQueue(batch, env) {
   for (const queueMessage of batch.messages || []) {
+    if (queueMessage?.body?.kind === "firmware_update_batch_flush") {
+      try {
+        await flushFirmwareUpdateBatch(env, queueMessage.body);
+        queueMessage.ack();
+      } catch (error) {
+        console.log(`Firmware notification batch flush failed: ${error.message}`);
+        queueMessage.retry({ delaySeconds: 15 });
+      }
+      continue;
+    }
+
     let message;
     try {
       message = normalizeMessage(queueMessage.body);

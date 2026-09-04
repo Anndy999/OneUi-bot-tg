@@ -16,6 +16,7 @@ import { buildFirmwareCacheRecord, isExactSmartHistory } from "./firmware-cache.
 import { calculatePriorityScore } from "./monitor-intelligence.js";
 import { maybeSendDailyMonitorSummary } from "./services/system-observability.js";
 import {
+  addFirmwareNotificationBatch,
   claimDueMonitorTargets,
   claimManualMonitorTargets,
   completeMonitorTarget,
@@ -615,22 +616,82 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
     const oldLatest = !schedulerOwnsVersion
       ? await env.FIRMWARE_KV.get(key)
       : String(schedulerEntry.lastVersion || "");
+    const runtimeBefore = schedulerOwnsVersion
+      ? (schedulerEntry.runtime || {})
+      : await getMonitorRuntime(env, item.model, item.csc);
     const oldFingerprint = firmwareVersionFingerprint(oldLatest);
     const newFingerprint = firmwareVersionFingerprint(parsed.latest);
-    const baselineReset = item.rolloutBaselinePending === true;
-    const versionChanged = !baselineReset && Boolean(oldLatest) && oldFingerprint !== newFingerprint;
+    const rawOldSequence = runtimeBefore?.lastSequence;
+    const rawNewSequence = parsed.smartHistory?.sequence;
+    const oldSequence = rawOldSequence !== null && rawOldSequence !== undefined && rawOldSequence !== "" && Number.isFinite(Number(rawOldSequence))
+      ? Number(rawOldSequence)
+      : null;
+    const newSequence = rawNewSequence !== null && rawNewSequence !== undefined && rawNewSequence !== "" && Number.isFinite(Number(rawNewSequence))
+      ? Number(rawNewSequence)
+      : null;
+    const rolloutBaselineReset = item.rolloutBaselinePending === true;
+    // Existing installations may have a saved version from before sequence
+    // tracking was introduced. Silently attach the current Samsung sequence
+    // once instead of treating that migration as a fresh release.
+    const sequenceBaselineReset = !rolloutBaselineReset && Boolean(oldLatest) && oldSequence === null && newSequence !== null;
+    const baselineReset = rolloutBaselineReset || sequenceBaselineReset;
+    const staleSnapshot = !baselineReset && oldSequence !== null && newSequence !== null && newSequence < oldSequence;
+    const sequenceMissingSnapshot = !baselineReset && oldSequence !== null && newSequence === null;
+    const sameSequence = !baselineReset && oldSequence !== null && newSequence !== null && newSequence === oldSequence;
+    const versionChanged = !baselineReset && !staleSnapshot && !sequenceMissingSnapshot && Boolean(oldLatest) && oldFingerprint !== newFingerprint && (
+      oldSequence !== null && newSequence !== null
+        ? newSequence > oldSequence
+        : true
+    );
     const successMetadata = {
       versionChanged,
       officialUpdateAt: versionChanged
         ? now.toISOString()
         : samsungDateIso(parsed.buildDate || parsed.smartHistory?.openDate),
       buildDate: parsed.buildDate || parsed.smartHistory?.openDate || "",
-      sequence: parsed.smartHistory?.sequence,
+      sequence: newSequence,
       querySource: parsed.source || "Samsung FUS SmartHistory",
       queryMode: "realtime",
       queryCacheHit: Boolean(result.coordinator?.cacheHit),
       queryShared: Boolean(result.coordinator?.shared || result.queryTiming?.singleFlightJoined)
     };
+
+    if (staleSnapshot || sequenceMissingSnapshot) {
+      // Samsung can briefly return an incomplete/older History snapshot while
+      // replicas synchronize. Once a sequence baseline exists, a response
+      // without a sequence is also ambiguous. Never downgrade the baseline or
+      // global query cache, and never notify users about either snapshot.
+      if (!schedulerOwnsVersion) {
+        await recordMonitorSuccess(env, item.model, item.csc, now, {
+          latest: oldLatest,
+          ...successMetadata,
+          versionChanged: false,
+          sequence: oldSequence
+        });
+      }
+      await recordMonitorEventSafely(env, {
+        type: staleSnapshot ? "stale_snapshot_ignored" : "sequence_missing_snapshot_ignored",
+        model: item.model,
+        csc: item.csc,
+        name: item.name,
+        detail: staleSnapshot
+          ? `Ignored sequence ${newSequence}; baseline sequence is ${oldSequence}`
+          : `Ignored sequence-less snapshot; baseline sequence is ${oldSequence}`,
+        source: parsed.source || "Samsung SmartHistory",
+        at: now.toISOString()
+      });
+      return {
+        status: "unchanged",
+        staleSnapshot: true,
+        boostedTargets: 0,
+        latest: oldLatest,
+        notificationPromise: null,
+        ...successMetadata,
+        versionChanged: false,
+        sequence: oldSequence
+      };
+    }
+
     await writeMonitorGlobalCache(env, item, parsed, result.canonicalCache);
     if (!schedulerOwnsVersion) {
       await recordMonitorSuccess(env, item.model, item.csc, now, {
@@ -644,9 +705,11 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       // latest release. Old saved versions belong to a previous monitoring
       // period and must never be replayed as fresh update notifications.
       if (!schedulerOwnsVersion) await env.FIRMWARE_KV.put(key, parsed.latest);
-      await upsertMonitorItem(env, { ...item, rolloutBaselinePending: false });
+      if (rolloutBaselineReset) {
+        await upsertMonitorItem(env, { ...item, rolloutBaselinePending: false });
+      }
       await recordMonitorEventSafely(env, {
-        type: "rollout_baseline_initialized",
+        type: rolloutBaselineReset ? "rollout_baseline_initialized" : "sequence_baseline_initialized",
         model: item.model,
         csc: item.csc,
         name: item.name,
@@ -672,7 +735,7 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       return { status: "initialized", boostedTargets: 0, latest: parsed.latest, notificationPromise, ...successMetadata };
     }
 
-    if (oldFingerprint && oldFingerprint === newFingerprint) {
+    if (sameSequence || (oldFingerprint && oldFingerprint === newFingerprint)) {
       if (!schedulerOwnsVersion && oldLatest !== parsed.latest) await env.FIRMWARE_KV.put(key, parsed.latest);
       if (previousFailureCount > 0) {
         await recordMonitorEventSafely(env, {
@@ -895,7 +958,79 @@ async function notifyFirstRun(env, item, parsed, now, adminId) {
   }
 }
 
+function notificationSeriesForItem(item = {}) {
+  const name = String(item.name || "");
+  const fromName = name.match(/\bS(25|26)\b/i);
+  if (fromName) return `S${fromName[1]}`;
+  const model = String(item.model || "").toUpperCase();
+  if (/^SM-S(?:942|947|948)[A-Z0-9]*$/.test(model)) return "S26";
+  if (/^SM-S(?:931|936|937|938)[A-Z0-9]*$/.test(model)) return "S25";
+  return "";
+}
+
+function notificationBatchWindowSeconds(env) {
+  const value = Number(env?.FIRMWARE_NOTIFICATION_BATCH_SECONDS || 20);
+  if (!Number.isFinite(value)) return 20;
+  return Math.max(5, Math.min(60, Math.floor(value)));
+}
+
+async function queueFirmwareUpdateBatch(env, item, oldLatest, parsed, options = {}) {
+  if (!env?.NOTIFICATION_QUEUE?.send) return null;
+  const series = notificationSeriesForItem(item);
+  if (!series) return null;
+  const csc = String(item.csc || "").toUpperCase();
+  const batchKey = `${series.toLowerCase()}:${csc.toLowerCase()}`;
+  const windowSeconds = notificationBatchWindowSeconds(env);
+  const batch = await addFirmwareNotificationBatch(env, batchKey, {
+    model: item.model,
+    csc,
+    name: item.name,
+    oldLatest,
+    latest: parsed.latest,
+    sequence: parsed.smartHistory?.sequence,
+    source: parsed.source || "Samsung SmartHistory",
+    series,
+    notifyManagers: options.notifyManagers !== false,
+    notifyAllowedUsers: item.notifyAllowedUsers !== false,
+    detectedAt: new Date().toISOString()
+  }, { windowSeconds });
+  if (!batch?.ok || !batch.batchId) return null;
+
+  if (batch.created) {
+    await env.NOTIFICATION_QUEUE.send({
+      schemaVersion: 1,
+      kind: "firmware_update_batch_flush",
+      id: `firmware-update-batch-flush:${batch.batchId}`,
+      batchKey,
+      batchId: batch.batchId,
+      createdAt: new Date().toISOString()
+    }, { delaySeconds: windowSeconds });
+  }
+  return {
+    attempted: 0,
+    queued: 1,
+    sent: 0,
+    batched: true,
+    batchId: batch.batchId,
+    batchCount: batch.count
+  };
+}
+
 async function notifyFirmwareUpdate(env, item, oldLatest, parsed, options = {}) {
+  // Latest S-series releases often reach several models within seconds. Buffer
+  // S25/S26 notices briefly and send one bilingual per-user card per region.
+  // If the durable batching path is unavailable, fall back to the proven
+  // one-message-per-model path instead of dropping a notification.
+  try {
+    const batched = await queueFirmwareUpdateBatch(env, item, oldLatest, parsed, options);
+    if (batched) return batched;
+  } catch (error) {
+    console.log(`Firmware notification batching unavailable for ${item.model}/${item.csc}: ${error.message}`);
+  }
+  return notifyFirmwareUpdateImmediate(env, item, oldLatest, parsed, options);
+}
+
+async function notifyFirmwareUpdateImmediate(env, item, oldLatest, parsed, options = {}) {
   const now = new Date();
   const adminIds = await getAdminChatIds(env);
   const notificationTasks = [];
