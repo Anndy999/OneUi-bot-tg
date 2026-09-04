@@ -811,23 +811,27 @@ async function mainMenuText(env, identity, lang = "zh") {
 
 function mainMenuKeyboard(identity, lang = "zh", owner = false) {
   const en = lang === "en";
+  const languageRow = [{ text: en ? "🌐 中文" : "🌐 English", callback_data: "menu:language" }];
   if (identity === "admin") {
     const rows = [
       [{ text: en ? "Query firmware" : "\ud83d\udd0d 查询固件", callback_data: "menu:query-help" }, { text: en ? "Firmware download" : "📥 下载", callback_data: "admin:download-menu" }],
       [{ text: en ? "Rollout chain" : "📣 发布链", callback_data: "admin:rollout-menu" }]
     ];
     if (owner) rows.push([{ text: en ? "Users & admins" : "\ud83d\udc65 用户与管理员", callback_data: "admin:access-menu" }]);
+    rows.push(languageRow);
     return { inline_keyboard: rows };
   }
   if (identity === "allowed") {
     return { inline_keyboard: [
       [{ text: en ? "Query firmware" : "\ud83d\udd0d \u67e5\u8be2\u56fa\u4ef6", callback_data: "menu:query-help" }],
-      [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+      [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }],
+      languageRow
     ] };
   }
   return { inline_keyboard: [
     [{ text: en ? "Request access" : "\ud83d\udd10 \u7533\u8bf7\u6743\u9650", callback_data: "user:apply" }],
-    [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }]
+    [{ text: en ? "Settings" : "\u2699\ufe0f \u8bbe\u7f6e", callback_data: "menu:settings" }, { text: en ? "Help" : "\u2753 \u5e2e\u52a9", callback_data: "menu:help" }],
+    languageRow
   ] };
 }
 
@@ -1259,13 +1263,12 @@ function userSettingsKeyboard(identity, lang = "zh") {
   const en = lang === "en";
   return { inline_keyboard: [
     [{ text: en ? "My info" : "\u6211\u7684\u4fe1\u606f", callback_data: "user:whoami" }],
-    [{ text: en ? "Language" : "\u8bed\u8a00", callback_data: "menu:language" }],
     [{ text: en ? "Back" : "\u8fd4\u56de", callback_data: "menu:home" }]
   ] };
 }
 
 function userSettingsText(lang = "zh") {
-  return lang === "en" ? "Settings\n\nManage language and view your account information." : "\u8bbe\u7f6e\n\n\u8bbe\u7f6e\u8bed\u8a00\u6216\u67e5\u770b\u8d26\u53f7\u4fe1\u606f\u3002";
+  return lang === "en" ? "Settings\n\nView your account information." : "\u8bbe\u7f6e\n\n\u67e5\u770b\u8d26\u53f7\u4fe1\u606f\u3002";
 }
 
 function onboardingText(identity, lang = "zh") {

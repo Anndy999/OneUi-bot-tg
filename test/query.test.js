@@ -3418,7 +3418,8 @@ test("Telegram start shows the compact role-based admin menu after onboarding", 
     "menu:query-help",
     "admin:download-menu",
     "admin:rollout-menu",
-    "admin:access-menu"
+    "admin:access-menu",
+    "menu:language"
   ]);
   assert.equal(callbacks.includes("admin:autoapprove:on"), false);
 });
@@ -4247,7 +4248,9 @@ test("first /start asks for language, then shows localized onboarding once", asy
     message: { message_id: 2, chat: { id: 9911 }, from: { id: 9911 }, text: "/start" }
   }, secondPayloads);
   assert.equal(secondPayloads.some((entry) => String(entry.body.text || "").includes("Choose your language / 选择语言")), false);
-  assert.ok(secondPayloads.some((entry) => String(entry.body.text || "").startsWith("Administrator")));
+  const returningHome = secondPayloads.find((entry) => String(entry.body.text || "").startsWith("Administrator"));
+  assert.ok(returningHome);
+  assert.ok(returningHome.body.reply_markup.inline_keyboard.flat().some((button) => button.text === "🌐 中文" && button.callback_data === "menu:language"));
 
   const devicePayloads = [];
   await dispatchTelegramTestUpdate(env, {
