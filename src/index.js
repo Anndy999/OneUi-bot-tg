@@ -2688,6 +2688,7 @@ async function handleAdminCallback(env, chatId, messageId, data, ctx = null) {
     return;
   }
   if (data.startsWith("admin:rollout-weekends:")) {
+    const lang = await getUserLanguage(env, chatId);
     if (!isOwnerChatId(env, chatId)) {
       await sendTelegramMessage(env, chatId, lang === "en" ? "Only the owner can change weekend monitoring." : "仅所有者可更改周末监控。" );
       return;

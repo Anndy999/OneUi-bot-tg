@@ -615,6 +615,20 @@ export async function createRolloutProposalForUpdate(env, item, parsed, now = ne
   return { proposal, chain, stage, next, startChain };
 }
 
+// The Korean S26 Ultra is the preferred confirmation source for the rollout
+// card. This does not change scheduling or stage activation: a non-Ultra model
+// may still discover a Samsung release first and remains the truthful fallback.
+export async function getRolloutPreferredConfirmationTarget(env, item) {
+  if (cleanText(item?.rolloutChainId, 48) !== "s26" || cleanText(item?.rolloutStageId, 48) !== "kr") return null;
+  const chains = await getRolloutChains(env);
+  const chain = findChain(chains, "s26");
+  const stage = chain && findStage(chain, "kr");
+  if (!chain || !stage || !chain.enabled || chain.status === "completed" || chain.activeStageId !== "kr") return null;
+  const primary = stage.targets.find((target) => target.model === "SM-S948N" && target.csc === "KOO");
+  if (!primary || (primary.model === item.model && primary.csc === item.csc)) return null;
+  return { ...primary };
+}
+
 function beijingDateAt(parts, clockTime, dayOffset = 0) {
   const minutes = timeToMinutes(clockTime);
   if (minutes === null) return 0;

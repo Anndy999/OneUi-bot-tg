@@ -80,6 +80,7 @@ import {
   advanceRolloutChainStage,
   applyRolloutProposalDecision,
   createRolloutProposalForUpdate,
+  getRolloutPreferredConfirmationTarget,
   getRolloutItemScheduleDecision,
   getRolloutChains,
   applyOneTimeEuropeanRolloutRecovery,
@@ -4119,6 +4120,32 @@ test("rollout update stays actionable when the next region is configured later",
   }, { latest: "S9480XXU1A" });
   assert.ok(created?.proposal);
   assert.equal(created.proposal.nextStageId, "eu");
+});
+
+test("Korean S26 non-Ultra updates can verify the configured Ultra before proposing", async () => {
+  const env = { FIRMWARE_KV: memoryKv(), TELEGRAM_CHAT_ID: "991" };
+  await setRolloutChainSettings(env, "s26", { enabled: true });
+  const preferred = await getRolloutPreferredConfirmationTarget(env, {
+    model: "SM-S947N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  });
+  assert.deepEqual(preferred, { model: "SM-S948N", csc: "KOO", name: "Galaxy S26 Ultra" });
+  const alreadyPrimary = await getRolloutPreferredConfirmationTarget(env, {
+    model: "SM-S948N",
+    csc: "KOO",
+    rolloutChainId: "s26",
+    rolloutStageId: "kr"
+  });
+  assert.equal(alreadyPrimary, null);
+  const outsideKorea = await getRolloutPreferredConfirmationTarget(env, {
+    model: "SM-S947B",
+    csc: "EUX",
+    rolloutChainId: "s26",
+    rolloutStageId: "eu"
+  });
+  assert.equal(outsideKorea, null);
 });
 
 test("a confirmed rollout pauses the finished region and activates the next regions", async () => {

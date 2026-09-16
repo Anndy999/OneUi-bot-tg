@@ -37,6 +37,7 @@ import {
 } from "./flagship-priority.js";
 import {
   createRolloutProposalForUpdate,
+  getRolloutPreferredConfirmationTarget,
   applyOneTimeEuropeanRolloutRecovery,
   applyOneTimeS25HongKongRolloutRecovery,
   getRolloutItemScheduleDecision,
@@ -764,7 +765,11 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       at: now.toISOString()
     });
     // A version change sends one notification and keeps the normal schedule.
-    const rollout = await createRolloutProposalForUpdate(env, item, parsed, now);
+    // For the Korean S26 rollout only, a non-Ultra discovery gets one immediate
+    // real-time Ultra confirmation query. It changes only the manager-facing
+    // rollout-card source when Ultra independently has a newer Samsung record.
+    const rolloutSource = await resolveRolloutConfirmationSource(env, item, parsed);
+    const rollout = await createRolloutProposalForUpdate(env, rolloutSource.item, rolloutSource.parsed, now);
     const updateNotice = rollout?.suppressUpdate
       ? Promise.resolve({ attempted: 0, queued: 0, sent: 0, suppressed: true })
       : notifyFirmwareUpdate(env, item, oldLatest, parsed, {
@@ -806,6 +811,43 @@ async function executeMonitorTarget(env, item, items, now, adminId, schedulerEnt
       failureCount: runtime.failureCount,
       error: String(error?.message || error)
     };
+  }
+}
+
+function hasNewerMonitorSnapshot(previous, candidate) {
+  const previousVersion = String(previous?.lastVersion || "");
+  if (!previousVersion || firmwareVersionFingerprint(previousVersion) === firmwareVersionFingerprint(candidate?.latest)) return false;
+  const sequence = (value) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value))
+    ? Number(value)
+    : null;
+  const previousSequence = sequence(previous?.lastSequence);
+  const candidateSequence = sequence(candidate?.smartHistory?.sequence);
+  if (previousSequence !== null && candidateSequence !== null) return candidateSequence > previousSequence;
+  return true;
+}
+
+async function resolveRolloutConfirmationSource(env, item, parsed) {
+  const preferred = await getRolloutPreferredConfirmationTarget(env, item);
+  if (!preferred) return { item, parsed };
+  try {
+    const result = await coordinatedFirmwareQuery(env, preferred.model, preferred.csc, {
+      monitor: true,
+      role: "monitor",
+      refresh: true
+    });
+    const candidate = result.parsed;
+    if (!isExactSmartHistory(candidate)) return { item, parsed };
+    const runtime = await getMonitorRuntime(env, preferred.model, preferred.csc);
+    if (!hasNewerMonitorSnapshot(runtime, candidate)) return { item, parsed };
+    return {
+      item: { ...item, ...preferred },
+      parsed: candidate
+    };
+  } catch (error) {
+    // The original exact update remains actionable. Do not block or reclassify
+    // a real release because the optional preferred-model confirmation failed.
+    console.log(`Preferred rollout confirmation failed for ${preferred.model}/${preferred.csc}: ${error.message}`);
+    return { item, parsed };
   }
 }
 
