@@ -180,7 +180,7 @@ test("VPS Telegram polling prioritizes callback acknowledgements", async () => {
 
 test("VPS concurrency and stale-loop settings stay within safe bounds", () => {
   const defaults = createVpsConfig({});
-  assert.equal(defaults.telegramWorkerConcurrency, 6);
+  assert.equal(defaults.telegramWorkerConcurrency, 8);
   assert.equal(defaults.monitorWorkerConcurrency, 2);
   assert.equal(defaults.scheduleStaleMs, 5 * 60_000);
   const bounded = createVpsConfig({
