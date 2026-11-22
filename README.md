@@ -459,4 +459,12 @@ npm run security-check
 npm test
 npx wrangler deploy --dry-run
 ```
->>>>>>> f3d3e4a (Prepare VPS runtime deployment)
+
+---
+
+## Need a firmware watcher like this?
+
+I build custom firmware & software monitoring bots with instant Telegram alerts on Fiverr:
+
+- [Firmware monitoring bot with Telegram update alerts](https://www.fiverr.com/andyhwins/create-a-firmware-monitoring-bot-with-telegram-update-alerts)
+- [Custom Telegram bot development](https://www.fiverr.com/andyhwins/create-a-custom-telegram-bot-using-python-and-telegram-api)
